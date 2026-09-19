@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Анализатор изометрий</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%23182124'/%3E%3Cpath d='M18 46 44 18M18 46h28M18 46V18' stroke='%23c9e7d6' stroke-width='6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark">∠</span><span>Изометрии<span class="brand-muted"> / mark pipeline</span></span></div>
+    <div class="top-status"><span class="status-dot" id="api-dot"></span><span id="api-status">API подключение</span><button class="ghost-button" id="history-button">История</button><button class="ghost-button" id="prompts-button">Промпты</button></div>
+  </header>
+
+  <main id="app" class="app-shell">
+    <section class="page-grid welcome-page">
+      <div class="intro-column compact">
+        <p class="eyebrow">PIPELINE / 01</p>
+        <h1>Изометрии <em>· расстояния по вершинам</em></h1>
+        <div class="signal-card"><span class="signal-label">Система готова</span><strong id="key-status">Проверяем API...</strong><small id="config-note"></small></div>
+      </div>
+
+      <div class="control-column">
+        <div class="section-heading"><span>01</span><div><h2>Источник документа</h2><p>Подготовьте PDF перед выбором линий</p></div></div>
+        <div class="source-switch">
+          <label><input type="radio" name="source-mode" value="local" checked><span>Локальный PDF<small>Изометрии.pdf из папки проекта</small></span></label>
+          <label><input type="radio" name="source-mode" value="upload"><span>Новый файл<small>Загрузить PDF</small></span></label>
+        </div>
+        <div class="upload-row"><input id="pdf-file" type="file" accept="application/pdf" style="display:none"><button class="secondary-button" id="load-pdf">Загрузить PDF</button></div>
+        <div id="document-summary" class="document-summary empty">Документ еще не загружен</div>
+
+        <div class="section-heading groups-heading"><span>02</span><div><h2>Группы линий</h2><p>Выберите одну или несколько линий</p></div></div>
+        <div class="groups-tools"><input id="groups-search" type="search" placeholder="Фильтр, например LC_1031"><span id="groups-count">0 групп</span></div>
+        <div id="groups-list" class="groups-list empty-state">Сначала загрузите PDF</div>
+
+        <div class="run-toolbar">
+          <label class="check-row">Делать до этапа
+            <select id="stop-stage">
+              <option value="prepare">Подготовка файлов (числа + вершины)</option>
+              <option value="analyze">Полный анализ у провайдера</option>
+            </select>
+          </label>
+          <button class="primary-button" id="start-analysis" disabled>Начать анализ <span>→</span></button>
+        </div>
+      </div>
+    </section>
+
+    <section class="analysis-page" id="runs-section" hidden>
+      <div class="panel-title"><span>ПРОГРЕСС</span><h2 id="run-title">Прогон</h2></div>
+      <div id="run-status"></div>
+      <div id="lines-progress"></div>
+    </section>
+
+    <section class="analysis-page" id="result-section" hidden>
+      <div class="panel-title"><span>РЕЗУЛЬТАТЫ</span><h2 id="result-title"></h2></div>
+      <div id="result-body"></div>
+    </section>
+
+    <section class="analysis-page" id="history-section" hidden>
+      <div class="panel-title"><span>ИСТОРИЯ</span><h2>Прошлые прогоны</h2></div>
+      <div id="history-body"></div>
+    </section>
+
+    <section class="analysis-page" id="prompt-section" hidden>
+      <div class="panel-title"><span>ПРОМПТЫ</span><h2>Редактор промптов</h2></div>
+      <div class="row prompt-tabs" id="prompt-tabs"></div>
+      <div class="row">
+        <span class="pill-soft" id="prompt-meta"></span>
+      </div>
+      <textarea id="prompt-editor" class="prompt-editor" spellcheck="false"></textarea>
+      <div class="row">
+        <button class="primary-button" id="save-prompt">Сохранить промпт</button>
+        <button class="secondary-button" id="reset-prompt">Сбросить к исходному</button>
+        <span id="prompt-status" class="pill-soft"></span>
+      </div>
+    </section>
+  </main>
+</body>
+</html>
