@@ -1303,3 +1303,25 @@ select {
 .page-selector-row { margin: 10px 0; }
 /* --- history kind badge --- */
 .badge.kind { background: #eef4ff; color: #3b5bd6; }
+/* --- закрепить «Начать анализ» и выбор этапа без прокрутки --- */
+.page-grid.welcome-page {
+  height: calc(100vh - 140px);
+  min-height: 520px;
+  align-items: stretch;
+}
+.control-column {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+.control-column .groups-list {
+  flex: 1 1 auto;
+  min-height: 140px;
+  max-height: none;
+  overflow-y: auto;
+}
+.control-column .run-toolbar {
+  margin-top: auto;
+  flex-shrink: 0;
+}

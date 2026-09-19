@@ -21,6 +21,7 @@ class PrepareResult:
     numbers: list[dict[str, Any]] = field(default_factory=list)
     vertices: list[dict[str, Any]] = field(default_factory=list)
     skipped_numbers: list[dict[str, Any]] = field(default_factory=list)
+    components: list[dict[str, Any]] = field(default_factory=list)
 
 
 def run_prepare(pdf_path: str | Path, page_number: int, out_dir: str | Path) -> PrepareResult:
@@ -50,6 +51,7 @@ def run_prepare(pdf_path: str | Path, page_number: int, out_dir: str | Path) -> 
     doc.close()
 
     vertices = mark_pipeline.extract_vertices(str(pdf_path), page_1based)
+    components = mark_pipeline.components_report(str(pdf_path), page_1based)
     mark_pipeline.save_numbers_pdf(str(pdf_path), page_0based, str(numbers_pdf), dims, rectangles, drawing_area)
     mark_pipeline.save_vertices_pdf(str(pdf_path), page_0based, str(vertices_pdf), vertices)
     mark_pipeline.save_numbers_txt(str(numbers_txt), dims, vertices, drawing_area)
@@ -89,6 +91,7 @@ def run_prepare(pdf_path: str | Path, page_number: int, out_dir: str | Path) -> 
         numbers=numbers,
         vertices=vertices_rows,
         skipped_numbers=discards,
+        components=components,
     )
 
 

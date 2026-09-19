@@ -284,6 +284,14 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                 "vertices_pdf": prepare.vertices_pdf.name,
                 "numbers_txt": prepare.numbers_txt.name,
             }
+            components = prepare.components or []
+            kept = [c for c in components if c.get("kept")]
+            dropped = [c for c in components if not c.get("kept")]
+            page_run.events.append({"time": now(), "stage": "prepare", "message": f"компонент оси: {len(kept)} принято, {len(dropped)} отброшено"})
+            for c in kept:
+                page_run.events.append({"time": now(), "stage": "prepare", "message": f"  компонент #{c['index']}: {c['nodes']} узлов, bbox {c['bbox']}"})
+            for c in dropped:
+                page_run.events.append({"time": now(), "stage": "prepare", "message": f"  отброшено #{c['index']}: {c['nodes']} узлов, диаг. {c['diag_px']}px"})
             page_run.stage = "prepare"
             page_run.status = "prepare_done"
             page_run.events.append({"time": now(), "stage": "prepare", "message": f"чисел {len(prepare.numbers)}, вершин {len(prepare.vertices)}"})

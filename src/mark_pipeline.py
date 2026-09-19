@@ -379,7 +379,7 @@ def outgoing_vector(stroke, node):
     return stroke.x0 - node[0], stroke.y0 - node[1]
 
 
-def pipe_component_nodes(adjacency, nodes):
+def _build_components(adjacency):
     components = []
     seen = set()
     for start in adjacency:
@@ -396,26 +396,56 @@ def pipe_component_nodes(adjacency, nodes):
                     seen.add(nb)
                     queue.append(nb)
         components.append(component)
-    if not components:
-        return set()
-    main = max(components, key=len)
-    main_x = [nodes[i][0] for i in main]
-    main_y = [nodes[i][1] for i in main]
-    main_bbox = (min(main_x), min(main_y), max(main_x), max(main_y))
+    return components
 
-    def bbox_gap(component):
-        xs = [nodes[i][0] for i in component]
-        ys = [nodes[i][1] for i in component]
-        bbox = (min(xs), min(ys), max(xs), max(ys))
-        dx = max(main_bbox[0] - bbox[2], bbox[0] - main_bbox[2], 0.0)
-        dy = max(main_bbox[1] - bbox[3], bbox[1] - main_bbox[3], 0.0)
-        return math.hypot(dx, dy)
 
+MIN_COMPONENT_DIAG_PX = 40.0
+
+
+def _component_metrics(adjacency, nodes, component):
+    xs = [nodes[i][0] for i in component]
+    ys = [nodes[i][1] for i in component]
+    diag = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+    max_degree = max((len(adjacency.get(i, [])) for i in component), default=0)
+    return diag, max_degree
+
+
+def pipe_component_nodes(adjacency, nodes):
+    """Все содержательные компоненты толстых штрихов (без отбрасывания дальних).
+
+    Отбрасываются только точечные фрагменты: короткие изолированные отрезки
+    без развилок (диагональ bbox < MIN_COMPONENT_DIAG_PX и max_degree < 3).
+    """
+    components = _build_components(adjacency)
     allowed = set()
     for component in components:
-        if component is main or bbox_gap(component) <= 55.0:
+        diag, max_degree = _component_metrics(adjacency, nodes, component)
+        if diag >= MIN_COMPONENT_DIAG_PX or max_degree >= 3:
             allowed.update(component)
     return allowed
+
+
+def components_report(pdf_path, page_number):
+    """Диагностика: сколько компонент толстых штрихов, их bbox и судьба."""
+    axis_strokes = extract_axis_strokes(pdf_path, page_number)
+    if not axis_strokes:
+        return []
+    nodes, adjacency = build_node_graph(axis_strokes)
+    components = _build_components(adjacency)
+    report = []
+    for index, component in enumerate(components):
+        diag, max_degree = _component_metrics(adjacency, nodes, component)
+        xs = [nodes[i][0] for i in component]
+        ys = [nodes[i][1] for i in component]
+        report.append({
+            "index": index,
+            "nodes": len(component),
+            "max_degree": max_degree,
+            "diag_px": round(diag, 1),
+            "bbox": [round(min(xs), 1), round(min(ys), 1), round(max(xs), 1), round(max(ys), 1)],
+            "kept": diag >= MIN_COMPONENT_DIAG_PX or max_degree >= 3,
+        })
+    return report
 
 
 def extract_vertices(pdf_path, page_number):
