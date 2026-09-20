@@ -40,8 +40,9 @@ def build_map_text(mapping: dict[str, Any]) -> str:
     lines.append("DIMENSIONS:")
     for dimension in mapping.get("dimensions", []):
         possible = ",".join(item["edge_id"] for item in dimension.get("edge_candidates", []))
+        existing = dimension.get("existing_mapping", {})
         lines.append(
-            f"{dimension['id']} value_mm={dimension['value_mm']} label_center={dimension['label_center']} selected_edge={dimension.get('selected_edge_id')} possible_edges={possible} status={dimension.get('status')}"
+            f"{dimension['id']} value_mm={dimension['value_mm']} label_center={dimension['label_center']} selected_edge={dimension.get('selected_edge_id')} possible_edges={possible} status={dimension.get('status')} attachment_kind={existing.get('attachment_kind')} dimension_stroke={existing.get('dimension_stroke')} leader_stroke={existing.get('leader_stroke')} extension_strokes={existing.get('extension_strokes')}"
         )
     lines.append("DISCARDED_NUMBERS:")
     lines.extend(f"{item['text']} reason={item['reason']}" for item in mapping.get("discarded_numbers", []))
@@ -81,9 +82,11 @@ def review_map_with_provider(
     payload = build_review_payload(mapping, map_text)
     base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
     user_content: Any = json.dumps(payload, ensure_ascii=False)
-    if pdf_path is not None and page_number is not None:
-        with fitz.open(str(pdf_path)) as document:
-            page = document[page_number - 1]
+    image_source = Path(pdf_path) if pdf_path is not None else None
+    if image_source is not None and page_number is not None and image_source.exists():
+        with fitz.open(str(image_source)) as document:
+            page_index = max(0, min(page_number - 1, document.page_count - 1))
+            page = document[page_index]
             pixmap = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
             image_data = base64.b64encode(pixmap.tobytes("png")).decode("ascii")
         user_content = [
@@ -140,12 +143,41 @@ def calculate_lengths(mapping: dict[str, Any], review: dict[str, Any]) -> dict[s
             if item.get("edge_id")
         }
     )
+
+    def is_pipe_length_candidate(candidate_id: str) -> bool:
+        row = decision_rows.get(candidate_id, {})
+        kind = row.get("kind")
+        return kind in {None, "pipe_length"}
+
+    def is_prevalidated_invalid(candidate_id: str) -> bool:
+        row = decision_rows.get(candidate_id, {})
+        if not row:
+            return False
+        decision = row.get("decision")
+        kind = row.get("kind")
+        reason = (row.get("reason") or "").lower()
+        if decision == "exclude" and kind in {"valve_dimension", "cross_sheet_dimension", "other"}:
+            return True
+        if decision == "exclude" and (
+            "handwheel" in reason
+            or "cross_sheet" in reason
+            or "see sheet" in reason
+            or "continuation" in reason
+            or "invalid_overlap" in reason
+            or "same axis" in reason
+        ):
+            return True
+        return False
+
     covered_edges: set[str] = set()
     counted_candidate_ids: list[str] = []
     duplicate_candidate_ids: list[str] = []
+    prevalidated_invalid_candidate_ids: list[str] = []
     include_rows = []
     for candidate_id, row in decision_rows.items():
-        if row.get("decision") != "include" or candidate_id not in dimensions:
+        if is_prevalidated_invalid(candidate_id):
+            prevalidated_invalid_candidate_ids.append(candidate_id)
+        if row.get("decision") != "include" or candidate_id not in dimensions or not is_pipe_length_candidate(candidate_id):
             continue
         edge_ids = row.get("covered_edge_ids") or []
         if not edge_ids and row.get("edge_id"):
@@ -164,13 +196,14 @@ def calculate_lengths(mapping: dict[str, Any], review: dict[str, Any]) -> dict[s
     ambiguous = sum(
         float(dimensions[candidate_id].get("value_mm", 0))
         for candidate_id, decision in decisions.items()
-        if candidate_id in dimensions and decision == "ambiguous"
+        if candidate_id in dimensions and decision == "ambiguous" and is_pipe_length_candidate(candidate_id)
     )
     dirty = sum(
         float(dimensions[candidate_id].get("value_mm", 0))
         for candidate_id, decision in decisions.items()
-        if candidate_id in dimensions and decision in {"include", "ambiguous"}
+        if candidate_id in dimensions and decision in {"include", "ambiguous"} and is_pipe_length_candidate(candidate_id)
     )
+
     def route_type(candidate_id: str) -> str:
         row = decision_rows.get(candidate_id, {})
         if row.get("route_type") in {"main", "branch"}:
@@ -183,7 +216,7 @@ def calculate_lengths(mapping: dict[str, Any], review: dict[str, Any]) -> dict[s
         "branch": {"clean_length_mm": 0.0, "dirty_length_mm": 0.0, "ambiguous_length_mm": 0.0},
     }
     for candidate_id, decision in decisions.items():
-        if candidate_id not in dimensions or decision not in {"include", "ambiguous"}:
+        if candidate_id not in dimensions or decision not in {"include", "ambiguous"} or not is_pipe_length_candidate(candidate_id):
             continue
         route = route_type(candidate_id)
         if route not in route_lengths:
@@ -201,14 +234,18 @@ def calculate_lengths(mapping: dict[str, Any], review: dict[str, Any]) -> dict[s
         "dirty_length_mm": round(dirty, 2),
         "clean_length_mm": round(clean, 2),
         "ambiguous_length_mm": round(ambiguous, 2),
-        "included_candidate_ids": [key for key, value in decisions.items() if value == "include"],
+        "included_candidate_ids": [key for key, value in decisions.items() if value == "include" and is_pipe_length_candidate(key)],
         "counted_candidate_ids": counted_candidate_ids,
         "duplicate_included_candidate_ids": duplicate_candidate_ids,
+        "prevalidated_invalid_candidate_ids": sorted(set(prevalidated_invalid_candidate_ids)),
+        "deterministically_invalid_candidate_ids": sorted(set(prevalidated_invalid_candidate_ids)),
         "excluded_candidate_ids": [key for key, value in decisions.items() if value == "exclude"],
-        "ambiguous_candidate_ids": [key for key, value in decisions.items() if value == "ambiguous"],
+        "ambiguous_candidate_ids": [key for key, value in decisions.items() if value == "ambiguous" and is_pipe_length_candidate(key)],
         "main": {key: round(value, 2) for key, value in route_lengths["main"].items()},
         "branch": {key: round(value, 2) for key, value in route_lengths["branch"].items()},
         "main_route": review.get("main_route", {}),
         "branch_routes": review.get("branch_routes", []),
         "cross_sheet_connections": review.get("cross_sheet_connections", []),
+        "valve_dimensions": review.get("valve_dimensions", []),
+        "cross_sheet_dimensions": review.get("cross_sheet_dimensions", []),
     }

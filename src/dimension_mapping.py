@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +70,19 @@ def _vertex_rows(pdf_path: str | Path, page_number: int) -> list[dict[str, Any]]
     ]
 
 
+def _dimension_hints_from_text(text: str) -> set[str]:
+    text = (text or "").strip()
+    if not text:
+        return set()
+    normalized = " ".join(text.split()).upper()
+    hints: set[str] = set()
+    if re.search(r"(?:СМ\.?\s*ЛИСТ|СМ\.?\s*SHEET|SEE\s+SHEET|CONTINUATION|ЛИСТ\s*\d+|SHEET\s*\d+)", text, flags=re.IGNORECASE):
+        hints.add("cross_sheet_reference")
+    if re.search(r"(?:ШТУРВАЛ|РУКОЯТКА|РУКОЯТЬ|РУЧКА|МАХОВИК|КОЛЕСО|ТРОС|РЫЧАГ|HANDWHEEL|WHEEL|HANDLE|CRANK|LEVER)", text, flags=re.IGNORECASE):
+        hints.add("handwheel")
+    return hints
+
+
 def _same_directed_contour(first: dict[str, Any], second: dict[str, Any], edge_by_id: dict[str, dict[str, Any]]) -> bool:
     first_edge = edge_by_id.get(first.get("edge_id"))
     second_edge = edge_by_id.get(second.get("edge_id"))
@@ -101,12 +115,31 @@ def _same_directed_contour(first: dict[str, Any], second: dict[str, Any], edge_b
         (second_stroke["start"][0] * unit_x + second_stroke["start"][1] * unit_y,
          second_stroke["end"][0] * unit_x + second_stroke["end"][1] * unit_y)
     )
-    if min(first_interval[1], second_interval[1]) - max(first_interval[0], second_interval[0]) <= 2.0:
+    overlap_start = max(first_interval[0], second_interval[0])
+    overlap_end = min(first_interval[1], second_interval[1])
+    interval_overlap = overlap_end - overlap_start
+    if interval_overlap <= 2.0:
         return False
     first_offset = first.get("offset_px")
     second_offset = second.get("offset_px")
-    if first_offset is not None and second_offset is not None and abs(first_offset - second_offset) <= 8.0:
+    offset_delta = None if first_offset is None or second_offset is None else abs(first_offset - second_offset)
+    if offset_delta is not None and offset_delta <= 22.0:
+        # Same straight contour / same axis: sequential labels or repeated values on one
+        # pipe segment are not true overlaps, even when projections intersect.
         return False
+    shorter_length = min(first_length, second_length)
+    # Require a substantial shared projection to mark a real overlap. A tiny overlap from
+    # a nearby label or a shifted leader line should stay valid.
+    if interval_overlap < max(10.0, 0.25 * shorter_length):
+        return False
+    first_mid = (first_interval[0] + first_interval[1]) / 2.0
+    second_mid = (second_interval[0] + second_interval[1]) / 2.0
+    center_distance = abs(first_mid - second_mid)
+    if offset_delta is not None and center_distance <= 0.15 * shorter_length and offset_delta <= 32.0:
+        return False
+    # For genuine overlap, the labels must not just be parallel; their projections need to
+    # overlap over a meaningful chunk and their perpendicular separation must indicate a
+    # distinct measurement line, not a same-axis duplicate.
     return True
 
 
@@ -327,6 +360,7 @@ def map_dimensions(pdf_path: str | Path, page_number: int) -> dict[str, Any]:
             )
             candidates.append((distance, position, projection, edge))
         candidates.sort(key=lambda item: item[0])
+        hints = _dimension_hints_from_text(text)
         if candidates and candidates[0][0] <= MAX_GAP_PX:
             distance, position, projection, edge = candidates[0]
             edge_dx = edge["end"][0] - edge["start"][0]
@@ -338,6 +372,7 @@ def map_dimensions(pdf_path: str | Path, page_number: int) -> dict[str, Any]:
                     "id": f"D{index:03d}",
                     "value": float(text.replace(",", ".")),
                     "text": text,
+                    "hints": sorted(hints),
                     "label_center": [round(center[0], 2), round(center[1], 2)],
                     "edge_id": edge["id"],
                     "position": round(position, 4),
@@ -353,6 +388,7 @@ def map_dimensions(pdf_path: str | Path, page_number: int) -> dict[str, Any]:
                     "id": f"D{index:03d}",
                     "value": float(text.replace(",", ".")),
                     "text": text,
+                    "hints": sorted(hints),
                     "label_center": [round(center[0], 2), round(center[1], 2)],
                     "edge_id": None,
                     "position": None,
@@ -363,6 +399,12 @@ def map_dimensions(pdf_path: str | Path, page_number: int) -> dict[str, Any]:
                     "reason": "no_pipe_edge_within_tolerance",
                 }
             )
+        if "cross_sheet_reference" in mapped[-1]["hints"]:
+            mapped[-1]["status"] = "cross_sheet_reference"
+            mapped[-1]["valid"] = False
+        if "handwheel" in mapped[-1]["hints"]:
+            mapped[-1]["status"] = "handwheel"
+            mapped[-1]["valid"] = False
         mapped[-1]["dimension_stroke"] = None
         attached = attached_strokes.get(mapped[-1]["id"])
         if attached is not None:
@@ -464,6 +506,74 @@ def save_dimension_mapping_pdf(
                 projection = fitz.Point(*dimension["projection"])
                 marked.draw_line(center, projection, color=color, width=0.7, dashes="[2 2] 0")
                 marked.draw_circle(projection, 2.5, color=color, fill=color, width=0.8)
+
+        output.save(str(output_pdf))
+        output.close()
+
+
+def save_preprocess_annotation_pdf(
+    pdf_path: str | Path,
+    page_number: int,
+    output_pdf: str | Path,
+    mapping: dict[str, Any],
+) -> None:
+    """Legacy local QA overlay kept for compatibility; richer than the minimal clean version."""
+    with fitz.open(str(pdf_path)) as document:
+        page = document[page_number - 1]
+        output = fitz.open()
+        marked = output.new_page(width=page.rect.width, height=page.rect.height)
+        marked.show_pdf_page(marked.rect, document, page_number - 1)
+
+        for vertex in mapping.get("vertices", []):
+            color = mark_pipeline.VERTEX_ROLE_COLORS.get(vertex.get("role"), (0, 0, 0))
+            center = fitz.Point(vertex["x"], vertex["y"])
+            marked.draw_circle(center, 6, color=color, fill=color, width=1.2)
+            marked.insert_text(center + (8, -8), vertex.get("id", "V?"), fontsize=8, fontname="helv", color=color)
+
+        for dimension in mapping.get("dimensions", []):
+            label_center = dimension.get("label_center")
+            if not label_center:
+                continue
+            if dimension.get("status") in {"cross_sheet_reference", "handwheel", "unresolved", "invalid_overlap"}:
+                continue
+            center = fitz.Point(*label_center)
+            rect = fitz.Rect(center.x - 18, center.y - 10, center.x + 22, center.y + 10)
+            marked.draw_rect(rect, color=(0.0, 0.55, 0.15), fill=None, width=1.2)
+
+        output.save(str(output_pdf))
+        output.close()
+
+
+def save_clean_local_markup_pdf(
+    pdf_path: str | Path,
+    page_number: int,
+    output_pdf: str | Path,
+    mapping: dict[str, Any],
+) -> None:
+    """Pure QA overlay: vertex markers and minimal boxes around selected dimension numbers only."""
+    with fitz.open(str(pdf_path)) as document:
+        page = document[page_number - 1]
+        output = fitz.open()
+        marked = output.new_page(width=page.rect.width, height=page.rect.height)
+        marked.show_pdf_page(marked.rect, document, page_number - 1)
+
+        for vertex in mapping.get("vertices", []):
+            color = mark_pipeline.VERTEX_ROLE_COLORS.get(vertex.get("role"), (0, 0, 0))
+            center = fitz.Point(vertex["x"], vertex["y"])
+            marked.draw_circle(center, 6, color=color, fill=color, width=1.2)
+            marked.insert_text(center + (8, -8), vertex.get("id", "V?"), fontsize=8, fontname="helv", color=color)
+
+        for dimension in mapping.get("dimensions", []):
+            label_center = dimension.get("label_center")
+            if not label_center:
+                continue
+            if dimension.get("status") in {"cross_sheet_reference", "handwheel", "unresolved", "invalid_overlap"}:
+                continue
+            if not dimension.get("valid", True):
+                continue
+            center = fitz.Point(*label_center)
+            rect = fitz.Rect(center.x - 20, center.y - 12, center.x + 24, center.y + 12)
+            marked.draw_rect(rect, color=(0.0, 0.55, 0.15), fill=None, width=1.2)
 
         output.save(str(output_pdf))
         output.close()
@@ -649,4 +759,11 @@ def run_dimension_mapping(pdf_path: str | Path, page_number: int, output_pdf: st
     return mapping
 
 
-__all__ = ["map_dimensions", "run_dimension_mapping", "save_dimension_mapping_pdf", "save_clean_graph_pdf", "save_skeleton_pdf"]
+__all__ = [
+    "map_dimensions",
+    "run_dimension_mapping",
+    "save_dimension_mapping_pdf",
+    "save_preprocess_annotation_pdf",
+    "save_clean_graph_pdf",
+    "save_skeleton_pdf",
+]

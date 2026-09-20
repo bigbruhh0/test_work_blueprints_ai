@@ -19,7 +19,13 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from src import db as run_db
-from src.dimension_mapping import run_dimension_mapping, save_clean_graph_pdf, save_skeleton_pdf
+from src.dimension_mapping import (
+    run_dimension_mapping,
+    save_clean_graph_pdf,
+    save_clean_local_markup_pdf,
+    save_preprocess_annotation_pdf,
+    save_skeleton_pdf,
+)
 from src.distance_ai import call_distance_ai_trace
 from src.dimension_review import build_map_text, calculate_lengths, review_map_with_provider
 from src.prepare_stage import run_prepare
@@ -33,16 +39,16 @@ ARTIFACTS_DIR = ROOT / ".cache" / "mark_runs"
 load_dotenv(ROOT / ".env")
 
 PIPELINE_STEPS = [
-    ("prepare", "Подготовка файлов (числа + вершины)"),
-    ("dimensions", "Привязка размеров к графу трубы"),
+    ("local_processing", "Локальная обработка"),
     ("dimension_review", "Карта размеров + проверка провайдером"),
     ("analyze", "Анализ у провайдера"),
 ]
 
 # Расширяемый реестр конфигураций запуска. stop_stage -> ключ + человекочитаемая метка.
 RUN_KIND_BY_STAGE = {
-    "prepare": ("local_prepare", "Локальная подготовка (без ИИ)"),
-    "dimensions": ("dimension_mapping", "Привязка размеров к графу трубы"),
+    "local_processing": ("local_processing", "Локальная обработка"),
+    "prepare": ("local_prepare", "Локальная обработка"),
+    "dimensions": ("dimension_mapping", "Локальная обработка"),
     "dimension_review": ("dimension_review", "Карта размеров + проверка провайдером"),
     "analyze": ("deepseek_analyze", "Анализ DeepSeek"),
 }
@@ -184,6 +190,7 @@ class AnalyzeBody(BaseModel):
     document_id: str
     line_ids: list[str]
     stop_stage: str = "analyze"
+    excluded_pages: list[int] = []
 
 
 @app.get("/api/prompts")
@@ -266,10 +273,20 @@ def create_run(body: AnalyzeBody) -> dict[str, Any]:
     if not document:
         raise HTTPException(404, "Документ не найден")
     stop_stage = (body.stop_stage or "analyze").strip().lower()
-    if stop_stage not in {"prepare", "dimensions", "dimension_review", "analyze"}:
-        raise HTTPException(400, "stop_stage: prepare|dimensions|dimension_review|analyze")
+    if stop_stage not in {"local_processing", "prepare", "dimensions", "dimension_review", "analyze"}:
+        raise HTTPException(400, "stop_stage: local_processing|dimension_review|analyze")
+    if stop_stage in {"prepare", "dimensions"}:
+        stop_stage = "local_processing"
     run_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     kind, kind_label = RUN_KIND_BY_STAGE.get(stop_stage, (stop_stage, stop_stage))
+    excluded_pages = set()
+    for page_number in body.excluded_pages or []:
+        try:
+            value = int(page_number)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            excluded_pages.add(value)
     run = RunState(
         run_id=run_id,
         document_id=body.document_id,
@@ -284,7 +301,12 @@ def create_run(body: AnalyzeBody) -> dict[str, Any]:
     )
     for line_id in body.line_ids:
         group = _group(document, line_id)
-        run.lines[line_id] = LineRun(line_id=line_id, pages=[page.page_number for page in (group.pages if group else [])])
+        pages = [page.page_number for page in (group.pages if group else []) if page.page_number not in excluded_pages]
+        if not pages:
+            continue
+        run.lines[line_id] = LineRun(line_id=line_id, pages=pages)
+    if not run.lines:
+        raise HTTPException(400, "После исключения листов не осталось страниц для анализа")
     STATE["runs"][run_id] = run
     run_db.save_run(run_dict(run))
     context = {
@@ -339,19 +361,27 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
             page_run.status = "prepare_done"
             page_run.events.append({"time": now(), "stage": "prepare", "message": f"чисел {len(prepare.numbers)}, координат {len(prepare.coordinates)}, вершин {len(prepare.vertices)}"})
             _persist(run)
-            if stop_stage == "prepare":
-                page_run.status = "complete"
+            if stop_stage in {"prepare", "local_processing"}:
+                page_run.stage = "prepare"
+                page_run.status = "prepare_done"
                 _persist(run)
-                return
+                if stop_stage == "prepare":
+                    page_run.status = "complete"
+                    _persist(run)
+                    return
 
-            if stop_stage in {"dimensions", "dimension_review"}:
+            if stop_stage in {"local_processing", "dimensions", "dimension_review"}:
                 page_run.stage = "dimensions"
                 page_run.status = "running"
-                page_run.events.append({"time": now(), "stage": "dimensions", "message": "привязка размеров к отрезкам графа трубы"})
+                page_run.events.append({"time": now(), "stage": "dimensions", "message": "локальная обработка: разметка и привязка размеров"})
                 pdf_stem = Path(pdf_path).stem
                 dimensions_pdf = run_dir / f"{pdf_stem}_page{page_run.page_number}_dimensions_marked.pdf"
                 dimensions_json = run_dir / f"{pdf_stem}_page{page_run.page_number}_dimensions.json"
                 mapping = run_dimension_mapping(pdf_path, page_run.page_number, dimensions_pdf, dimensions_json)
+                preprocess_pdf = run_dir / f"{pdf_stem}_page{page_run.page_number}_preprocess_annotations.pdf"
+                save_preprocess_annotation_pdf(pdf_path, page_run.page_number, preprocess_pdf, mapping)
+                clean_markup_pdf = run_dir / f"{pdf_stem}_page{page_run.page_number}_clean_local_markup.pdf"
+                save_clean_local_markup_pdf(pdf_path, page_run.page_number, clean_markup_pdf, mapping)
                 clean_graph_pdf = run_dir / f"{pdf_stem}_page{page_run.page_number}_dimension_graph.pdf"
                 save_clean_graph_pdf(pdf_path, page_run.page_number, clean_graph_pdf, mapping)
                 skeleton_pdf = run_dir / f"{pdf_stem}_page{page_run.page_number}_dimension_skeleton.pdf"
@@ -364,6 +394,8 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                 page_run.analysis = {"dimension_mapping": mapping, "dimension_map": dimension_map}
                 page_run.files["dimensions_pdf"] = dimensions_pdf.name
                 page_run.files["dimensions_json"] = dimensions_json.name
+                page_run.files["preprocess_annotations_pdf"] = preprocess_pdf.name
+                page_run.files["clean_local_markup_pdf"] = clean_markup_pdf.name
                 page_run.files["dimension_graph_pdf"] = clean_graph_pdf.name
                 page_run.files["dimension_skeleton_pdf"] = skeleton_pdf.name
                 page_run.files["dimension_map_pdf"] = dimension_map_pdf.name
@@ -373,12 +405,15 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                     dimension_map_txt = run_dir / f"{pdf_stem}_page{page_run.page_number}_dimension_map.txt"
                     review_json = run_dir / f"{pdf_stem}_page{page_run.page_number}_dimension_review.json"
                     dimension_map_txt.write_text(map_text, encoding="utf-8")
+                    review_pdf_path = run_dir / f"{pdf_stem}_page{page_run.page_number}_clean_local_markup.pdf"
+                    if not review_pdf_path.exists():
+                        review_pdf_path = Path(pdf_path)
                     review_trace = review_map_with_provider(
                         dimension_map,
                         map_text,
                         api_key,
                         model,
-                        pdf_path=Path(pdf_path),
+                        pdf_path=review_pdf_path,
                         page_number=page_run.page_number,
                     )
                     review = review_trace["answer"]

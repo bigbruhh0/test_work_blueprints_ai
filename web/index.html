@@ -43,11 +43,13 @@
         <div class="run-toolbar">
           <label class="check-row">Делать до этапа
             <select id="stop-stage">
-              <option value="prepare">Подготовка файлов (числа + вершины)</option>
-              <option value="dimensions">Привязка размеров к графу трубы</option>
+              <option value="local_processing">Локальная обработка</option>
               <option value="dimension_review">Карта размеров + проверка провайдером</option>
               <option value="analyze">Полный анализ у провайдера</option>
             </select>
+          </label>
+          <label class="check-row">Исключить листы
+            <input id="exclude-pages" type="text" placeholder="Напр. 7, 12-15" aria-label="Листы для исключения">
           </label>
           <button class="primary-button" id="start-analysis" disabled>Начать анализ <span>→</span></button>
         </div>

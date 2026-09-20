@@ -1,11 +1,24 @@
 PROMPT_TEMPLATE = """Ты анализируешь диагностическую карту трубопровода.
 
 Для каждого кандидата размера верни решение include, exclude или ambiguous.
+Перед решением классифицируй кандидат как kind=pipe_length, valve_dimension, cross_sheet_dimension или other.
 Для итогов используй правило: clean_length_mm — сумма уверенно включённых кандидатов без дублей; dirty_length_mm — сумма всех кандидатов с решением include или ambiguous, включая дубли и сомнительные размеры. Кандидаты exclude не входят ни в clean, ни в dirty.
 Нужно исключать из суммы:
 1. размерные кандидаты, которые полностью перекрываются другим более длинным размером на том же направлении/отрезке;
 2. штурвалы, арматуру, опоры, детали, выноски и прочие объекты, которые не являются длиной трубы;
 3. размеры соседней линии, таблицы, спецификации и штампа.
+
+Размер штурвала, задвижки, клапана, патрубка или другой арматуры никогда не является длиной трубы: decision=exclude, но добавь его в valve_dimensions с candidate_id, object_type, value_mm, from_vertex, to_vertex, edge_id и reason. Эти данные нужны отдельно для 3D-модели.
+
+Если на чертеже есть явное обозначение «СМ. ЛИСТ N», «ЛИСТ N», continuation или другая отметка продолжения, размер относится к cross-sheet_dimensions: decision=exclude из длины трубы, но добавь запись с candidate_id, value_mm, from_vertex, to_vertex, edge_id, target_sheet, label и reason. Отсутствие второй выносной линии не отменяет этот признак.
+
+Если у крайних вершин/метки есть пометка вида «СМ. ЛИСТ», «ЛИСТ N», «SEE SHEET», «CONTINUATION» и размерная линия не имеет явного выноса с двух сторон, это длина отрезка, относящаяся к другому листу, а не к текущему участку трубы. Такая отметка должна быть помечена как cross_sheet_reference и вынесена в cross_sheet_dimensions с decision=exclude; она не считается длиной текущего edge.
+
+Если existing_mapping.valid=false, status=invalid_overlap или указан conflict_with, это детерминированный дубль: decision=exclude, а не ambiguous. Если размерная линия последовательно разделена стрелками/выносами на несколько участков, не считай соседние значения перекрытием только из-за общего stroke; анализируй точки разделения, порядок участков и фактическое покрытие по одному и тому же сегменту. Последовательные размеры на одной оси, но с разными стрелками/выносами и не перекрывающимися по проекции, должны оставаться отдельными размерами, а не автоматически считаться дублями.
+
+Размеры рукоятки, штурвала, колеса, маховика, ручки, троса/рычага, задвижки, клапана и прочей арматуры никогда не являются длиной трубы: decision=exclude, но добавь его в valve_dimensions как object_type='handwheel' или 'valve'/'fitting'/'support'/'other' с from_vertex/to_vertex и edge_id. Если на чертеже видна отдельная рукоятка/штурвал у арматуры, не сопоставляй её с трубным участком, даже если она стоит на той же оси или рядом с размерами трубы. Ищи отдельно штурвал, рукоятку и маховик по меткам типа 'ШТУРВАЛ', 'HANDWHEEL', 'РУКОЯТКА', 'КОЛЕСО', 'МАХОВИК'.
+
+Не сравнивай числовой размер с pixel_length, пиксельным расстоянием, масштабом изображения или видимой длиной линии: масштаб чертежа может быть условным и искажённым. Пиксельная геометрия нужна только для топологии, направления и определения точки привязки стрелки. Продолжение на другой лист может иметь одну выноску или размерную линию, продолжающуюся вдоль контура; две выносные линии не обязательны. Отсутствие второй выносной линии не отменяет признак cross_sheet_dimension, если есть явное обозначение вида «СМ. ЛИСТ N», «ЛИСТ N» или продолжения/врезки. Когда у размера нет явного выноса с двух сторон и при этом есть метка типа «СМ. ЛИСТ», значит это длина другого листа, а не текущий размер на этом чертеже.
 
 Не меняй геометрию и не создавай новые вершины или рёбра. Сохраняй связь кандидата с edge_id и vertex_pair.
 Если один размер покрывает несколько последовательных рёбер или полностью включает другой размер, укажи все покрытые рёбра в covered_edge_ids. Для полного размера выбирай covered_edge_ids шире, чем для его частичного дубля.
@@ -13,12 +26,14 @@ PROMPT_TEMPLATE = """Ты анализируешь диагностическу�
 Классифицируй каждый edge как route_type=main или route_type=branch. Ответвление начинается от синей вершины с role=junction. Основной маршрут — путь от одного endpoint до другого endpoint с наибольшим количеством последовательных секторов; верни его в main_route. Все остальные пути от junction верни в branch_routes. Если видишь обозначение продолжения на другой странице или место врезки/перехода на другой лист, верни его в cross_sheet_connections с vertex_id, текстом обозначения и предполагаемым номером/линией листа.
 Верни только JSON:
 {
-  "candidate_decisions": [{"candidate_id":"D001","decision":"include|exclude|ambiguous","reason":"...","edge_id":"E001","covered_edge_ids":["E001"]}],
-  "edge_decisions": [{"edge_id":"E001","vertex_pair":["V01","V02"],"route_type":"main|branch","junction_vertex_id":null,"candidate_ids":["D001"],"included_candidate_ids":[],"excluded_candidate_ids":[],"ambiguous_candidate_ids":[],"covered_by_candidate_ids":[],"reason":"..."}],
-  "main_route": {"endpoint_vertices":["V01","V02"],"edge_ids":["E001"],"reason":"..."},
-  "branch_routes": [{"junction_vertex_id":"V08","endpoint_vertex_id":"V05","edge_ids":["E006"],"candidate_ids":["D005"],"reason":"..."}],
-  "cross_sheet_connections": [{"vertex_id":"V08","label":"...","target_sheet":"...","connection_type":"continuation|tie_in|unknown","reason":"..."}],
-  "pipe_objects": [{"type":"handwheel|valve|support|other","label":"...","edge_id":"E001","reason":"..."}],
+  "candidate_decisions": [{"candidate_id":"<candidate_id>","kind":"pipe_length|valve_dimension|cross_sheet_dimension|other","decision":"include|exclude|ambiguous","reason":"...","edge_id":"<edge_id>","covered_edge_ids":["<edge_id>"]}],
+  "edge_decisions": [{"edge_id":"<edge_id>","vertex_pair":["<from_vertex>","<to_vertex>"],"route_type":"main|branch","junction_vertex_id":null,"candidate_ids":["<candidate_id>"],"included_candidate_ids":[],"excluded_candidate_ids":[],"ambiguous_candidate_ids":[],"covered_by_candidate_ids":[],"reason":"..."}],
+  "main_route": {"endpoint_vertices":["<endpoint_a>","<endpoint_b>"],"edge_ids":["<edge_id>"],"reason":"..."},
+  "branch_routes": [{"junction_vertex_id":"<junction_vertex>","endpoint_vertex_id":"<endpoint_vertex>","edge_ids":["<edge_id>"],"candidate_ids":["<candidate_id>"],"reason":"..."}],
+  "cross_sheet_connections": [{"vertex_id":"<vertex_id>","label":"...","target_sheet":"...","connection_type":"continuation|tie_in|unknown","reason":"..."}],
+  "valve_dimensions": [{"candidate_id":"<candidate_id>","object_type":"handwheel|valve|fitting|support|other","value_mm":0,"from_vertex":"<vertex_id>","to_vertex":"<vertex_id>","edge_id":"<edge_id>","reason":"..."}],
+  "cross_sheet_dimensions": [{"candidate_id":"<candidate_id>","value_mm":0,"from_vertex":"<vertex_id>","to_vertex":"<vertex_id>","edge_id":"<edge_id>","target_sheet":"<sheet>","label":"...","reason":"..."}],
+  "pipe_objects": [{"type":"handwheel|valve|support|other","label":"...","edge_id":"<edge_id>","reason":"..."}],
   "notes": []
 }
 """

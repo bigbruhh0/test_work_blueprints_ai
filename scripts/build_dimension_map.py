@@ -23,7 +23,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src import dimension_mapping, mark_pipeline  # noqa: E402
-from src.dimension_mapping import MAX_GAP_PX, _distance_to_segment  # noqa: E402
+from src.dimension_mapping import _distance_to_segment  # noqa: E402
 
 
 EDGE_COLOR = (0.05, 0.38, 0.85)
@@ -34,9 +34,13 @@ DIMENSION_COLORS = {
     "ambiguous": (0.95, 0.6, 0.0),
     "unresolved": (0.85, 0.05, 0.05),
 }
-MAX_CANDIDATE_EDGE_GAP_PX = 45.0
-MAX_VERTEX_ANCHOR_GAP_PX = 18.0
-GRAPH_EPS = 4.0
+GEOMETRY_CONFIG = {
+    "candidate_edge_gap_px": 45.0,
+    "vertex_anchor_gap_px": 18.0,
+    "graph_eps_px": 4.0,
+    "collinear_cosine": 0.97,
+    "stroke_match_gap_px": 2.0,
+}
 
 
 def _distance(a: tuple[float, float], b: tuple[float, float]) -> float:
@@ -77,7 +81,7 @@ def _stroke_graph(pdf_path: Path, page_number: int) -> dict[str, Any]:
                 (first_dx * second_dx + first_dy * second_dy)
                 / ((math.hypot(first_dx, first_dy) or 1.0) * (math.hypot(second_dx, second_dy) or 1.0))
             )
-            if cosine < 0.97:
+            if cosine < GEOMETRY_CONFIG["collinear_cosine"]:
                 continue
             endpoint_pairs = [
                 (first_nodes[1], second_nodes[0], _distance((first.x1, first.y1), (second.x0, second.y0))),
@@ -86,7 +90,7 @@ def _stroke_graph(pdf_path: Path, page_number: int) -> dict[str, Any]:
                 (first_nodes[1], second_nodes[1], _distance((first.x1, first.y1), (second.x1, second.y1))),
             ]
             node_a, node_b, gap = min(endpoint_pairs, key=lambda item: item[2])
-            if node_a is None or node_b is None or node_a == node_b or gap > MAX_VERTEX_ANCHOR_GAP_PX:
+            if node_a is None or node_b is None or node_a == node_b or gap > GEOMETRY_CONFIG["vertex_anchor_gap_px"]:
                 continue
             adjacency.setdefault(node_a, []).append((node_b, -1))
             adjacency.setdefault(node_b, []).append((node_a, -1))
@@ -178,7 +182,7 @@ def _build_edges(
     anchors: dict[str, int] = {}
     for vertex in vertices:
         node, gap = _nearest_node((vertex["x"], vertex["y"]), nodes)
-        if node is not None and gap <= MAX_VERTEX_ANCHOR_GAP_PX:
+        if node is not None and gap <= GEOMETRY_CONFIG["vertex_anchor_gap_px"]:
             anchors[vertex["id"]] = node
 
     ordered_vertices = list(vertices)
@@ -199,9 +203,9 @@ def _build_edges(
                 stroke = strokes[stroke_index]
                 first, first_gap = _nearest_node((stroke.x0, stroke.y0), nodes)
                 last, last_gap = _nearest_node((stroke.x1, stroke.y1), nodes)
-                if first is not None and first_gap <= GRAPH_EPS:
+                if first is not None and first_gap <= GEOMETRY_CONFIG["graph_eps_px"]:
                     path_nodes.add(first)
-                if last is not None and last_gap <= GRAPH_EPS:
+                if last is not None and last_gap <= GEOMETRY_CONFIG["graph_eps_px"]:
                     path_nodes.add(last)
             intermediate_anchors = [
                 vertex_id for vertex_id, node in anchors.items()
@@ -238,7 +242,7 @@ def _build_edges(
             continue
         start_node, start_gap = _nearest_node((stroke.x0, stroke.y0), nodes)
         end_node, end_gap = _nearest_node((stroke.x1, stroke.y1), nodes)
-        if start_node not in allowed or end_node not in allowed or start_gap > GRAPH_EPS or end_gap > GRAPH_EPS:
+        if start_node not in allowed or end_node not in allowed or start_gap > GEOMETRY_CONFIG["graph_eps_px"] or end_gap > GEOMETRY_CONFIG["graph_eps_px"]:
             continue
         edges.append(
             {
@@ -302,7 +306,7 @@ def _collinear_edges(first: dict[str, Any], second: dict[str, Any]) -> bool:
         _distance(tuple(first["end"]), tuple(second["start"])),
         _distance(tuple(first["end"]), tuple(second["end"])),
     )
-    return cosine >= 0.97 and shared_endpoint <= GRAPH_EPS
+    return cosine >= GEOMETRY_CONFIG["collinear_cosine"] and shared_endpoint <= GEOMETRY_CONFIG["graph_eps_px"]
 
 
 def _stroke_index_for_source_edge(source_edge: dict[str, Any], strokes: list[Any]) -> int | None:
@@ -316,7 +320,7 @@ def _stroke_index_for_source_edge(source_edge: dict[str, Any], strokes: list[Any
     if not matches:
         return None
     distance, index = min(matches)
-    return index if distance <= 2.0 else None
+    return index if distance <= GEOMETRY_CONFIG["stroke_match_gap_px"] else None
 
 
 def _map_dimensions(
@@ -366,7 +370,7 @@ def _map_dimensions(
                 fallback.append((distance, edge, position))
             if fallback:
                 distance, candidate, _position = min(fallback, key=lambda item: item[0])
-                if distance <= MAX_CANDIDATE_EDGE_GAP_PX:
+                if distance <= GEOMETRY_CONFIG["candidate_edge_gap_px"]:
                     target_edge = candidate
         candidate_edges = [target_edge] if target_edge is not None else []
         if target_edge is not None and base.get("status") == "leader_attached":
@@ -377,27 +381,6 @@ def _map_dimensions(
                 and edge["id"] != target_edge["id"]
                 and _collinear_edges(target_edge, edge)
             )
-        dimension_stroke = base.get("dimension_stroke")
-        if target_edge is not None and dimension_stroke and dimension_stroke.get("length_px", 0) >= 180 and base.get("status") == "leader_attached":
-            stroke_dx = dimension_stroke["end"][0] - dimension_stroke["start"][0]
-            stroke_dy = dimension_stroke["end"][1] - dimension_stroke["start"][1]
-            stroke_center = (
-                (dimension_stroke["start"][0] + dimension_stroke["end"][0]) / 2,
-                (dimension_stroke["start"][1] + dimension_stroke["end"][1]) / 2,
-            )
-            target_distance = _edge_distance(stroke_center, target_edge)[0]
-            for edge in edges:
-                if edge["status"] != "mapped" or edge["id"] in {item["id"] for item in candidate_edges}:
-                    continue
-                edge_dx = edge["end"][0] - edge["start"][0]
-                edge_dy = edge["end"][1] - edge["start"][1]
-                cosine = abs(
-                    (stroke_dx * edge_dx + stroke_dy * edge_dy)
-                    / ((math.hypot(stroke_dx, stroke_dy) or 1.0) * (math.hypot(edge_dx, edge_dy) or 1.0))
-                )
-                edge_distance = _edge_distance(stroke_center, edge)[0]
-                if cosine >= 0.97 and edge_distance <= min(55.0, target_distance + 18.0):
-                    candidate_edges.append(edge)
         possibilities = []
         for candidate_edge in candidate_edges:
             distance, position = _edge_distance((center[0], center[1]), candidate_edge)
@@ -484,7 +467,7 @@ def build_map(pdf_path: Path, page_number: int) -> dict[str, Any]:
     return {
         "pdf": pdf_path.name,
         "page": page_number,
-        "tolerance_px": MAX_GAP_PX,
+        "tolerance_px": GEOMETRY_CONFIG["candidate_edge_gap_px"],
         "vertices": vertices,
         "uncertain_vertices": uncertain_vertices,
         "edges": edges,

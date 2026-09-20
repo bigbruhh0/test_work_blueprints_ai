@@ -4,8 +4,8 @@ const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 const esc = (value) => String(value ?? '').replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
 const STAGE_LABELS = {
-  prepare: 'Подготовка файлов',
-  dimensions: 'Привязка размеров',
+  prepare: 'Локальная подготовка + разметка',
+  dimensions: 'Локальная подготовка + привязка размеров',
   dimension_review: 'Карта размеров + проверка провайдером',
   analyze: 'Анализ у провайдера',
   done: 'Готово',
@@ -240,13 +240,45 @@ function renderGroups(groups) {
   $('#groups-count').textContent = groups.length + ' групп · 0 выбрано';
 }
 
+function parseExcludedPages(rawValue) {
+  if (!rawValue || !rawValue.trim()) return [];
+  const numbers = new Set();
+  for (const token of rawValue.split(',')) {
+    const text = token.trim();
+    if (!text) continue;
+    if (text.includes('-')) {
+      const [startText, endText] = text.split('-', 2);
+      const start = Number(startText.trim());
+      const end = Number(endText.trim());
+      if (!Number.isFinite(start) || !Number.isFinite(end) || start <= 0 || end <= 0 || start > end) {
+        throw new Error('Некорректный диапазон листов: ' + text);
+      }
+      for (let page = start; page <= end; page += 1) numbers.add(page);
+      continue;
+    }
+    const page = Number(text);
+    if (!Number.isFinite(page) || page <= 0) {
+      throw new Error('Некорректный номер листа: ' + text);
+    }
+    numbers.add(page);
+  }
+  return Array.from(numbers).sort((a, b) => a - b);
+}
+
 async function startAnalysis() {
   const lineIds = $$('#groups-list input:checked').map((item) => item.value);
   if (!lineIds.length) { alert('Выберите хотя бы одну линию'); return; }
+  let excludedPages = [];
+  try {
+    excludedPages = parseExcludedPages($('#exclude-pages').value);
+  } catch (error) {
+    alert(error.message);
+    return;
+  }
   try {
     const response = await api('/api/runs', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ document_id: state.document.document_id, line_ids: lineIds, stop_stage: $('#stop-stage').value }),
+      body: JSON.stringify({ document_id: state.document.document_id, line_ids: lineIds, stop_stage: $('#stop-stage').value, excluded_pages: excludedPages }),
     });
     state.runId = response.run_id;
     $('#runs-section').hidden = false;
@@ -316,10 +348,12 @@ function renderRun(run) {
 }
 
 const VIEWER_TABS = [
+  { key: 'clean_local_markup_pdf', label: 'Локальная разметка (чистая)' },
   { key: 'numbers_pdf', label: 'Разметка чисел' },
   { key: 'vertices_pdf', label: 'Вершины' },
   { key: 'coordinates_pdf', label: 'Координаты' },
   { key: 'numbers_txt', label: 'Числа (TXT)' },
+  { key: 'preprocess_annotations_pdf', label: 'Локальная разметка (старая)' },
   { key: 'dimensions_pdf', label: 'Размеры на графе' },
   { key: 'dimension_graph_pdf', label: 'Чистый граф трубы' },
   { key: 'dimension_skeleton_pdf', label: 'Контур и размерные линии' },
@@ -833,8 +867,11 @@ function pageDetailHtml(lineId, pr) {
     const crossSheetInfo = review && (review.cross_sheet_connections || []).length
       ? '<p><b>Переходы на другие листы:</b> ' + review.cross_sheet_connections.map(function (item) { return esc((item.vertex_id || '?') + ': ' + (item.label || item.target_sheet || '')); }).join('; ') + '</p>'
       : '';
+    const invalidCandidates = (lengths.deterministically_invalid_candidate_ids || []).length
+      ? '<div class="notes"><b>Предварительно невалидно</b><p><span class="badge err">не считается в длине</span> ' + esc((lengths.deterministically_invalid_candidate_ids || []).join(', ') || '—') + '</p></div>'
+      : '';
     const reviewBlock = review
-      ? '<div class="review-summary"><div class="kpi"><div><span class="kpi-label">Чистая длина</span><strong>' + esc(lengths.clean_length_mm) + ' мм</strong></div><div><span class="kpi-label">Грязная длина</span><strong>' + esc(lengths.dirty_length_mm) + ' мм</strong></div></div><div class="route-kpis">' + routeKpi('Основная линия', lengths.main) + routeKpi('Ответвления', lengths.branch) + '</div><div class="notes"><b>Проверка провайдером</b><p>Сомнения: <b>' + esc(lengths.ambiguous_length_mm) + ' мм</b> · дубли включённых: ' + esc((lengths.duplicate_included_candidate_ids || []).join(', ') || '—') + '</p>' + branchInfo + crossSheetInfo + '<p>include: ' + esc((lengths.included_candidate_ids || []).join(', ') || '—') + '<br>exclude: ' + esc((lengths.excluded_candidate_ids || []).join(', ') || '—') + '<br>ambiguous: ' + esc((lengths.ambiguous_candidate_ids || []).join(', ') || '—') + '</p></div></div>'
+      ? '<div class="review-summary"><div class="kpi"><div><span class="kpi-label">Чистая длина</span><strong>' + esc(lengths.clean_length_mm) + ' мм</strong></div><div><span class="kpi-label">Грязная длина</span><strong>' + esc(lengths.dirty_length_mm) + ' мм</strong></div></div><div class="route-kpis">' + routeKpi('Основная линия', lengths.main) + routeKpi('Ответвления', lengths.branch) + '</div><div class="notes"><b>Проверка провайдером</b><p>Сомнения: <b>' + esc(lengths.ambiguous_length_mm) + ' мм</b> · дубли включённых: ' + esc((lengths.duplicate_included_candidate_ids || []).join(', ') || '—') + '</p>' + branchInfo + crossSheetInfo + '<p>include: ' + esc((lengths.included_candidate_ids || []).join(', ') || '—') + '<br>exclude: ' + esc((lengths.excluded_candidate_ids || []).join(', ') || '—') + '<br>ambiguous: ' + esc((lengths.ambiguous_candidate_ids || []).join(', ') || '—') + '</p></div>' + invalidCandidates + '</div>'
       : '';
     return '<h4>Лист ' + pr.page_number + ' — привязка размеров</h4>'
       + '<p class="muted">Рёбер графа: ' + (mapping.edges || []).length + ' · размеров: ' + dimensions.length + '</p>'
