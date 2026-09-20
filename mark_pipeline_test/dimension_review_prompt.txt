@@ -1,0 +1,24 @@
+PROMPT_TEMPLATE = """Ты анализируешь диагностическую карту трубопровода.
+
+Для каждого кандидата размера верни решение include, exclude или ambiguous.
+Для итогов используй правило: clean_length_mm — сумма уверенно включённых кандидатов без дублей; dirty_length_mm — сумма всех кандидатов с решением include или ambiguous, включая дубли и сомнительные размеры. Кандидаты exclude не входят ни в clean, ни в dirty.
+Нужно исключать из суммы:
+1. размерные кандидаты, которые полностью перекрываются другим более длинным размером на том же направлении/отрезке;
+2. штурвалы, арматуру, опоры, детали, выноски и прочие объекты, которые не являются длиной трубы;
+3. размеры соседней линии, таблицы, спецификации и штампа.
+
+Не меняй геометрию и не создавай новые вершины или рёбра. Сохраняй связь кандидата с edge_id и vertex_pair.
+Если один размер покрывает несколько последовательных рёбер или полностью включает другой размер, укажи все покрытые рёбра в covered_edge_ids. Для полного размера выбирай covered_edge_ids шире, чем для его частичного дубля.
+Для каждого edge верни решения кандидатов и объяснение. Отдельно перечисли найденные pipe_objects, которые нужно рисовать на 3D-модели, но не включать в длину.
+Классифицируй каждый edge как route_type=main или route_type=branch. Ответвление начинается от синей вершины с role=junction. Основной маршрут — путь от одного endpoint до другого endpoint с наибольшим количеством последовательных секторов; верни его в main_route. Все остальные пути от junction верни в branch_routes. Если видишь обозначение продолжения на другой странице или место врезки/перехода на другой лист, верни его в cross_sheet_connections с vertex_id, текстом обозначения и предполагаемым номером/линией листа.
+Верни только JSON:
+{
+  "candidate_decisions": [{"candidate_id":"D001","decision":"include|exclude|ambiguous","reason":"...","edge_id":"E001","covered_edge_ids":["E001"]}],
+  "edge_decisions": [{"edge_id":"E001","vertex_pair":["V01","V02"],"route_type":"main|branch","junction_vertex_id":null,"candidate_ids":["D001"],"included_candidate_ids":[],"excluded_candidate_ids":[],"ambiguous_candidate_ids":[],"covered_by_candidate_ids":[],"reason":"..."}],
+  "main_route": {"endpoint_vertices":["V01","V02"],"edge_ids":["E001"],"reason":"..."},
+  "branch_routes": [{"junction_vertex_id":"V08","endpoint_vertex_id":"V05","edge_ids":["E006"],"candidate_ids":["D005"],"reason":"..."}],
+  "cross_sheet_connections": [{"vertex_id":"V08","label":"...","target_sheet":"...","connection_type":"continuation|tie_in|unknown","reason":"..."}],
+  "pipe_objects": [{"type":"handwheel|valve|support|other","label":"...","edge_id":"E001","reason":"..."}],
+  "notes": []
+}
+"""

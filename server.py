@@ -21,6 +21,7 @@ from pydantic import BaseModel
 from src import db as run_db
 from src.dimension_mapping import run_dimension_mapping, save_clean_graph_pdf, save_skeleton_pdf
 from src.distance_ai import call_distance_ai_trace
+from src.dimension_review import build_map_text, calculate_lengths, review_map_with_provider
 from src.prepare_stage import run_prepare
 from scripts.build_dimension_map import build_map as build_dimension_map, render_pdf as render_dimension_map
 
@@ -34,6 +35,7 @@ load_dotenv(ROOT / ".env")
 PIPELINE_STEPS = [
     ("prepare", "Подготовка файлов (числа + вершины)"),
     ("dimensions", "Привязка размеров к графу трубы"),
+    ("dimension_review", "Карта размеров + проверка провайдером"),
     ("analyze", "Анализ у провайдера"),
 ]
 
@@ -41,6 +43,7 @@ PIPELINE_STEPS = [
 RUN_KIND_BY_STAGE = {
     "prepare": ("local_prepare", "Локальная подготовка (без ИИ)"),
     "dimensions": ("dimension_mapping", "Привязка размеров к графу трубы"),
+    "dimension_review": ("dimension_review", "Карта размеров + проверка провайдером"),
     "analyze": ("deepseek_analyze", "Анализ DeepSeek"),
 }
 ENV: dict[str, str] = {}
@@ -263,8 +266,8 @@ def create_run(body: AnalyzeBody) -> dict[str, Any]:
     if not document:
         raise HTTPException(404, "Документ не найден")
     stop_stage = (body.stop_stage or "analyze").strip().lower()
-    if stop_stage not in {"prepare", "dimensions", "analyze"}:
-        raise HTTPException(400, "stop_stage: prepare|dimensions|analyze")
+    if stop_stage not in {"prepare", "dimensions", "dimension_review", "analyze"}:
+        raise HTTPException(400, "stop_stage: prepare|dimensions|dimension_review|analyze")
     run_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     kind, kind_label = RUN_KIND_BY_STAGE.get(stop_stage, (stop_stage, stop_stage))
     run = RunState(
@@ -341,7 +344,7 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                 _persist(run)
                 return
 
-            if stop_stage == "dimensions":
+            if stop_stage in {"dimensions", "dimension_review"}:
                 page_run.stage = "dimensions"
                 page_run.status = "running"
                 page_run.events.append({"time": now(), "stage": "dimensions", "message": "привязка размеров к отрезкам графа трубы"})
@@ -365,6 +368,36 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                 page_run.files["dimension_skeleton_pdf"] = skeleton_pdf.name
                 page_run.files["dimension_map_pdf"] = dimension_map_pdf.name
                 page_run.files["dimension_map_json"] = dimension_map_json.name
+                if stop_stage == "dimension_review":
+                    map_text = build_map_text(dimension_map)
+                    dimension_map_txt = run_dir / f"{pdf_stem}_page{page_run.page_number}_dimension_map.txt"
+                    review_json = run_dir / f"{pdf_stem}_page{page_run.page_number}_dimension_review.json"
+                    dimension_map_txt.write_text(map_text, encoding="utf-8")
+                    review_trace = review_map_with_provider(
+                        dimension_map,
+                        map_text,
+                        api_key,
+                        model,
+                        pdf_path=Path(pdf_path),
+                        page_number=page_run.page_number,
+                    )
+                    review = review_trace["answer"]
+                    page_run.analysis["dimension_review"] = {
+                        "answer": review,
+                        "lengths": calculate_lengths(dimension_map, review),
+                        "model": review_trace["model"],
+                    }
+                    review_json.write_text(json.dumps(page_run.analysis["dimension_review"], ensure_ascii=False, indent=2), encoding="utf-8")
+                    page_run.provider_trace = {
+                        "prompt": review_trace["prompt"],
+                        "payload": review_trace["payload"],
+                        "response_raw": review_trace["response_raw"],
+                        "answer": review,
+                        "model": review_trace["model"],
+                        "prompt_name": "dimension_review",
+                    }
+                    page_run.files["dimension_map_txt"] = dimension_map_txt.name
+                    page_run.files["dimension_review_json"] = review_json.name
                 page_run.stage = "done"
                 page_run.status = "complete"
                 page_run.events.append({"time": now(), "stage": "done", "message": f"размеров: {len(mapping['dimensions'])}, рёбер: {len(mapping['edges'])}"})

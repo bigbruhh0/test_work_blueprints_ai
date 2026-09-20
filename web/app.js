@@ -6,6 +6,7 @@ const esc = (value) => String(value ?? '').replace(/[&<>"]/g, (c) => ({'&':'&amp
 const STAGE_LABELS = {
   prepare: 'Подготовка файлов',
   dimensions: 'Привязка размеров',
+  dimension_review: 'Карта размеров + проверка провайдером',
   analyze: 'Анализ у провайдера',
   done: 'Готово',
   error: 'Ошибка',
@@ -76,7 +77,7 @@ async function selectPrompt(name) {
   try {
     const data = await api('/api/prompts/' + name);
     $('#prompt-editor').value = data.text;
-    $('#prompt-meta').textContent = (item ? item.title : name) + ' · источник: ' + data.source
+    $('#prompt-meta').textContent = (item ? item.title : name) + (item && item.usage ? ' · используется: ' + item.usage : '') + ' · источник: ' + data.source
       + ' · версия: ' + (data.version ?? 'default') + ' · sha256: ' + String(data.sha256 || '').slice(0, 12);
     await loadPromptVersions(name);
   } catch (error) {
@@ -324,6 +325,7 @@ const VIEWER_TABS = [
   { key: 'dimension_skeleton_pdf', label: 'Контур и размерные линии' },
   { key: 'dimensions_json', label: 'Карта размеров (JSON)' },
   { key: 'dimension_map_pdf', label: 'Диагностическая карта' },
+  { key: 'dimension_review_json', label: 'Решение провайдера (JSON)' },
 ];
 
 function pageKey(lineId, pageNumber) { return lineId + '::' + pageNumber; }
@@ -397,8 +399,14 @@ function parseNumbersTxt(text) {
 
 function renderTrace(trace) {
   if (!trace) return '<p class="muted">Запросов к ИИ не было.</p>';
+  const pretty = function (value) {
+    if (value == null) return '';
+    if (typeof value === 'string') return value;
+    try { return JSON.stringify(value, null, 2); } catch { return String(value); }
+  };
   const payloadPretty = JSON.stringify(trace.payload || {}, null, 2);
-  const answerRaw = trace.response_raw || '';
+  const responsePretty = pretty(trace.response_raw);
+  const answerPretty = pretty(trace.answer || trace.parsed_answer);
   const meta = (trace.model ? 'model: ' + esc(trace.model) + ' · ' : '')
     + (trace.prompt_version != null ? 'промпт: v' + esc(trace.prompt_version) + ' · ' : '')
     + (trace.prompt_sha256 ? 'sha256: ' + esc(String(trace.prompt_sha256).slice(0, 12)) + ' · ' : '')
@@ -408,7 +416,8 @@ function renderTrace(trace) {
     + '<p class="muted">' + meta + '</p>'
     + '<div class="trace-section"><b>Prompt</b><pre class="raw-json">' + esc(trace.prompt || '') + '</pre></div>'
     + '<div class="trace-section"><b>Payload</b><pre class="raw-json">' + esc(payloadPretty) + '</pre></div>'
-    + '<div class="trace-section"><b>Ответ (raw)</b><pre class="raw-json">' + esc(answerRaw) + '</pre></div>'
+    + '<div class="trace-section"><b>Ответ (raw)</b><pre class="raw-json">' + esc(responsePretty) + '</pre></div>'
+    + (answerPretty ? '<div class="trace-section"><b>Ответ (parsed)</b><pre class="raw-json">' + esc(answerPretty) + '</pre></div>' : '')
     + '</div>';
 }
 
@@ -739,6 +748,15 @@ async function showViewerTab(card, tabKey) {
     } catch (error) { wrap.innerHTML = '<div class="badge error">Ошибка: ' + esc(error.message) + '</div>'; }
     return;
   }
+  if (tabKey === 'dimension_review_json') {
+    wrap.innerHTML = '<span class="spinner"></span> Читаю решение провайдера...';
+    try {
+      const response = await fetch(viewerImageUrl(runId, lineId, filename));
+      const data = await response.json();
+      wrap.innerHTML = '<pre class="raw-json">' + esc(JSON.stringify(data, null, 2)) + '</pre>';
+    } catch (error) { wrap.innerHTML = '<div class="badge error">Ошибка: ' + esc(error.message) + '</div>'; }
+    return;
+  }
   wrap.innerHTML = '<img class="viewer-frame" src="' + viewerImageUrl(runId, lineId, filename) + '" alt="">';
 }
 
@@ -803,12 +821,30 @@ function pageDetailHtml(lineId, pr) {
   if (analysis.dimension_mapping) {
     const mapping = analysis.dimension_mapping;
     const dimensions = mapping.dimensions || [];
+    const review = analysis.dimension_review;
+    const lengths = review && review.lengths;
+    const routeKpi = function (label, route) {
+      if (!route) return '';
+      return '<div class="route-kpi ' + (label === 'Ответвления' ? 'branch' : 'main') + '"><span>' + label + '</span><strong>чистая ' + esc(route.clean_length_mm) + ' мм</strong><small>грязная ' + esc(route.dirty_length_mm) + ' мм · сомнения ' + esc(route.ambiguous_length_mm) + ' мм</small></div>';
+    };
+    const branchInfo = review && (review.branch_routes || []).length
+      ? '<p><b>Ответвления:</b> ' + review.branch_routes.map(function (route) { return esc((route.junction_vertex_id || '?') + ' → ' + (route.endpoint_vertex_id || '?') + ' [' + (route.edge_ids || []).join(', ') + ']'); }).join('; ') + '</p>'
+      : '';
+    const crossSheetInfo = review && (review.cross_sheet_connections || []).length
+      ? '<p><b>Переходы на другие листы:</b> ' + review.cross_sheet_connections.map(function (item) { return esc((item.vertex_id || '?') + ': ' + (item.label || item.target_sheet || '')); }).join('; ') + '</p>'
+      : '';
+    const reviewBlock = review
+      ? '<div class="review-summary"><div class="kpi"><div><span class="kpi-label">Чистая длина</span><strong>' + esc(lengths.clean_length_mm) + ' мм</strong></div><div><span class="kpi-label">Грязная длина</span><strong>' + esc(lengths.dirty_length_mm) + ' мм</strong></div></div><div class="route-kpis">' + routeKpi('Основная линия', lengths.main) + routeKpi('Ответвления', lengths.branch) + '</div><div class="notes"><b>Проверка провайдером</b><p>Сомнения: <b>' + esc(lengths.ambiguous_length_mm) + ' мм</b> · дубли включённых: ' + esc((lengths.duplicate_included_candidate_ids || []).join(', ') || '—') + '</p>' + branchInfo + crossSheetInfo + '<p>include: ' + esc((lengths.included_candidate_ids || []).join(', ') || '—') + '<br>exclude: ' + esc((lengths.excluded_candidate_ids || []).join(', ') || '—') + '<br>ambiguous: ' + esc((lengths.ambiguous_candidate_ids || []).join(', ') || '—') + '</p></div></div>'
+      : '';
     return '<h4>Лист ' + pr.page_number + ' — привязка размеров</h4>'
       + '<p class="muted">Рёбер графа: ' + (mapping.edges || []).length + ' · размеров: ' + dimensions.length + '</p>'
-      + '<table class="data-table"><thead><tr><th>Размер</th><th>Отрезок</th><th>Зазор, px</th><th>Статус</th></tr></thead><tbody>'
+      + reviewBlock
+      + '<table class="data-table"><thead><tr><th>Размер</th><th>Отрезок</th><th>Зазор, px</th><th>Статус</th><th>Пояснение модели</th></tr></thead><tbody>'
       + (dimensions.map(function (item) {
-        return '<tr><td>' + esc(item.text) + '</td><td>' + esc(item.edge_id || '—') + '</td><td>' + esc(item.gap_px ?? '—') + '</td><td>' + esc(item.status) + (item.leader_attached ? ' · стрелка' : '') + (item.conflict_with ? ' → ' + esc(item.conflict_with) : '') + '</td></tr>';
-      }).join('') || '<tr><td colspan="4" class="muted">Размеров нет</td></tr>')
+        const reviewDecision = review && review.answer && (review.answer.candidate_decisions || []).find(function (row) { return row.candidate_id === item.id; });
+        const status = reviewDecision ? reviewDecision.decision : item.status;
+        return '<tr class="candidate-' + esc(status) + '"><td>' + esc(item.text) + '</td><td>' + esc(item.edge_id || '—') + '</td><td>' + esc(item.gap_px ?? '—') + '</td><td>' + esc(status) + (item.leader_attached ? ' · стрелка' : '') + (item.conflict_with ? ' → ' + esc(item.conflict_with) : '') + '</td><td class="candidate-reason">' + esc(reviewDecision ? reviewDecision.reason : '') + '</td></tr>';
+      }).join('') || '<tr><td colspan="5" class="muted">Размеров нет</td></tr>')
       + '</tbody></table>' + downloads + viewer;
   }
   const main = analysis.main_chain || {};
@@ -854,9 +890,22 @@ function renderResults(run) {
     let edgeCount = 0;
     let totalBranches = 0;
     let totalSkipped = 0;
+    let reviewCleanMain = 0;
+    let reviewDirtyMain = 0;
+    let reviewCleanBranch = 0;
+    let reviewDirtyBranch = 0;
+    let hasDimensionReview = false;
     pages.forEach(function (pr) {
       const a = pr.analysis;
       if (!a) return;
+      if (a.dimension_review && a.dimension_review.lengths) {
+        hasDimensionReview = true;
+        const lengths = a.dimension_review.lengths;
+        reviewCleanMain += Number(lengths.main?.clean_length_mm || 0);
+        reviewDirtyMain += Number(lengths.main?.dirty_length_mm || 0);
+        reviewCleanBranch += Number(lengths.branch?.clean_length_mm || 0);
+        reviewDirtyBranch += Number(lengths.branch?.dirty_length_mm || 0);
+      }
       const segs = (a.main_chain || {}).segments || [];
       totalMain += segs.reduce(function (sum, segment) {
         return sum + (typeof segment.value === 'number' ? segment.value : 0);
@@ -876,10 +925,15 @@ function renderResults(run) {
         ? '<section class="result-3d-block"><div class="panel-title"><span>ТОПОЛОГИЯ / ' + esc(line.line_id) + '</span><h2>3D-граф трубы</h2></div><div class="line-graph-3d" data-graph-3d-line="' + esc(line.line_id) + '"><div class="graph-3d-loading"><span class="spinner"></span> Загружаю 3D-сцену...</div></div></section>'
         : '')
       + '<div class="kpi">'
-      + '<div><span class="kpi-label">Сумма (все листы)</span><strong>' + totalMain + ' мм</strong></div>'
-      + '<div><span class="kpi-label">Рёбер</span><strong>' + edgeCount + '</strong></div>'
-      + '<div><span class="kpi-label">Ответвлений</span><strong>' + totalBranches + '</strong></div>'
-      + '<div><span class="kpi-label">Непривязанных</span><strong>' + totalSkipped + '</strong></div>'
+      + (hasDimensionReview
+        ? '<div><span class="kpi-label">Основная линия · чистая / грязная</span><strong>' + reviewCleanMain + ' / ' + reviewDirtyMain + ' мм</strong></div>'
+          + '<div><span class="kpi-label">Ответвления · чистая / грязная</span><strong>' + reviewCleanBranch + ' / ' + reviewDirtyBranch + ' мм</strong></div>'
+          + '<div><span class="kpi-label">Рёбер</span><strong>' + edgeCount + '</strong></div>'
+          + '<div><span class="kpi-label">Листов</span><strong>' + pages.length + '</strong></div>'
+        : '<div><span class="kpi-label">Сумма (все листы)</span><strong>' + totalMain + ' мм</strong></div>'
+          + '<div><span class="kpi-label">Рёбер</span><strong>' + edgeCount + '</strong></div>'
+          + '<div><span class="kpi-label">Ответвлений</span><strong>' + totalBranches + '</strong></div>'
+          + '<div><span class="kpi-label">Непривязанных</span><strong>' + totalSkipped + '</strong></div>')
       + '</div>'
       + '<div class="row page-selector-row">' + pageButtons + '</div>'
       + '<div class="page-content" data-line="' + esc(line.line_id) + '">'

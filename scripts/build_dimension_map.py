@@ -378,7 +378,7 @@ def _map_dimensions(
                 and _collinear_edges(target_edge, edge)
             )
         dimension_stroke = base.get("dimension_stroke")
-        if target_edge is not None and dimension_stroke and dimension_stroke.get("length_px", 0) >= 180:
+        if target_edge is not None and dimension_stroke and dimension_stroke.get("length_px", 0) >= 180 and base.get("status") == "leader_attached":
             stroke_dx = dimension_stroke["end"][0] - dimension_stroke["start"][0]
             stroke_dy = dimension_stroke["end"][1] - dimension_stroke["start"][1]
             stroke_center = (
