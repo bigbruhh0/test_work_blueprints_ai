@@ -5,6 +5,7 @@ const esc = (value) => String(value ?? '').replace(/[&<>"]/g, (c) => ({'&':'&amp
 
 const STAGE_LABELS = {
   prepare: 'Подготовка файлов',
+  dimensions: 'Привязка размеров',
   analyze: 'Анализ у провайдера',
   done: 'Готово',
   error: 'Ошибка',
@@ -318,6 +319,10 @@ const VIEWER_TABS = [
   { key: 'vertices_pdf', label: 'Вершины' },
   { key: 'coordinates_pdf', label: 'Координаты' },
   { key: 'numbers_txt', label: 'Числа (TXT)' },
+  { key: 'dimensions_pdf', label: 'Размеры на графе' },
+  { key: 'dimension_graph_pdf', label: 'Чистый граф трубы' },
+  { key: 'dimension_skeleton_pdf', label: 'Контур и размерные линии' },
+  { key: 'dimensions_json', label: 'Карта размеров (JSON)' },
 ];
 
 function pageKey(lineId, pageNumber) { return lineId + '::' + pageNumber; }
@@ -724,6 +729,15 @@ async function showViewerTab(card, tabKey) {
     }
     return;
   }
+  if (tabKey === 'dimensions_json') {
+    wrap.innerHTML = '<span class="spinner"></span> Читаю JSON…';
+    try {
+      const response = await fetch(viewerImageUrl(runId, lineId, filename));
+      const data = await response.json();
+      wrap.innerHTML = '<pre class="raw-json">' + esc(JSON.stringify(data, null, 2)) + '</pre>';
+    } catch (error) { wrap.innerHTML = '<div class="badge error">Ошибка: ' + esc(error.message) + '</div>'; }
+    return;
+  }
   wrap.innerHTML = '<img class="viewer-frame" src="' + viewerImageUrl(runId, lineId, filename) + '" alt="">';
 }
 
@@ -784,6 +798,17 @@ function pageDetailHtml(lineId, pr) {
       + (pr.status === 'error' ? '<span class="badge error">' + esc(pr.error || 'Ошибка') + '</span>'
         : 'анализ не запускался (этап подготовки)') + '</div>'
       + coords + downloads + viewer;
+  }
+  if (analysis.dimension_mapping) {
+    const mapping = analysis.dimension_mapping;
+    const dimensions = mapping.dimensions || [];
+    return '<h4>Лист ' + pr.page_number + ' — привязка размеров</h4>'
+      + '<p class="muted">Рёбер графа: ' + (mapping.edges || []).length + ' · размеров: ' + dimensions.length + '</p>'
+      + '<table class="data-table"><thead><tr><th>Размер</th><th>Отрезок</th><th>Зазор, px</th><th>Статус</th></tr></thead><tbody>'
+      + (dimensions.map(function (item) {
+        return '<tr><td>' + esc(item.text) + '</td><td>' + esc(item.edge_id || '—') + '</td><td>' + esc(item.gap_px ?? '—') + '</td><td>' + esc(item.status) + (item.leader_attached ? ' · стрелка' : '') + (item.conflict_with ? ' → ' + esc(item.conflict_with) : '') + '</td></tr>';
+      }).join('') || '<tr><td colspan="4" class="muted">Размеров нет</td></tr>')
+      + '</tbody></table>' + downloads + viewer;
   }
   const main = analysis.main_chain || {};
   const segments = main.segments || [];

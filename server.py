@@ -19,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from src import db as run_db
+from src.dimension_mapping import run_dimension_mapping, save_clean_graph_pdf, save_skeleton_pdf
 from src.distance_ai import call_distance_ai_trace
 from src.prepare_stage import run_prepare
 
@@ -31,12 +32,14 @@ load_dotenv(ROOT / ".env")
 
 PIPELINE_STEPS = [
     ("prepare", "Подготовка файлов (числа + вершины)"),
+    ("dimensions", "Привязка размеров к графу трубы"),
     ("analyze", "Анализ у провайдера"),
 ]
 
 # Расширяемый реестр конфигураций запуска. stop_stage -> ключ + человекочитаемая метка.
 RUN_KIND_BY_STAGE = {
     "prepare": ("local_prepare", "Локальная подготовка (без ИИ)"),
+    "dimensions": ("dimension_mapping", "Привязка размеров к графу трубы"),
     "analyze": ("deepseek_analyze", "Анализ DeepSeek"),
 }
 ENV: dict[str, str] = {}
@@ -259,8 +262,8 @@ def create_run(body: AnalyzeBody) -> dict[str, Any]:
     if not document:
         raise HTTPException(404, "Документ не найден")
     stop_stage = (body.stop_stage or "analyze").strip().lower()
-    if stop_stage not in {"prepare", "analyze"}:
-        raise HTTPException(400, "stop_stage: prepare|analyze")
+    if stop_stage not in {"prepare", "dimensions", "analyze"}:
+        raise HTTPException(400, "stop_stage: prepare|dimensions|analyze")
     run_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     kind, kind_label = RUN_KIND_BY_STAGE.get(stop_stage, (stop_stage, stop_stage))
     run = RunState(
@@ -334,6 +337,29 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
             _persist(run)
             if stop_stage == "prepare":
                 page_run.status = "complete"
+                _persist(run)
+                return
+
+            if stop_stage == "dimensions":
+                page_run.stage = "dimensions"
+                page_run.status = "running"
+                page_run.events.append({"time": now(), "stage": "dimensions", "message": "привязка размеров к отрезкам графа трубы"})
+                pdf_stem = Path(pdf_path).stem
+                dimensions_pdf = run_dir / f"{pdf_stem}_page{page_run.page_number}_dimensions_marked.pdf"
+                dimensions_json = run_dir / f"{pdf_stem}_page{page_run.page_number}_dimensions.json"
+                mapping = run_dimension_mapping(pdf_path, page_run.page_number, dimensions_pdf, dimensions_json)
+                clean_graph_pdf = run_dir / f"{pdf_stem}_page{page_run.page_number}_dimension_graph.pdf"
+                save_clean_graph_pdf(pdf_path, page_run.page_number, clean_graph_pdf, mapping)
+                skeleton_pdf = run_dir / f"{pdf_stem}_page{page_run.page_number}_dimension_skeleton.pdf"
+                save_skeleton_pdf(pdf_path, page_run.page_number, skeleton_pdf, mapping)
+                page_run.analysis = {"dimension_mapping": mapping}
+                page_run.files["dimensions_pdf"] = dimensions_pdf.name
+                page_run.files["dimensions_json"] = dimensions_json.name
+                page_run.files["dimension_graph_pdf"] = clean_graph_pdf.name
+                page_run.files["dimension_skeleton_pdf"] = skeleton_pdf.name
+                page_run.stage = "done"
+                page_run.status = "complete"
+                page_run.events.append({"time": now(), "stage": "done", "message": f"размеров: {len(mapping['dimensions'])}, рёбер: {len(mapping['edges'])}"})
                 _persist(run)
                 return
 
