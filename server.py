@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+import json
 import os
 import shutil
 import threading
@@ -12,7 +14,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, UploadFile
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -49,10 +51,12 @@ class PageRun:
     error: str = ""
     numbers: list[dict[str, Any]] = field(default_factory=list)
     vertices: list[dict[str, Any]] = field(default_factory=list)
+    coordinates: list[dict[str, Any]] = field(default_factory=list)
     skipped_numbers: list[dict[str, Any]] = field(default_factory=list)
     files: dict[str, str] = field(default_factory=dict)
     analysis: dict[str, Any] | None = None
     provider_trace: dict[str, Any] | None = None
+    prompt_revision: dict[str, Any] | None = None
     events: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -187,16 +191,19 @@ class PromptBody(BaseModel):
 
 
 @app.get("/api/prompts/{name}")
-def get_prompt(name: str) -> dict[str, str]:
+def get_prompt(name: str) -> dict[str, Any]:
     from src import prompts
 
     if name not in prompts.PROMPT_REGISTRY:
         raise HTTPException(404, "Промпт не найден")
+    revision = prompts.load_prompt_revision(name)
     return {
         "name": name,
         "title": prompts.PROMPT_REGISTRY[name].get("title", name),
-        "source": "override" if (prompts.OVERRIDE_DIR / f"{name}.txt").exists() else "default",
-        "text": prompts.load_prompt(name),
+        "source": revision["source"],
+        "version": revision["version"],
+        "sha256": revision["sha256"],
+        "text": revision["text"],
     }
 
 
@@ -218,6 +225,32 @@ def reset_prompt(name: str) -> dict[str, str]:
         raise HTTPException(404, "Промпт не найден")
     prompts.reset_prompt(name)
     return {"name": name, "source": "default"}
+
+
+@app.get("/api/prompts/{name}/versions")
+def list_prompt_versions(name: str) -> dict[str, Any]:
+    from src import prompts
+
+    if name not in prompts.PROMPT_REGISTRY:
+        raise HTTPException(404, "Промпт не найден")
+    return {"name": name, "versions": prompts.list_versions(name)}
+
+
+class RestoreBody(BaseModel):
+    version: int
+
+
+@app.post("/api/prompts/{name}/restore")
+def restore_prompt_version(name: str, body: RestoreBody) -> dict[str, Any]:
+    from src import prompts
+
+    if name not in prompts.PROMPT_REGISTRY:
+        raise HTTPException(404, "Промпт не найден")
+    try:
+        prompts.restore_version(name, body.version)
+    except IndexError as error:
+        raise HTTPException(400, str(error)) from error
+    return {"name": name, "version": body.version, "source": "override"}
 
 
 @app.post("/api/runs")
@@ -275,13 +308,16 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
         run_dir = ARTIFACTS_DIR / run.run_id / line.line_id
         try:
             page_run.events.append({"time": now(), "stage": "prepare", "message": "формирование чисел и вершин"})
+            _persist(run)
             prepare = run_prepare(pdf_path, page_run.page_number, run_dir)
             page_run.numbers = prepare.numbers
             page_run.vertices = prepare.vertices
+            page_run.coordinates = prepare.coordinates
             page_run.skipped_numbers = prepare.skipped_numbers
             page_run.files = {
                 "numbers_pdf": prepare.numbers_pdf.name,
                 "vertices_pdf": prepare.vertices_pdf.name,
+                "coordinates_pdf": prepare.coordinates_pdf.name,
                 "numbers_txt": prepare.numbers_txt.name,
             }
             components = prepare.components or []
@@ -294,14 +330,17 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                 page_run.events.append({"time": now(), "stage": "prepare", "message": f"  отброшено #{c['index']}: {c['nodes']} узлов, диаг. {c['diag_px']}px"})
             page_run.stage = "prepare"
             page_run.status = "prepare_done"
-            page_run.events.append({"time": now(), "stage": "prepare", "message": f"чисел {len(prepare.numbers)}, вершин {len(prepare.vertices)}"})
+            page_run.events.append({"time": now(), "stage": "prepare", "message": f"чисел {len(prepare.numbers)}, координат {len(prepare.coordinates)}, вершин {len(prepare.vertices)}"})
+            _persist(run)
             if stop_stage == "prepare":
                 page_run.status = "complete"
+                _persist(run)
                 return
 
             page_run.stage = "analyze"
             page_run.status = "running"
             page_run.events.append({"time": now(), "stage": "analyze", "message": "запрос к анализатору"})
+            _persist(run)
             if not api_key:
                 raise RuntimeError("DEEPSEEK_API_KEY не задан в .env")
             trace = call_distance_ai_trace(
@@ -309,6 +348,7 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                 model=model,
                 vertices=prepare.vertices,
                 numbers=prepare.numbers,
+                coordinates=prepare.coordinates,
                 event_callback=lambda name, payload: page_run.events.append({"time": now(), "stage": "analyze", "message": f"{name}: {payload}"}),
             )
             page_run.analysis = trace["answer"]
@@ -319,14 +359,26 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                 "status_code": trace["status_code"],
                 "elapsed_seconds": trace["elapsed_seconds"],
                 "model": trace["model"],
+                "prompt_name": trace.get("prompt_name", "analyze"),
+                "prompt_version": trace.get("prompt_version", "default"),
+                "prompt_source": trace.get("prompt_source", "default"),
+                "prompt_sha256": trace.get("prompt_sha256", ""),
+            }
+            page_run.prompt_revision = {
+                "name": trace.get("prompt_name", "analyze"),
+                "version": trace.get("prompt_version", "default"),
+                "source": trace.get("prompt_source", "default"),
+                "sha256": trace.get("prompt_sha256", ""),
             }
             page_run.stage = "done"
             page_run.status = "complete"
             page_run.events.append({"time": now(), "stage": "done", "message": f"main_chain: {(trace['answer'].get('main_chain') or {}).get('path')}"})
+            _persist(run)
         except Exception as error:  # noqa: BLE001
             page_run.status = "error"
             page_run.error = str(error)
             page_run.events.append({"time": now(), "stage": "error", "message": str(error)})
+            _persist(run)
 
     futures = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -335,6 +387,7 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                 page_run = PageRun(page_number=page_number)
                 line.page_results[page_number] = page_run
                 futures.append(executor.submit(process_page, line, page_run))
+            _persist(run)
         for future in futures:
             future.result()
 
@@ -348,7 +401,8 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
             line.status = "error"
         else:
             line.status = "partial"
-    run.status = "complete"
+    statuses = {line.status for line in run.lines.values()}
+    run.status = "error" if "error" in statuses else "complete"
     _persist(run)
 
 
@@ -366,6 +420,87 @@ def get_run(run_id: str) -> dict[str, Any]:
     if not persisted:
         raise HTTPException(404, "Прогон не найден")
     return persisted
+
+
+def _run_export_rows(run: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    pages = []
+    events = []
+    errors = []
+    numbers = []
+    vertices = []
+    coordinates = []
+    analyses = []
+    for line in run.get("lines", []):
+        for page in line.get("page_results", []):
+            base = {
+                "line_id": line.get("line_id"),
+                "page_number": page.get("page_number"),
+                "status": page.get("status"),
+                "stage": page.get("stage"),
+                "error": page.get("error", ""),
+                "numbers_count": len(page.get("numbers", [])),
+                "vertices_count": len(page.get("vertices", [])),
+            }
+            pages.append(base)
+            for item in page.get("numbers", []):
+                numbers.append({"line_id": line.get("line_id"), "page_number": page.get("page_number"), **item})
+            for item in page.get("vertices", []):
+                vertices.append({"line_id": line.get("line_id"), "page_number": page.get("page_number"), **item})
+            for item in page.get("coordinates", []):
+                coordinates.append({"line_id": line.get("line_id"), "page_number": page.get("page_number"), **item})
+            if page.get("analysis"):
+                analyses.append({
+                    "line_id": line.get("line_id"),
+                    "page_number": page.get("page_number"),
+                    "analysis_json": json.dumps(page["analysis"], ensure_ascii=False),
+                })
+            if page.get("error"):
+                errors.append(base)
+            for event in page.get("events", []):
+                events.append({
+                    "line_id": line.get("line_id"),
+                    "page_number": page.get("page_number"),
+                    "time": event.get("time", ""),
+                    "stage": event.get("stage", ""),
+                    "message": event.get("message", ""),
+                })
+    return {
+        "Страницы": pages,
+        "Числа": numbers,
+        "Вершины": vertices,
+        "Координаты": coordinates,
+        "Анализ": analyses,
+        "События": events,
+        "Ошибки": errors,
+    }
+
+
+@app.get("/api/runs/{run_id}/export/json")
+def export_run_json(run_id: str) -> Response:
+    run = get_run(run_id)
+    content = json.dumps(run, ensure_ascii=False, indent=2).encode("utf-8")
+    return Response(content, media_type="application/json", headers={"Content-Disposition": f'attachment; filename="{run_id}.json"'})
+
+
+@app.get("/api/runs/{run_id}/export/excel")
+def export_run_excel(run_id: str) -> StreamingResponse:
+    import pandas as pd
+
+    run = get_run(run_id)
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        pd.DataFrame([{
+            "run_id": run.get("run_id"),
+            "source_name": run.get("source_name"),
+            "status": run.get("status"),
+            "created_at": run.get("created_at"),
+            "model": run.get("model"),
+            "stop_stage": run.get("stop_stage"),
+        }]).to_excel(writer, sheet_name="Сводка", index=False)
+        for sheet, rows in _run_export_rows(run).items():
+            pd.DataFrame(rows or [{"status": "Нет данных"}]).to_excel(writer, sheet_name=sheet, index=False)
+    output.seek(0)
+    return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f'attachment; filename="{run_id}.xlsx"'})
 
 
 def run_dict(run: RunState) -> dict[str, Any]:
@@ -393,10 +528,12 @@ def run_dict(run: RunState) -> dict[str, Any]:
                         "error": page_run.error,
                         "numbers": page_run.numbers,
                         "vertices": page_run.vertices,
+                        "coordinates": page_run.coordinates,
                         "skipped_numbers": page_run.skipped_numbers,
                         "files": page_run.files,
                         "analysis": page_run.analysis,
                         "provider_trace": page_run.provider_trace,
+                        "prompt_revision": page_run.prompt_revision,
                         "events": page_run.events,
                     }
                     for page_run in sorted(line.page_results.values(), key=lambda item: item.page_number)

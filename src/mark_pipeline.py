@@ -252,6 +252,48 @@ def extract_dimension_numbers(page, drawing_area):
 
 
 # ============================================================
+# 2b. КООРДИНАТЫ X/Y/Z
+# ============================================================
+
+COORDINATE_LABELS = {"X", "Y", "Z", "Z+", "Z-"}
+
+
+def extract_coordinates(page, drawing_area):
+    """Найти координатные подписи X/Y/Z и их числовые значения."""
+    words = page.get_text("words")
+    coords = []
+    for x0, y0, x1, y1, text, block_no, line_no, _word_no in words:
+        label = text.strip().upper()
+        if label not in COORDINATE_LABELS:
+            continue
+        label_rect = fitz.Rect(x0, y0, x1, y1)
+        if not drawing_area.intersects(label_rect):
+            continue
+        best_value = None
+        best_rect = None
+        best_x = None
+        for wx0, wy0, wx1, wy1, wtext, wblock, wline, _wword in words:
+            if wblock != block_no or wline != line_no:
+                continue
+            if wx0 < x1 - 1:
+                continue
+            if not re.fullmatch(r"\d+([.,]\d+)?", wtext.strip()):
+                continue
+            if best_x is None or wx0 < best_x:
+                best_x = wx0
+                best_value = wtext.strip()
+                best_rect = fitz.Rect(wx0, wy0, wx1, wy1)
+        if best_value is not None:
+            coords.append({
+                "label": label,
+                "value": best_value,
+                "label_bbox": [x0, y0, x1, y1],
+                "value_bbox": [best_rect.x0, best_rect.y0, best_rect.x1, best_rect.y1],
+            })
+    return coords
+
+
+# ============================================================
 # 3. ПОИСК ВЕРШИН
 # ============================================================
 
@@ -286,6 +328,17 @@ def classify_zone(bbox, page_width, page_height):
     return "drawing"
 
 
+def drawing_area_by_size(width, height):
+    """Рабочая область чертежа (та же, что для кандидатов-размеров)."""
+    if abs(width - 1190.55) < 10 and abs(height - 841.89) < 10:
+        return (56.9, 13.0, 810.0, 705.0)
+    if abs(width - 842) < 10 and abs(height - 595) < 10:
+        return (56.9, 13.0, 810.0, 705.0)
+    if abs(width - 1684) < 10 and abs(height - 1190) < 10:
+        return (56.9, 13.0, 810.0, 705.0)
+    return (0.0, 0.0, width * 0.65, height * 0.83)
+
+
 def is_frame_line(bbox, length, width, height):
     if length <= 0.5 * max(width, height):
         return False
@@ -300,7 +353,7 @@ def is_frame_line(bbox, length, width, height):
 
 
 def extract_axis_strokes(pdf_path, page_number):
-    """Возвращает список толстых осевых штрихов."""
+    """Возвращает список толстых осевых штрихов внутри рабочей области."""
     strokes = []
     try:
         with pdfplumber.open(str(pdf_path)) as pdf:
@@ -313,6 +366,7 @@ def extract_axis_strokes(pdf_path, page_number):
     except Exception:
         return strokes
 
+    area = drawing_area_by_size(width, height)
     for obj in objects:
         pts = obj.get("pts")
         if not pts or len(pts) < 2:
@@ -320,7 +374,9 @@ def extract_axis_strokes(pdf_path, page_number):
         x0, y0 = float(pts[0][0]), float(pts[0][1])
         x1, y1 = float(pts[-1][0]), float(pts[-1][1])
         bbox = (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
-        if classify_zone(bbox, width, height) != "drawing":
+        cx = (x0 + x1) / 2
+        cy = (y0 + y1) / 2
+        if not (area[0] <= cx <= area[2] and area[1] <= cy <= area[3]):
             continue
         length = math.hypot(x1 - x0, y1 - y0)
         if length < MIN_STROKE_LENGTH:
@@ -578,6 +634,20 @@ def save_vertices_pdf(input_pdf, page_num, output_pdf, vertices):
     new_page = new_doc.new_page(width=page.rect.width, height=page.rect.height)
     new_page.show_pdf_page(new_page.rect, doc, page_num)
 
+    drawing_area, _fmt = get_drawing_area(page)
+    new_page.draw_rect(
+        drawing_area,
+        color=(0, 0.3, 1.0),
+        width=1.5,
+        dashes="[4 3] 0",
+    )
+    new_page.insert_text(
+        fitz.Point(drawing_area.x0 + 4, drawing_area.y0 + 14),
+        f"SEARCH AREA  x=[{drawing_area.x0:.0f}..{drawing_area.x1:.0f}]  "
+        f"y=[{drawing_area.y0:.0f}..{drawing_area.y1:.0f}]",
+        fontsize=9, fontname="helv", color=(0, 0.3, 1.0),
+    )
+
     for idx, v in enumerate(vertices, start=1):
         color = VERTEX_ROLE_COLORS.get(v["role"], (0, 0, 0))
         center = fitz.Point(v["x"], v["y"])
@@ -593,9 +663,44 @@ def save_vertices_pdf(input_pdf, page_num, output_pdf, vertices):
     doc.close()
 
 
-def save_numbers_txt(output_txt, dims, vertices, drawing_area):
+def save_coordinates_pdf(input_pdf, page_num, output_pdf, coordinates, drawing_area):
+    """PDF с отмеченными координатными значениями X/Y/Z."""
+    doc = fitz.open(input_pdf)
+    new_doc = fitz.open()
+    page = doc[page_num]
+    new_page = new_doc.new_page(width=page.rect.width, height=page.rect.height)
+    new_page.show_pdf_page(new_page.rect, doc, page_num)
+
+    new_page.draw_rect(drawing_area, color=(0, 0.3, 1.0), width=1.5, dashes="[4 3] 0")
+    new_page.insert_text(
+        fitz.Point(drawing_area.x0 + 4, drawing_area.y0 + 14),
+        f"COORDINATES  x=[{drawing_area.x0:.0f}..{drawing_area.x1:.0f}]  "
+        f"y=[{drawing_area.y0:.0f}..{drawing_area.y1:.0f}]",
+        fontsize=9, fontname="helv", color=(0, 0.3, 1.0),
+    )
+
+    label_color = (0.13, 0.35, 0.86)   # синий
+    value_color = (0.0, 0.55, 0.2)     # зелёный
+    for coord in coordinates:
+        lb = coord["label_bbox"]
+        vb = coord["value_bbox"]
+        new_page.draw_rect(
+            fitz.Rect(vb[0] - 2, vb[1] - 2, vb[2] + 2, vb[3] + 2),
+            color=value_color, width=1.5,
+        )
+        new_page.draw_rect(
+            fitz.Rect(lb[0] - 2, lb[1] - 2, lb[2] + 2, lb[3] + 2),
+            color=label_color, width=1.0,
+        )
+
+    new_doc.save(output_pdf)
+    new_doc.close()
+    doc.close()
+
+
+def save_numbers_txt(output_txt, dims, vertices, coordinates, drawing_area):
     """
-    TXT со списком найденных чисел-кандидатов и вершин.
+    TXT со списком найденных чисел-кандидатов, координат и вершин.
     Без прямоугольников.
     """
     with open(output_txt, "w", encoding="utf-8") as f:
@@ -610,6 +715,17 @@ def save_numbers_txt(output_txt, dims, vertices, drawing_area):
             cy = (r.y0 + r.y1) / 2
             f.write(f"{text}\t{r.x0:.1f}\t{r.y0:.1f}\t{r.x1:.1f}\t{r.y1:.1f}\t"
                     f"{cx:.1f}\t{cy:.1f}\n")
+
+        # ---------- КООРДИНАТЫ ----------
+        f.write("\n\n# ============================================================\n")
+        f.write("# Найденные координаты X/Y/Z\n")
+        f.write("# ============================================================\n")
+        f.write(f"# Всего координат: {len(coordinates)}\n")
+        f.write("# Формат: label\tvalue\tx0\ty0\tx1\ty1\n\n")
+        for coord in coordinates:
+            vb = coord["value_bbox"]
+            f.write(f"{coord['label']}\t{coord['value']}\t"
+                    f"{vb[0]:.1f}\t{vb[1]:.1f}\t{vb[2]:.1f}\t{vb[3]:.1f}\n")
 
         # ---------- ВЕРШИНЫ ----------
         f.write("\n\n# ============================================================\n")

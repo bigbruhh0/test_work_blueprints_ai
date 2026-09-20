@@ -88,7 +88,7 @@ def load_run(run_id: str) -> dict[str, Any] | None:
 def list_runs() -> list[dict[str, Any]]:
     with _connect() as connection:
         rows = connection.execute(
-            "SELECT run_id, created_at, updated_at, status, source_name, line_ids, stop_stage, kind, kind_label, model FROM runs ORDER BY created_at DESC"
+            "SELECT run_id, created_at, updated_at, status, source_name, line_ids, stop_stage, kind, kind_label, model, data FROM runs ORDER BY created_at DESC"
         ).fetchall()
     output = []
     for row in rows:
@@ -96,18 +96,31 @@ def list_runs() -> list[dict[str, Any]]:
             line_ids = json.loads(row["line_ids"])
         except (TypeError, ValueError):
             line_ids = []
+        try:
+            data = json.loads(row["data"] or "{}")
+        except (TypeError, ValueError):
+            data = {}
+        errors = []
+        for line in data.get("lines", []):
+            if line.get("error"):
+                errors.append(line["error"])
+            for page in line.get("page_results", []):
+                if page.get("error"):
+                    errors.append(f"стр. {page.get('page_number')}: {page['error']}")
         output.append(
             {
                 "run_id": row["run_id"],
                 "created_at": row["created_at"],
                 "updated_at": row["updated_at"],
-                "status": row["status"],
+                "status": "error" if errors else row["status"],
                 "source_name": row["source_name"],
                 "line_ids": line_ids,
                 "stop_stage": row["stop_stage"],
                 "kind": row["kind"],
                 "kind_label": row["kind_label"],
                 "model": row["model"],
+                "error_count": len(errors),
+                "errors": errors[:3],
             }
         )
     return output

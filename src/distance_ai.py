@@ -17,6 +17,12 @@ def _load_prompt_template() -> str:
     return load_prompt("analyze")
 
 
+def _load_prompt_revision() -> dict[str, object]:
+    from .prompts import load_prompt_revision
+
+    return load_prompt_revision("analyze")
+
+
 def build_fragments(
     vertices: list[dict[str, Any]],
     numbers: list[dict[str, Any]],
@@ -35,6 +41,19 @@ def build_fragments(
         ]
         numbers_rows.append(f"{number['text']}\t{center[0]:.1f}\t{center[1]:.1f}")
     return "\n".join(vertex_lines), "\n".join(numbers_rows)
+
+
+def build_coordinates_fragment(coordinates: list[dict[str, Any]]) -> str:
+    rows = []
+    for coord in coordinates:
+        vb = coord.get("value_bbox") or coord.get("bbox")
+        if vb and len(vb) == 4:
+            cx = (vb[0] + vb[2]) / 2
+            cy = (vb[1] + vb[3]) / 2
+            rows.append(f"{coord['label']}\t{coord['value']}\t{cx:.1f}\t{cy:.1f}")
+        else:
+            rows.append(f"{coord['label']}\t{coord['value']}")
+    return "\n".join(rows)
 
 
 def parse_json(content: str) -> dict[str, Any]:
@@ -57,11 +76,54 @@ def parse_json(content: str) -> dict[str, Any]:
         raise
 
 
+def normalize_vertex_coordinates(
+    answer: dict[str, Any],
+    vertices: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Normalize AI coordinate rows and require an existing vertex id."""
+    known = {str(vertex.get("id")): vertex for vertex in vertices if vertex.get("id")}
+    raw_points = answer.get("points")
+    if not isinstance(raw_points, list):
+        answer["points"] = []
+        answer["coordinate_warnings"] = ["Ответ не содержит массива points"]
+        return answer
+
+    points: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    for index, raw in enumerate(raw_points, start=1):
+        if not isinstance(raw, dict):
+            warnings.append(f"points[{index}] пропущен: ожидался объект")
+            continue
+        vertex_id = str(raw.get("vertex_id") or raw.get("id") or raw.get("node_id") or "").strip()
+        if vertex_id not in known:
+            warnings.append(f"points[{index}] пропущен: неизвестная вершина {vertex_id or '—'}")
+            continue
+        points.append(
+            {
+                "id": vertex_id,
+                "vertex_id": vertex_id,
+                "x": raw.get("x"),
+                "y": raw.get("y"),
+                "z": raw.get("z"),
+                "source_coordinate_labels": raw.get("source_coordinate_labels") or raw.get("sources") or [],
+                "confidence": raw.get("confidence"),
+                "reason": raw.get("reason", ""),
+            }
+        )
+    answer["points"] = points
+    if warnings:
+        answer["coordinate_warnings"] = warnings
+    else:
+        answer.pop("coordinate_warnings", None)
+    return answer
+
+
 def call_distance_ai(
     api_key: str,
     model: str,
     vertices: list[dict[str, Any]],
     numbers: list[dict[str, Any]],
+    coordinates: list[dict[str, Any]] | None = None,
     base_url: str | None = None,
     event_callback=None,
 ) -> dict[str, Any]:
@@ -70,6 +132,7 @@ def call_distance_ai(
         model=model,
         vertices=vertices,
         numbers=numbers,
+        coordinates=coordinates,
         base_url=base_url,
         event_callback=event_callback,
     )
@@ -81,12 +144,19 @@ def call_distance_ai_trace(
     model: str,
     vertices: list[dict[str, Any]],
     numbers: list[dict[str, Any]],
+    coordinates: list[dict[str, Any]] | None = None,
     base_url: str | None = None,
     event_callback=None,
 ) -> dict[str, Any]:
-    template = _load_prompt_template()
+    prompt_revision = _load_prompt_revision()
+    template = str(prompt_revision["text"])
     vertices_block, numbers_block = build_fragments(vertices, numbers)
-    prompt = template.replace("{VERTICES_BLOCK}", vertices_block).replace("{NUMBERS_BLOCK}", numbers_block)
+    coordinates_block = build_coordinates_fragment(coordinates or [])
+    prompt = (
+        template.replace("{VERTICES_BLOCK}", vertices_block)
+        .replace("{NUMBERS_BLOCK}", numbers_block)
+        .replace("{COORDINATES_BLOCK}", coordinates_block)
+    )
 
     base = base_url or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/chat/completions")
     payload = {
@@ -115,6 +185,8 @@ def call_distance_ai_trace(
                 "numbers": len(numbers),
                 "payload_chars": len(prompt),
                 "attempt": attempt,
+                "prompt_version": prompt_revision["version"],
+                "prompt_sha256": prompt_revision["sha256"],
             })
         try:
             response = requests.post(
@@ -136,8 +208,9 @@ def call_distance_ai_trace(
             content = response.json()["choices"][0]["message"]["content"]
             content = (content or "").strip()
             if content:
+                answer = normalize_vertex_coordinates(parse_json(content), vertices)
                 return {
-                    "answer": parse_json(content),
+                    "answer": answer,
                     "prompt": prompt,
                     "payload": payload,
                     "response_raw": content,
@@ -145,6 +218,10 @@ def call_distance_ai_trace(
                     "elapsed_seconds": elapsed,
                     "model": model,
                     "attempts": attempt,
+                    "prompt_name": prompt_revision["name"],
+                    "prompt_version": prompt_revision["version"],
+                    "prompt_source": prompt_revision["source"],
+                    "prompt_sha256": prompt_revision["sha256"],
                 }
             last_error = "пустой ответ от провайдера"
         except Exception as error:  # noqa: BLE001

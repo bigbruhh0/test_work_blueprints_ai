@@ -17,15 +17,17 @@ class PrepareResult:
     page_number: int
     numbers_pdf: Path
     vertices_pdf: Path
+    coordinates_pdf: Path
     numbers_txt: Path
     numbers: list[dict[str, Any]] = field(default_factory=list)
     vertices: list[dict[str, Any]] = field(default_factory=list)
+    coordinates: list[dict[str, Any]] = field(default_factory=list)
     skipped_numbers: list[dict[str, Any]] = field(default_factory=list)
     components: list[dict[str, Any]] = field(default_factory=list)
 
 
 def run_prepare(pdf_path: str | Path, page_number: int, out_dir: str | Path) -> PrepareResult:
-    """Подготовить 3 файла для провайдера и вернуть их пути + данные.
+    """Подготовить файлы (числа + координаты + вершины + txt) и вернуть пути + данные.
 
     Страница передаётся 1-based (как в тексте задания), внутри скрипта она
     конвертируется в 0-based для PyMuPDF.
@@ -40,6 +42,7 @@ def run_prepare(pdf_path: str | Path, page_number: int, out_dir: str | Path) -> 
 
     numbers_pdf = Path(f"{prefix}_numbers_marked.pdf")
     vertices_pdf = Path(f"{prefix}_vertices_marked.pdf")
+    coordinates_pdf = Path(f"{prefix}_coordinates_marked.pdf")
     numbers_txt = Path(f"{prefix}_numbers.txt")
 
     import fitz  # PyMuPDF
@@ -48,13 +51,15 @@ def run_prepare(pdf_path: str | Path, page_number: int, out_dir: str | Path) -> 
     page = doc[page_0based]
     drawing_area, _fmt = mark_pipeline.get_drawing_area(page)
     dims, rectangles, discarded = mark_pipeline.extract_dimension_numbers(page, drawing_area)
+    coordinates = mark_pipeline.extract_coordinates(page, drawing_area)
     doc.close()
 
     vertices = mark_pipeline.extract_vertices(str(pdf_path), page_1based)
     components = mark_pipeline.components_report(str(pdf_path), page_1based)
     mark_pipeline.save_numbers_pdf(str(pdf_path), page_0based, str(numbers_pdf), dims, rectangles, drawing_area)
     mark_pipeline.save_vertices_pdf(str(pdf_path), page_0based, str(vertices_pdf), vertices)
-    mark_pipeline.save_numbers_txt(str(numbers_txt), dims, vertices, drawing_area)
+    mark_pipeline.save_coordinates_pdf(str(pdf_path), page_0based, str(coordinates_pdf), coordinates, drawing_area)
+    mark_pipeline.save_numbers_txt(str(numbers_txt), dims, vertices, coordinates, drawing_area)
 
     numbers = [
         {
@@ -87,9 +92,11 @@ def run_prepare(pdf_path: str | Path, page_number: int, out_dir: str | Path) -> 
         page_number=page_1based,
         numbers_pdf=numbers_pdf,
         vertices_pdf=vertices_pdf,
+        coordinates_pdf=coordinates_pdf,
         numbers_txt=numbers_txt,
         numbers=numbers,
         vertices=vertices_rows,
+        coordinates=coordinates,
         skipped_numbers=discards,
         components=components,
     )
