@@ -323,6 +323,7 @@ const VIEWER_TABS = [
   { key: 'dimension_graph_pdf', label: 'Чистый граф трубы' },
   { key: 'dimension_skeleton_pdf', label: 'Контур и размерные линии' },
   { key: 'dimensions_json', label: 'Карта размеров (JSON)' },
+  { key: 'dimension_map_pdf', label: 'Диагностическая карта' },
 ];
 
 function pageKey(lineId, pageNumber) { return lineId + '::' + pageNumber; }

@@ -22,6 +22,7 @@ from src import db as run_db
 from src.dimension_mapping import run_dimension_mapping, save_clean_graph_pdf, save_skeleton_pdf
 from src.distance_ai import call_distance_ai_trace
 from src.prepare_stage import run_prepare
+from scripts.build_dimension_map import build_map as build_dimension_map, render_pdf as render_dimension_map
 
 
 ROOT = Path(__file__).resolve().parent
@@ -352,11 +353,18 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                 save_clean_graph_pdf(pdf_path, page_run.page_number, clean_graph_pdf, mapping)
                 skeleton_pdf = run_dir / f"{pdf_stem}_page{page_run.page_number}_dimension_skeleton.pdf"
                 save_skeleton_pdf(pdf_path, page_run.page_number, skeleton_pdf, mapping)
-                page_run.analysis = {"dimension_mapping": mapping}
+                dimension_map_pdf = run_dir / f"{pdf_stem}_page{page_run.page_number}_dimension_map.pdf"
+                dimension_map_json = run_dir / f"{pdf_stem}_page{page_run.page_number}_dimension_map.json"
+                dimension_map = build_dimension_map(Path(pdf_path), page_run.page_number)
+                dimension_map_json.write_text(json.dumps(dimension_map, ensure_ascii=False, indent=2), encoding="utf-8")
+                render_dimension_map(Path(pdf_path), page_run.page_number, dimension_map_pdf, dimension_map)
+                page_run.analysis = {"dimension_mapping": mapping, "dimension_map": dimension_map}
                 page_run.files["dimensions_pdf"] = dimensions_pdf.name
                 page_run.files["dimensions_json"] = dimensions_json.name
                 page_run.files["dimension_graph_pdf"] = clean_graph_pdf.name
                 page_run.files["dimension_skeleton_pdf"] = skeleton_pdf.name
+                page_run.files["dimension_map_pdf"] = dimension_map_pdf.name
+                page_run.files["dimension_map_json"] = dimension_map_json.name
                 page_run.stage = "done"
                 page_run.status = "complete"
                 page_run.events.append({"time": now(), "stage": "done", "message": f"размеров: {len(mapping['dimensions'])}, рёбер: {len(mapping['edges'])}"})

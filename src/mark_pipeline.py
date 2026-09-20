@@ -584,6 +584,123 @@ def merge_vertex_clusters(vertices, radius=20.0):
     return merged
 
 
+def extract_uncertain_vertices(pdf_path, page_number, exact_vertices=None):
+    """Find candidate vertices implied by continuous dimension-line chains."""
+    exact_vertices = exact_vertices or extract_vertices(pdf_path, page_number)
+    axis_strokes = extract_axis_strokes(pdf_path, page_number)
+    if not axis_strokes:
+        return []
+
+    with pdfplumber.open(str(pdf_path)) as document:
+        if not (1 <= page_number <= len(document.pages)):
+            return []
+        page = document.pages[page_number - 1]
+        width, height = float(page.width), float(page.height)
+        objects = list(page.objects.get("line", [])) + list(page.objects.get("curve", []))
+
+    dimension_strokes = []
+    for obj in objects:
+        points = obj.get("pts")
+        if not points or len(points) < 2:
+            continue
+        x0, y0 = map(float, points[0])
+        x1, y1 = map(float, points[-1])
+        bbox = (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+        length = math.hypot(x1 - x0, y1 - y0)
+        linewidth = float(obj.get("linewidth") or obj.get("stroke_width") or 0.0)
+        if classify_zone(bbox, width, height) != "drawing":
+            continue
+        if length < 10.0 or linewidth > THIN_LW_MAX or is_frame_line(bbox, length, width, height):
+            continue
+        dimension_strokes.append((x0, y0, x1, y1, length))
+
+    axis_points = [(stroke.x0, stroke.y0) for stroke in axis_strokes]
+    axis_points.extend((stroke.x1, stroke.y1) for stroke in axis_strokes)
+    unique_axis_points = []
+    for point in axis_points:
+        if not any(math.hypot(point[0] - other[0], point[1] - other[1]) < GRAPH_EPS for other in unique_axis_points):
+            unique_axis_points.append(point)
+
+    def nearest_axis_point(point):
+        return min(
+            unique_axis_points,
+            key=lambda other: math.hypot(point[0] - other[0], point[1] - other[1]),
+            default=None,
+        )
+
+    candidates = []
+    for index, dimension in enumerate(dimension_strokes):
+        if dimension[4] < 30.0:
+            continue
+        matches = []
+        for dimension_end in ((dimension[0], dimension[1]), (dimension[2], dimension[3])):
+            best = None
+            for extension_index, extension in enumerate(dimension_strokes):
+                if extension_index == index:
+                    continue
+                extension_ends = [(extension[0], extension[1]), (extension[2], extension[3])]
+                close_index = min(
+                    range(2),
+                    key=lambda item: math.hypot(
+                        extension_ends[item][0] - dimension_end[0],
+                        extension_ends[item][1] - dimension_end[1],
+                    ),
+                )
+                close = extension_ends[close_index]
+                free = extension_ends[1 - close_index]
+                end_gap = math.hypot(close[0] - dimension_end[0], close[1] - dimension_end[1])
+                axis_point = nearest_axis_point(free)
+                axis_gap = math.hypot(free[0] - axis_point[0], free[1] - axis_point[1]) if axis_point else float("inf")
+                if end_gap <= 9.0 and axis_gap <= 14.0:
+                    score = end_gap + axis_gap
+                    if best is None or score < best[0]:
+                        best = (score, axis_point)
+            if best is not None:
+                matches.append(best[1])
+        if len(matches) != 2:
+            continue
+        for point in matches:
+            if point is None:
+                continue
+            if any(math.hypot(point[0] - item["x"], point[1] - item["y"]) < 10.0 for item in candidates):
+                continue
+            if any(math.hypot(point[0] - item["x"], point[1] - item["y"]) < 10.0 for item in exact_vertices):
+                continue
+            candidates.append({"x": round(point[0], 2), "y": round(point[1], 2), "source_stroke": index})
+
+    if not candidates:
+        return []
+    exact_points = [(item["x"], item["y"]) for item in exact_vertices]
+    if len(exact_points) >= 2:
+        first = min(exact_points, key=lambda point: point[0] + point[1])
+        last = max(exact_points, key=lambda point: point[0] + point[1])
+        direction = (last[0] - first[0], last[1] - first[1])
+    else:
+        direction = (1.0, 0.0)
+    direction_length = math.hypot(*direction) or 1.0
+    direction = (direction[0] / direction_length, direction[1] / direction_length)
+    ordered = sorted(candidates, key=lambda item: item["x"] * direction[0] + item["y"] * direction[1])
+    chain = [*exact_vertices, *candidates]
+    chain.sort(key=lambda item: item.get("x", 0.0) * direction[0] + item.get("y", 0.0) * direction[1])
+    uncertain = []
+    for item in ordered:
+        position = chain.index(item)
+        has_previous = position > 0
+        has_next = position < len(chain) - 1
+        uncertain.append(
+            {
+                "x": item["x"],
+                "y": item["y"],
+                "role": "uncertain",
+                "exact": has_previous and has_next,
+                "confidence": 0.85 if has_previous and has_next else 0.35,
+                "source": "dimension_chain",
+                "reason": "есть размерные связи с обеих сторон" if has_previous and has_next else "есть только одна подтверждённая сторона",
+            }
+        )
+    return uncertain
+
+
 # ============================================================
 # 4. РЕНДЕР И СОХРАНЕНИЕ
 # ============================================================
