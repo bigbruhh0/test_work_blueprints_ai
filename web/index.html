@@ -13,8 +13,8 @@
     }
   }
   </script>
-  <link rel="stylesheet" href="/static/styles.css?v=3">
-  <script src="/static/app.js" defer></script>
+  <link rel="stylesheet" href="/static/styles.css?v=6">
+  <script src="/static/app.js?v=6" defer></script>
 </head>
 <body>
   <header class="topbar">
@@ -77,34 +77,45 @@
     </section>
 
     <section class="analysis-page" id="prompt-section" hidden>
-      <div class="prompt-page-head">
-        <div class="panel-title"><span>ПРОМПТЫ</span><h2>Редактор промптов</h2></div>
-        <div class="prompt-picker" id="prompt-tabs" aria-label="Выбор промпта"></div>
+      <div class="prompt-screen-head">
+        <div>
+          <div class="prompt-eyebrow">КОНТРОЛЬ ПРОМПТОВ</div>
+          <h2>Промпты и версии</h2>
+          <p class="muted">Для выбранного промпта отдельно показаны оценки текущей версии, всех версий и старых запусков без версии.</p>
+        </div>
+        <span id="prompt-status" class="prompt-state-badge">Готово</span>
       </div>
-      <section class="prompt-active-card">
-        <div class="prompt-active-heading">
-          <div>
-            <div class="prompt-eyebrow">ТЕКУЩИЙ ПРОМПТ</div>
-            <h3 id="prompt-active-title">—</h3>
+      <div class="prompt-workspace">
+        <aside class="prompt-catalog" aria-label="Список промптов">
+          <div class="prompt-catalog-title"><span>ПРОМПТЫ</span><b id="prompt-catalog-count">0</b></div>
+          <div id="prompt-tabs" class="prompt-catalog-list"></div>
+        </aside>
+        <section class="prompt-detail" aria-live="polite">
+          <div class="prompt-detail-head">
+            <div>
+              <div class="prompt-eyebrow">АКТИВНЫЙ ПРОМПТ</div>
+              <h3 id="prompt-active-title">Выберите промпт</h3>
+              <div class="prompt-active-meta">
+                <span>Версия <b id="prompt-active-version">—</b></span>
+                <span>Источник <b id="prompt-active-source">—</b></span>
+                <code id="prompt-active-sha">—</code>
+              </div>
+            </div>
+            <div id="prompt-active-stats" class="prompt-stat-strip"></div>
           </div>
-          <div class="prompt-active-stats" id="prompt-active-stats"></div>
-        </div>
-        <div class="prompt-active-meta">
-          <span>версия <b id="prompt-active-version">—</b></span>
-          <span>sha <code id="prompt-active-sha">—</code></span>
-        </div>
-      </section>
-      <section class="prompt-editor-card">
-        <textarea id="prompt-editor" class="prompt-editor" spellcheck="false" aria-label="Текст текущего промпта"></textarea>
-        <div class="prompt-editor-actions">
-          <button class="primary-button" id="save-prompt">Сохранить</button>
-          <span id="prompt-status" class="pill-soft"></span>
-        </div>
-      </section>
-      <section class="prompt-history-card">
-        <div class="prompt-history-heading"><h3>Версии промпта</h3><span class="muted">Выберите версию, которую нужно сделать текущей</span></div>
-        <div id="prompt-versions"></div>
-      </section>
+          <div class="prompt-editor-wrap">
+            <div class="prompt-subhead"><h4>Текст активной версии</h4><span id="prompt-editor-hint" class="muted">Изменения применяются к новым запросам</span></div>
+            <textarea id="prompt-editor" class="prompt-editor" spellcheck="false" aria-label="Текст активной версии"></textarea>
+            <div class="prompt-editor-actions">
+              <button class="primary-button" id="save-prompt">Сохранить новую версию</button>
+            </div>
+          </div>
+          <div class="prompt-history-card">
+            <div class="prompt-subhead"><h4>История версий</h4><span class="muted">Статистика каждой строки относится к этой версии</span></div>
+            <div id="prompt-versions" class="prompt-version-list"></div>
+          </div>
+        </section>
+      </div>
     </section>
 
     <section class="analysis-page" id="eval-section" hidden>

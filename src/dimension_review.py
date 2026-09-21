@@ -96,7 +96,8 @@ def review_map_with_provider(
         ]
     from src import prompts
 
-    review_prompt = prompts.load_prompt("dimension_review")
+    prompt_revision = prompts.load_prompt_revision("dimension_review")
+    review_prompt = prompt_revision["text"]
     response = requests.post(
         f"{base_url}/chat/completions",
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
@@ -120,6 +121,10 @@ def review_map_with_provider(
         "payload": payload,
         "response_raw": raw,
         "prompt": review_prompt,
+        "prompt_name": prompt_revision["name"],
+        "prompt_version": prompt_revision["version"],
+        "prompt_sha256": prompt_revision["sha256"],
+        "prompt_source": prompt_revision["source"],
         "model": model,
     }
 

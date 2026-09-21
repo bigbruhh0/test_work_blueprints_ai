@@ -41,6 +41,17 @@ def _versions_path(name: str) -> Path:
     return OVERRIDE_DIR / f"{name}.versions.jsonl"
 
 
+def _selection_path(name: str) -> Path:
+    return OVERRIDE_DIR / f"{name}.active.json"
+
+
+def _remember_selection(name: str, version: int, text: str) -> None:
+    _selection_path(name).write_text(json.dumps({
+        "version": version,
+        "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+    }), encoding="utf-8")
+
+
 def list_prompts() -> list[dict[str, str]]:
     output = []
     for name, spec in PROMPT_REGISTRY.items():
@@ -69,11 +80,21 @@ def load_prompt_revision(name: str) -> dict[str, object]:
     override = _override_path(name).exists()
     sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
     matching = next((item for item in reversed(versions) if item.get("sha256") == sha256), None)
+    # Identical texts can belong to different saved versions. Preserve the choice.
+    if override and _selection_path(name).exists():
+        try:
+            selected = json.loads(_selection_path(name).read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            selected = {}
+        if isinstance(selected, dict) and selected.get("sha256") == sha256:
+            matching = next((item for item in versions
+                             if item["version"] == selected.get("version")
+                             and item["sha256"] == sha256), matching)
     return {
         "name": name,
         "text": text,
         "source": "override" if override else "default",
-        "version": matching["version"] if matching is not None else (versions[-1]["version"] if override and versions else "default"),
+        "version": matching["version"] if matching is not None else ("unversioned" if override else "default"),
         "sha256": sha256,
     }
 
@@ -93,6 +114,7 @@ def save_prompt(name: str, text: str) -> None:
     }
     with _versions_path(name).open("a", encoding="utf-8") as file:
         file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    _remember_selection(name, entry["version"], text)
 
 
 def list_versions(name: str) -> list[dict[str, object]]:
@@ -148,6 +170,25 @@ def restore_version(name: str, version: int) -> None:
     text = get_version_text(name, version)
     OVERRIDE_DIR.mkdir(parents=True, exist_ok=True)
     _override_path(name).write_text(text, encoding="utf-8")
+    _remember_selection(name, version, text)
+
+
+def resolve_recorded_revision(
+    name: str, version: object, sha256: str | None, text: str | None,
+) -> dict[str, object]:
+    """Recover missing metadata only when the stored evidence is unambiguous."""
+    if version is not None and version != "" and sha256:
+        return {"name": name, "version": str(version), "sha256": sha256}
+    digest = sha256 or (hashlib.sha256(text.encode("utf-8")).hexdigest() if text else None)
+    matches = [item for item in list_versions(name) if item["sha256"] == digest]
+    if version is not None and version != "":
+        matches = [item for item in matches if str(item["version"]) == str(version)]
+    if len(matches) == 1:
+        version = str(matches[0]["version"])
+    elif version in (None, "") and not matches and name in PROMPT_REGISTRY:
+        default_hash = hashlib.sha256(_default_text(name).encode("utf-8")).hexdigest()
+        version = "default" if digest == default_hash else None
+    return {"name": name, "version": version, "sha256": digest}
 
 
 def reset_prompt(name: str) -> None:

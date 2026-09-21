@@ -34,148 +34,185 @@ async function init() {
   }
 }
 
-let promptsState = { list: [], current: null, selectionToken: 0 };
+const promptWorkspace = { list: [], activeName: null, active: null, versions: [], token: 0, busy: false };
+
+function promptFeedback(feedback) {
+  const data = feedback || {};
+  return '<span class="prompt-feedback prompt-feedback-up">↑ ' + Number(data.positive || 0) + '</span>'
+    + '<span class="prompt-feedback prompt-feedback-down">↓ ' + Number(data.negative || 0) + '</span>';
+}
 
 async function showPrompts() {
+  $('#prompt-section').hidden = false;
+  $('#runs-section').hidden = true;
+  $('#result-section').hidden = true;
+  $('#history-section').hidden = true;
+  $('#eval-section').hidden = true;
+  if (promptWorkspace.busy) return;
   try {
-    const list = await api('/api/prompts');
-    promptsState.list = list;
-    $('#prompt-section').hidden = false;
-    $('#runs-section').hidden = true;
-    $('#result-section').hidden = true;
-    $('#history-section').hidden = true;
-    renderPromptTabs(list);
-    if (!list.some(function (item) { return item.name === promptsState.current; })) {
-      promptsState.current = null;
+    promptWorkspace.list = await api('/api/prompts', { cache: 'no-store' });
+    if (!promptWorkspace.list.some((item) => item.name === promptWorkspace.activeName)) {
+      promptWorkspace.activeName = promptWorkspace.list[0]?.name || null;
     }
-    if (list.length && !promptsState.current) {
-      await selectPrompt(list[0].name);
-    } else if (promptsState.current) {
-      await selectPrompt(promptsState.current);
-    }
+    renderPromptCatalog();
+    if (promptWorkspace.activeName) await loadPromptWorkspace(promptWorkspace.activeName);
     $('#prompt-section').scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch (error) {
-    $('#prompt-status').textContent = 'Ошибка: ' + error.message;
+    setPromptStatus('Ошибка: ' + error.message, true);
   }
 }
 
-function renderPromptTabs(list) {
+function setPromptStatus(message, error = false) {
+  const node = $('#prompt-status');
+  node.textContent = message;
+  node.classList.toggle('error', error);
+}
+
+function setPromptBusy(busy) {
+  promptWorkspace.busy = busy;
+  $('.prompt-detail').setAttribute('aria-busy', String(busy));
+  $('#save-prompt').disabled = busy || !promptWorkspace.active;
+  $('#prompt-editor').disabled = busy || !promptWorkspace.active;
+  $$('#prompt-tabs button, #prompt-versions button').forEach((button) => { button.disabled = busy; });
+}
+
+function clearPromptDetails() {
+  promptWorkspace.active = null;
+  promptWorkspace.versions = [];
+  $('#prompt-active-title').textContent = promptWorkspace.list.find((item) => item.name === promptWorkspace.activeName)?.title || '';
+  $('#prompt-active-version').textContent = '…';
+  $('#prompt-active-source').textContent = '';
+  $('#prompt-active-sha').textContent = '';
+  $('#prompt-active-stats').replaceChildren();
+  $('#prompt-versions').replaceChildren();
+  $('#prompt-editor').value = '';
+}
+
+function applyPromptSnapshot(data) {
+  if (data.name !== promptWorkspace.activeName) return;
+  promptWorkspace.active = data;
+  promptWorkspace.versions = Array.isArray(data.versions) ? data.versions : [];
+  const item = promptWorkspace.list.find((entry) => entry.name === data.name);
+  if (item) Object.assign(item, { active_version: data.version, active_sha256: data.sha256 });
+  renderPromptCatalog();
+  renderActivePrompt();
+  renderPromptVersions();
+  setPromptStatus('Активна версия v' + data.version);
+}
+
+function renderPromptCatalog() {
   const container = $('#prompt-tabs');
-  container.innerHTML = '';
-  list.forEach(function (item) {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'prompt-picker-item' + (promptsState.current === item.name ? ' on' : '');
-    const selected = promptsState.current === item.name;
-    button.setAttribute('aria-selected', selected ? 'true' : 'false');
-    if (selected) {
-      button.style.background = '#a8d1b9';
-      button.style.border = '3px solid #167b59';
-      button.style.boxShadow = '0 0 0 3px rgba(22, 123, 89, .2)';
-    }
-    const feedback = item.feedback || {};
-    button.innerHTML = '<span class="prompt-tab-title">' + esc(item.title) + '</span>'
-      + '<span class="prompt-feedback prompt-feedback-up" title="Thumbs up">↑ ' + Number(feedback.positive || 0) + '</span>'
-      + '<span class="prompt-feedback prompt-feedback-down" title="Thumbs down">↓ ' + Number(feedback.negative || 0) + '</span>';
-    button.dataset.name = item.name;
-    button.addEventListener('click', function () { selectPrompt(item.name); });
-    container.appendChild(button);
+  $('#prompt-catalog-count').textContent = String(promptWorkspace.list.length);
+  container.innerHTML = promptWorkspace.list.map((item) => {
+    const active = item.name === promptWorkspace.activeName;
+    const version = item.active_version ?? 'default';
+    return '<button type="button" class="prompt-catalog-item' + (active ? ' is-active' : '') + '"'
+      + ' data-prompt-name="' + esc(item.name) + '" aria-selected="' + active + '">'
+      + '<span class="prompt-catalog-mark">' + (active ? '✓' : '') + '</span>'
+      + '<span class="prompt-catalog-copy"><b>' + esc(item.title || item.name) + '</b>'
+      + '<small>' + esc(item.name) + ' · v' + esc(version) + '</small></span>'
+      + '</button>';
+  }).join('') || '<div class="muted">Промпты не найдены</div>';
+  container.querySelectorAll('[data-prompt-name]').forEach((button) => {
+    button.addEventListener('click', () => loadPromptWorkspace(button.dataset.promptName));
   });
 }
 
-async function selectPrompt(name) {
-  promptsState.current = name;
-  const selectionToken = ++promptsState.selectionToken;
-  const item = promptsState.list.find(function (p) { return p.name === name; });
-  $('#prompt-tabs').querySelectorAll('.prompt-picker-item').forEach(function (button) {
-    const selected = button.dataset.name === name;
-    button.classList.toggle('on', selected);
-    button.setAttribute('aria-selected', selected ? 'true' : 'false');
-    button.style.background = selected ? '#a8d1b9' : '';
-    button.style.border = selected ? '3px solid #167b59' : '';
-    button.style.outline = selected ? '3px solid #167b59' : '';
-    button.style.outlineOffset = selected ? '2px' : '';
-    button.style.boxShadow = selected ? '0 0 0 3px rgba(22, 123, 89, .2)' : '';
-  });
-  try {
-    const data = await api('/api/prompts/' + name);
-    if (selectionToken !== promptsState.selectionToken) return;
-    $('#prompt-editor').value = data.text;
-      $('#prompt-active-title').textContent = data.title || (item ? item.title : name);
-      $('#prompt-active-version').textContent = data.version ?? 'default';
-      $('#prompt-active-sha').textContent = String(data.sha256 || '').slice(0, 16);
-      const activeFeedback = data.feedback || {};
-      $('#prompt-active-stats').innerHTML = '<span class="prompt-feedback prompt-feedback-up">↑ ' + Number(activeFeedback.positive || 0) + '</span>'
-        + '<span class="prompt-feedback prompt-feedback-down">↓ ' + Number(activeFeedback.negative || 0) + '</span>';
-    await loadPromptVersions(name, selectionToken);
-  } catch (error) {
-    $('#prompt-status').textContent = 'Ошибка: ' + error.message;
+function renderActivePrompt() {
+  const data = promptWorkspace.active;
+  if (!data) return;
+  $('#prompt-active-title').textContent = data.title || data.name;
+  $('#prompt-active-version').textContent = data.version ?? 'default';
+  $('#prompt-active-source').textContent = data.source || 'default';
+  $('#prompt-active-sha').textContent = String(data.sha256 || '').slice(0, 16);
+  const activeFeedback = data.active_feedback;
+  const promptTotal = data.prompt_feedback || {};
+  const legacy = data.unversioned_feedback || {};
+  $('#prompt-active-stats').innerHTML = '<div class="prompt-stat-card" data-stat-scope="version"><small>Текущая версия · v' + esc(data.version) + '</small><span>' + promptFeedback(activeFeedback) + '</span></div>'
+    + '<div class="prompt-stat-card" data-stat-scope="prompt"><small>Все версии промпта</small><span>' + promptFeedback(promptTotal) + '</span></div>'
+    + (Number(legacy.total || 0) > 0
+      ? '<div class="prompt-stat-card is-legacy"><small>Без версии</small><span>' + promptFeedback(legacy) + '</span></div>'
+      : '');
+  $('#prompt-editor').value = data.text || '';
+}
+
+function renderPromptVersions() {
+  const container = $('#prompt-versions');
+  const versions = Array.isArray(promptWorkspace.versions) ? promptWorkspace.versions : [];
+  if (!versions.length) {
+    container.innerHTML = '<div class="prompt-empty">История пока пуста</div>';
+    return;
   }
+  container.innerHTML = versions.map((version) => {
+    const safeVersion = version || {};
+    const active = Boolean(safeVersion.is_active);
+    const when = safeVersion.created_at ? new Date(safeVersion.created_at).toLocaleString('ru-RU') : 'Встроенная версия';
+    return '<article data-version="' + esc(safeVersion.version) + '" class="prompt-version' + (active ? ' is-current' : '') + '">'
+      + '<div class="prompt-version-main"><div class="prompt-version-title"><b>v' + esc(safeVersion.version) + '</b>'
+      + (active ? '<span class="prompt-current-version">ТЕКУЩАЯ</span>' : '') + '</div>'
+      + '<small>' + esc(when) + ' · ' + Number(safeVersion.length || 0) + ' символов</small></div>'
+      + '<div class="prompt-version-stats">' + promptFeedback(safeVersion.feedback) + '</div>'
+      + (active ? '<span class="prompt-version-lock">Активна</span>' : '<button type="button" class="prompt-use-button" data-use-version="' + esc(safeVersion.version) + '">Сделать текущей</button>')
+      + '</article>';
+  }).join('');
+  container.querySelectorAll('[data-use-version]').forEach((button) => {
+    button.addEventListener('click', () => usePromptVersion(Number(button.dataset.useVersion)));
+  });
 }
 
-async function loadPromptVersions(name, selectionToken) {
+async function loadPromptWorkspace(name) {
+  if (promptWorkspace.busy) return;
+  const token = ++promptWorkspace.token;
+  promptWorkspace.activeName = name;
+  clearPromptDetails();
+  renderPromptCatalog();
+  setPromptBusy(true);
+  setPromptStatus('Загрузка…');
   try {
-    const data = await api('/api/prompts/' + name + '/versions');
-    if (selectionToken != null && selectionToken !== promptsState.selectionToken) return;
-    const versions = data.versions || [];
-    const container = $('#prompt-versions');
-    if (!versions.length) {
-      container.innerHTML = '<p class="muted">Версий пока нет — сохраните промпт, чтобы появилась первая версия.</p>';
-      return;
-    }
-    container.innerHTML = versions.map(function (version) {
-      const when = version.created_at ? new Date(version.created_at).toLocaleString('ru-RU') : '';
-      const feedback = version.feedback || {};
-      return '<div class="version-row">'
-        + '<span class="mono">v' + version.version + '</span>'
-        + '<span class="muted">' + esc(when) + ' · ' + version.length + ' симв.</span>'
-        + '<span class="version-feedback"><span class="prompt-feedback prompt-feedback-up">↑ ' + Number(feedback.positive || 0) + '</span><span class="prompt-feedback prompt-feedback-down">↓ ' + Number(feedback.negative || 0) + '</span></span>'
-        + '<button type="button" class="prompt-use-button" data-use-version="' + version.version + '">Использовать</button>'
-        + '</div>';
-    }).join('');
-    container.querySelectorAll('[data-use-version]').forEach(function (button) {
-      button.addEventListener('click', function () { usePromptVersion(Number(button.dataset.useVersion)); });
-    });
+    const active = await api('/api/prompts/' + encodeURIComponent(name), { cache: 'no-store' });
+    if (token !== promptWorkspace.token) return;
+    applyPromptSnapshot(active);
   } catch (error) {
-    $('#prompt-versions').innerHTML = '<div class="badge error">' + esc(error.message) + '</div>';
+    if (token === promptWorkspace.token) setPromptStatus('Ошибка: ' + error.message, true);
+  } finally {
+    if (token === promptWorkspace.token) setPromptBusy(false);
   }
 }
 
 async function usePromptVersion(version) {
-  const name = promptsState.current;
-  if (!name) return;
+  const name = promptWorkspace.activeName;
+  if (!name || promptWorkspace.busy) return;
+  clearPromptDetails();
+  setPromptBusy(true);
+  setPromptStatus('Переключение версии…');
   try {
-    const restored = await api('/api/prompts/' + name + '/restore', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ version: version }),
+    const restored = await api('/api/prompts/' + encodeURIComponent(name) + '/restore', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ version }),
     });
-    const list = await api('/api/prompts');
-    promptsState.list = list;
-    renderPromptTabs(list);
-    await selectPrompt(name);
-    $('#prompt-status').textContent = 'Используется версия v' + (restored.version ?? version);
+    applyPromptSnapshot(restored);
   } catch (error) {
-    $('#prompt-status').textContent = 'Ошибка: ' + error.message;
+    setPromptStatus('Ошибка: ' + error.message, true);
+  } finally {
+    setPromptBusy(false);
   }
 }
 
 async function saveCurrentPrompt() {
-  const name = promptsState.current;
-  if (!name) return;
+  const name = promptWorkspace.activeName;
+  if (!name || promptWorkspace.busy || !promptWorkspace.active) return;
+  const text = $('#prompt-editor').value;
+  setPromptBusy(true);
+  setPromptStatus('Сохранение…');
   try {
-    await api('/api/prompts/' + name, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: $('#prompt-editor').value }),
+    const saved = await api('/api/prompts/' + encodeURIComponent(name), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }),
     });
-    $('#prompt-status').textContent = 'Сохранено — применяется к новым запросам';
-    const list = await api('/api/prompts');
-    promptsState.list = list;
-    renderPromptTabs(list);
-    await selectPrompt(name);
+    applyPromptSnapshot(saved);
+    setPromptStatus('Новая версия сохранена');
   } catch (error) {
-    $('#prompt-status').textContent = 'Ошибка: ' + error.message;
+    setPromptStatus('Ошибка: ' + error.message, true);
+  } finally {
+    setPromptBusy(false);
   }
 }
 
@@ -1104,8 +1141,8 @@ function bindFeedbackButtons(root) {
             item.classList.toggle('selected', item === button);
           });
           const prompts = await api('/api/prompts');
-          promptsState.list = prompts;
-          renderPromptTabs(prompts);
+          promptWorkspace.list = prompts;
+          if (!$('#prompt-section').hidden) renderPromptCatalog();
         } catch (error) {
           alert('Не удалось сохранить оценку: ' + error.message);
         } finally {

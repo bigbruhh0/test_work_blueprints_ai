@@ -121,7 +121,7 @@ def startup() -> None:
 
 @app.get("/")
 def index() -> FileResponse:
-    return FileResponse(WEB_DIR / "index.html")
+    return FileResponse(WEB_DIR / "index.html", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/config")
@@ -196,29 +196,68 @@ class AnalyzeBody(BaseModel):
     excluded_pages: list[int] = []
 
 
+def _versioned_prompt_feedback_summary() -> list[dict[str, Any]]:
+    """Resolve legacy feedback to a prompt revision by exact prompt-text hash."""
+    from src import prompts
+
+    grouped: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
+    for row in run_db.feedback_rows():
+        prompt_name = row.get("prompt_name")
+        revision = prompts.resolve_recorded_revision(
+            prompt_name, row.get("prompt_version"), row.get("prompt_sha256"),
+            (row.get("context") or {}).get("prompt"),
+        ) if prompt_name else {}
+        prompt_version = revision.get("version")
+        prompt_sha256 = revision.get("sha256")
+        key = (prompt_name, prompt_version, prompt_sha256)
+        summary = grouped.setdefault(key, {
+            "prompt_name": prompt_name,
+            "prompt_version": prompt_version,
+            "prompt_sha256": prompt_sha256,
+            "positive": 0,
+            "negative": 0,
+            "total": 0,
+        })
+        summary["positive" if row.get("rating") == "up" else "negative"] += 1
+        summary["total"] += 1
+    return list(grouped.values())
+
+
+def _prompt_feedback_counts(
+    rows: list[dict[str, Any]], name: str, revision: dict[str, Any] | None = None,
+    *, unversioned: bool = False,
+) -> dict[str, int]:
+    matching = [row for row in rows if row.get("prompt_name") == name]
+    if revision is not None:
+        matching = [row for row in matching
+                    if str(row.get("prompt_version")) == str(revision.get("version"))
+                    and row.get("prompt_sha256") == revision.get("sha256")]
+    elif unversioned:
+        matching = [row for row in matching
+                    if row.get("prompt_version") in (None, "", "unversioned")
+                    or not row.get("prompt_sha256")]
+    positive = sum(int(row.get("positive") or 0) for row in matching)
+    negative = sum(int(row.get("negative") or 0) for row in matching)
+    return {"positive": positive, "negative": negative, "total": positive + negative}
+
+
 @app.get("/api/prompts")
 def list_prompts() -> list[dict[str, Any]]:
     from src import prompts
 
-    summary = {
-        (item.get("prompt_name"), item.get("prompt_version"), item.get("prompt_sha256")): item
-        for item in run_db.feedback_summary()
-    }
+    summary_rows = _versioned_prompt_feedback_summary()
     output = []
     for item in prompts.list_prompts():
         active = prompts.load_prompt_revision(item["name"])
-        active_key = (item["name"], str(active.get("version")), active.get("sha256"))
-        active_row = summary.get(active_key, {})
-        legacy_row = summary.get((item["name"], None, None), {})
-        positive = int(active_row.get("positive") or 0) + int(legacy_row.get("positive") or 0)
-        negative = int(active_row.get("negative") or 0) + int(legacy_row.get("negative") or 0)
+        active_feedback = _prompt_feedback_counts(summary_rows, item["name"], active)
         output.append({
             **item,
-            "feedback": {
-                "positive": positive,
-                "negative": negative,
-                "total": positive + negative,
-            },
+            "active_version": active.get("version", "default"),
+            "active_sha256": active.get("sha256", ""),
+            "feedback": active_feedback,
+            "active_feedback": active_feedback,
+            "prompt_feedback": _prompt_feedback_counts(summary_rows, item["name"]),
+            "unversioned_feedback": _prompt_feedback_counts(summary_rows, item["name"], unversioned=True),
         })
     return output
 
@@ -243,6 +282,25 @@ class ManualStatusBody(BaseModel):
     status: str
 
 
+def _feedback_revision(page: dict[str, Any]) -> dict[str, Any]:
+    from src import prompts
+
+    trace = page.get("provider_trace") or {}
+    revision = page.get("prompt_revision") or {}
+    version = revision.get("version")
+    if version is None:
+        version = trace.get("prompt_version")
+    resolved = prompts.resolve_recorded_revision(
+        revision.get("name") or trace.get("prompt_name") or "dimension_review",
+        version, revision.get("sha256") or trace.get("prompt_sha256"), trace.get("prompt"),
+    )
+    return {
+        "prompt_name": resolved["name"],
+        "prompt_version": resolved["version"],
+        "prompt_sha256": resolved["sha256"],
+    }
+
+
 @app.post("/api/feedback")
 def save_analysis_feedback(body: FeedbackBody) -> dict[str, Any]:
     if body.rating not in {"up", "down"}:
@@ -261,7 +319,6 @@ def save_analysis_feedback(body: FeedbackBody) -> dict[str, Any]:
         raise HTTPException(400, "Оценка доступна только после этапа провайдера")
     decision = next((item for item in (review.get("answer") or {}).get("candidate_decisions", []) if item.get("candidate_id") == body.candidate_id), {})
     trace = page.get("provider_trace") or {}
-    revision = page.get("prompt_revision") or {}
     context = {
         "source_name": run.get("source_name"),
         "dimension": dimension,
@@ -277,16 +334,17 @@ def save_analysis_feedback(body: FeedbackBody) -> dict[str, Any]:
         "page_number": body.page_number,
         "candidate_id": body.candidate_id,
         "rating": body.rating,
-        "prompt_name": revision.get("name") or trace.get("prompt_name") or "dimension_review",
-        "prompt_version": revision.get("version") or trace.get("prompt_version"),
-        "prompt_sha256": revision.get("sha256") or trace.get("prompt_sha256"),
+        **_feedback_revision(page),
         "context": context,
     })
 
 
 @app.get("/api/feedback")
 def list_analysis_feedback(prompt_name: str | None = None) -> dict[str, Any]:
-    return {"rows": run_db.feedback_rows(prompt_name), "summary": run_db.feedback_summary()}
+    summary = _versioned_prompt_feedback_summary()
+    if prompt_name:
+        summary = [row for row in summary if row.get("prompt_name") == prompt_name]
+    return {"rows": run_db.feedback_rows(prompt_name), "summary": summary}
 
 
 @app.post("/api/manual-status")
@@ -324,16 +382,13 @@ def update_manual_status(body: ManualStatusBody) -> dict[str, Any]:
     analysis["dimension_review"] = review
     page["analysis"] = analysis
     trace = page.get("provider_trace") or {}
-    revision = page.get("prompt_revision") or {}
     run_db.save_feedback({
         "run_id": body.run_id,
         "line_id": body.line_id,
         "page_number": body.page_number,
         "candidate_id": body.candidate_id,
         "rating": "down",
-        "prompt_name": revision.get("name") or trace.get("prompt_name") or "dimension_review",
-        "prompt_version": revision.get("version") or trace.get("prompt_version"),
-        "prompt_sha256": revision.get("sha256") or trace.get("prompt_sha256"),
+        **_feedback_revision(page),
         "context": {
             "source_name": run.get("source_name"),
             "manual_adjustment": manual_adjustments[body.candidate_id],
@@ -364,27 +419,8 @@ def get_prompt(name: str) -> dict[str, Any]:
     if name not in prompts.PROMPT_REGISTRY:
         raise HTTPException(404, "Промпт не найден")
     revision = prompts.load_prompt_revision(name)
-    feedback_rows = run_db.feedback_summary()
-    active_row = next(
-        (
-            item for item in feedback_rows
-            if item.get("prompt_name") == name
-            and str(item.get("prompt_version")) == str(revision.get("version"))
-            and item.get("prompt_sha256") == revision.get("sha256")
-        ),
-        {},
-    )
-    legacy_row = next(
-        (
-            item for item in feedback_rows
-            if item.get("prompt_name") == name
-            and not item.get("prompt_version")
-            and not item.get("prompt_sha256")
-        ),
-        {},
-    )
-    positive = int(active_row.get("positive") or 0) + int(legacy_row.get("positive") or 0)
-    negative = int(active_row.get("negative") or 0) + int(legacy_row.get("negative") or 0)
+    feedback_rows = _versioned_prompt_feedback_summary()
+    active_feedback = _prompt_feedback_counts(feedback_rows, name, revision)
     return {
         "name": name,
         "title": prompts.PROMPT_REGISTRY[name].get("title", name),
@@ -392,18 +428,22 @@ def get_prompt(name: str) -> dict[str, Any]:
         "version": revision["version"],
         "sha256": revision["sha256"],
         "text": revision["text"],
-        "feedback": {"positive": positive, "negative": negative, "total": positive + negative},
+        "feedback": active_feedback,
+        "active_feedback": active_feedback,
+        "prompt_feedback": _prompt_feedback_counts(feedback_rows, name),
+        "unversioned_feedback": _prompt_feedback_counts(feedback_rows, name, unversioned=True),
+        "versions": _prompt_version_rows(name, revision, feedback_rows),
     }
 
 
 @app.post("/api/prompts/{name}")
-def save_prompt(name: str, body: PromptBody) -> dict[str, str]:
+def save_prompt(name: str, body: PromptBody) -> dict[str, Any]:
     from src import prompts
 
     if name not in prompts.PROMPT_REGISTRY:
         raise HTTPException(404, "Промпт не найден")
     prompts.save_prompt(name, body.text)
-    return {"name": name, "source": "override"}
+    return get_prompt(name)
 
 
 @app.post("/api/prompts/{name}/reset")
@@ -418,43 +458,46 @@ def reset_prompt(name: str) -> dict[str, str]:
 
 @app.get("/api/prompts/{name}/versions")
 def list_prompt_versions(name: str) -> dict[str, Any]:
+    snapshot = get_prompt(name)
+    return {key: snapshot[key] for key in ("name", "versions", "unversioned_feedback")}
+
+
+def _prompt_version_rows(
+    name: str, active_revision: dict[str, Any], feedback_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     from src import prompts
 
-    if name not in prompts.PROMPT_REGISTRY:
-        raise HTTPException(404, "Промпт не найден")
-    summaries = {
-        (str(item.get("prompt_version")), item.get("prompt_sha256")): item
-        for item in run_db.feedback_summary()
-        if item.get("prompt_name") == name
-    }
-    active_revision = prompts.load_prompt_revision(name)
-    legacy_summary = next(
-        (
-            item for item in run_db.feedback_summary()
-            if item.get("prompt_name") == name
-            and not item.get("prompt_version")
-            and not item.get("prompt_sha256")
-        ),
-        None,
-    )
+    stored_versions = prompts.list_versions(name)
+    active_key = (str(active_revision.get("version", "default")), active_revision.get("sha256"))
+
     versions = []
-    for version in prompts.list_versions(name):
-        summary = summaries.get((str(version.get("version")), version.get("sha256")), {})
-        if version.get("version") == active_revision.get("version") and legacy_summary:
-            summary = {
-                "positive": int(summary.get("positive") or 0) + int(legacy_summary.get("positive") or 0),
-                "negative": int(summary.get("negative") or 0) + int(legacy_summary.get("negative") or 0),
-                "total": int(summary.get("total") or 0) + int(legacy_summary.get("total") or 0),
-            }
+    if not any(
+        (str(version.get("version")), version.get("sha256")) == active_key
+        for version in stored_versions
+    ):
+        active_feedback = _prompt_feedback_counts(feedback_rows, name, active_revision)
+        active_text = str(active_revision.get("text") or "")
+        versions.append({
+            "version": active_revision.get("version", "default"),
+            "created_at": "",
+            "preview": active_text[:80],
+            "length": len(active_text),
+            "sha256": active_revision.get("sha256", ""),
+            "source": active_revision.get("source", "default"),
+            "is_active": True,
+            "feedback": active_feedback,
+        })
+
+    for version in stored_versions:
         versions.append({
             **version,
-            "feedback": {
-                "positive": int(summary.get("positive") or 0),
-                "negative": int(summary.get("negative") or 0),
-                "total": int(summary.get("total") or 0),
-            },
+            "is_active": (
+                str(version.get("version")) == str(active_revision.get("version"))
+                and version.get("sha256") == active_revision.get("sha256")
+            ),
+            "feedback": _prompt_feedback_counts(feedback_rows, name, version),
         })
-    return {"name": name, "versions": versions}
+    return versions
 
 
 class RestoreBody(BaseModel):
@@ -471,13 +514,7 @@ def restore_prompt_version(name: str, body: RestoreBody) -> dict[str, Any]:
         prompts.restore_version(name, body.version)
     except IndexError as error:
         raise HTTPException(400, str(error)) from error
-    revision = prompts.load_prompt_revision(name)
-    return {
-        "name": name,
-        "version": revision["version"],
-        "sha256": revision["sha256"],
-        "source": "override",
-    }
+    return get_prompt(name)
 
 
 @app.post("/api/runs")
@@ -662,6 +699,15 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                         "answer": review,
                         "model": review_trace["model"],
                         "prompt_name": "dimension_review",
+                        "prompt_version": review_trace["prompt_version"],
+                        "prompt_sha256": review_trace["prompt_sha256"],
+                        "prompt_source": review_trace["prompt_source"],
+                    }
+                    page_run.prompt_revision = {
+                        "name": "dimension_review",
+                        "version": review_trace["prompt_version"],
+                        "sha256": review_trace["prompt_sha256"],
+                        "source": review_trace["prompt_source"],
                     }
                     eval_result = evaluate_line_for_prompt(line.line_id, "dimension_review", review)
                     if eval_result:
