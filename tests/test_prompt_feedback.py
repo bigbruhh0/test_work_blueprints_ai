@@ -6,7 +6,9 @@ from unittest import mock
 
 import server
 from src import db, prompts
+from src.ai_client import _find_connection_rows
 from src.dimension_review import review_map_with_provider
+from src.models import Candidate, VertexMark
 
 
 class PromptFeedbackTests(unittest.TestCase):
@@ -145,6 +147,25 @@ class PromptFeedbackTests(unittest.TestCase):
     def test_untracked_override_does_not_claim_latest_version(self):
         (prompts.OVERRIDE_DIR / "dimension_review.txt").write_text("external edit", encoding="utf-8")
         self.assertEqual(prompts.load_prompt_revision("dimension_review")["version"], "unversioned")
+
+    def test_find_connection_rows_detects_tie_in_and_continuation(self):
+        candidates = [
+            Candidate(id="C1", line_id="L1", page=216, kind="text", text="ПОДКЛЮЧЕНИЕ V-505/СЛИВ КОНДЕНСАТА 40 mm PE", zone="drawing", bbox=(10, 20, 100, 40)),
+            Candidate(id="C2", line_id="L1", page=216, kind="text", text="СМ. CO-0031 ЛИСТ 2", zone="drawing", bbox=(120, 40, 220, 60)),
+            Candidate(id="C3", line_id="L1", page=216, kind="text", text="СМ. СО-0031", zone="drawing", bbox=(220, 70, 320, 90)),
+        ]
+        vertices = [
+            VertexMark(id="V04", line_id="L1", page=216, label="V04", role="junction", x=50, y=30, confidence=1.0),
+            VertexMark(id="V03", line_id="L1", page=216, label="V03", role="junction", x=150, y=50, confidence=1.0),
+            VertexMark(id="V05", line_id="L1", page=216, label="V05", role="junction", x=250, y=80, confidence=1.0),
+        ]
+        rows = _find_connection_rows(candidates, vertices)
+        self.assertEqual([row["connection_type"] for row in rows], ["tie_in", "continuation", "other"])
+        self.assertEqual(rows[0]["vertex_id"], "V04")
+        self.assertEqual(rows[1]["target_sheet"], "2")
+        self.assertTrue(rows[1]["text_has_sheet_ref"])
+        self.assertEqual(rows[2]["target_sheet"], None)
+        self.assertTrue(rows[2]["text_has_sheet_ref"])
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ import os
 import shutil
 import threading
 import uuid
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -28,8 +29,7 @@ from src.dimension_mapping import (
     save_preprocess_annotation_pdf,
     save_skeleton_pdf,
 )
-from src.distance_ai import call_distance_ai_trace
-from src.dimension_review import build_map_text, calculate_lengths, review_map_with_provider
+from src.dimension_review import build_map_text, calculate_lengths, codex_login_command, codex_login_status, review_map_with_provider
 from src.eval_data import aggregate_eval_results, evaluate_line_for_prompt, list_eval_groups, summarize_prompt_eval_rows
 from src.prepare_stage import run_prepare
 from scripts.build_dimension_map import build_map as build_dimension_map, render_pdf as render_dimension_map
@@ -44,7 +44,6 @@ load_dotenv(ROOT / ".env")
 PIPELINE_STEPS = [
     ("local_processing", "Локальная обработка"),
     ("dimension_review", "Карта размеров + проверка провайдером"),
-    ("analyze", "Анализ у провайдера"),
 ]
 
 # Расширяемый реестр конфигураций запуска. stop_stage -> ключ + человекочитаемая метка.
@@ -53,7 +52,6 @@ RUN_KIND_BY_STAGE = {
     "prepare": ("local_prepare", "Локальная обработка"),
     "dimensions": ("dimension_mapping", "Локальная обработка"),
     "dimension_review": ("dimension_review", "Карта размеров + проверка провайдером"),
-    "analyze": ("deepseek_analyze", "Анализ DeepSeek"),
 }
 ENV: dict[str, str] = {}
 app = FastAPI(title="Isometry Mark Pipeline")
@@ -92,12 +90,13 @@ class RunState:
     source_name: str
     pdf_path: str
     line_ids: list[str]
-    stop_stage: str = "analyze"
+    stop_stage: str = "dimension_review"
     status: str = "running"
     created_at: str = ""
     kind: str = ""
     kind_label: str = ""
     model: str = ""
+    provider: str = "deepseek"
     lines: dict[str, LineRun] = field(default_factory=dict)
 
 
@@ -126,12 +125,40 @@ def index() -> FileResponse:
 
 @app.get("/api/config")
 def config() -> dict[str, Any]:
+    default_provider = ENV.get("AI_PROVIDER", "deepseek").strip().lower() or "deepseek"
+    if default_provider not in {"deepseek", "codex_cli"}:
+        default_provider = "deepseek"
+    codex_status = codex_login_status()
     return {
         "pipeline_steps": [{"id": key, "label": label} for key, label in PIPELINE_STEPS],
         "deepseek": bool(ENV.get("DEEPSEEK_API_KEY")),
         "model": ENV.get("DEEPSEEK_MODEL", "deepseek-flash"),
+        "default_provider": default_provider,
+        "providers": [
+            {"id": "deepseek", "label": "DeepSeek API", "available": bool(ENV.get("DEEPSEEK_API_KEY")), "model": ENV.get("DEEPSEEK_MODEL", "deepseek-flash")},
+            {"id": "codex_cli", "label": "Codex CLI", "available": bool(codex_status.get("available")), "logged_in": bool(codex_status.get("logged_in")), "model": ENV.get("CODEX_CLI_MODEL", "default")},
+        ],
+        "codex_cli": codex_status,
         "default_pdf": DEFAULT_PDF.name if DEFAULT_PDF.exists() else "",
     }
+
+
+@app.get("/api/providers/codex/status")
+def codex_provider_status() -> dict[str, Any]:
+    return codex_login_status()
+
+
+@app.post("/api/providers/codex/login")
+def codex_provider_login() -> dict[str, Any]:
+    status = codex_login_status()
+    if status.get("logged_in"):
+        return {"status": status, "command": "", "note": "Codex CLI уже авторизован."}
+    return {"status": status, **codex_login_command()}
+
+
+@app.get("/api/providers/codex/login")
+def codex_provider_login_info() -> dict[str, Any]:
+    return codex_provider_login()
 
 
 class LoadPdfBody(BaseModel):
@@ -192,8 +219,9 @@ def _group(document: dict[str, Any], line_id: str):
 class AnalyzeBody(BaseModel):
     document_id: str
     line_ids: list[str]
-    stop_stage: str = "analyze"
+    stop_stage: str = "dimension_review"
     excluded_pages: list[int] = []
+    provider: str = "deepseek"
 
 
 def _versioned_prompt_feedback_summary() -> list[dict[str, Any]]:
@@ -522,11 +550,14 @@ def create_run(body: AnalyzeBody) -> dict[str, Any]:
     document = STATE["documents"].get(body.document_id)
     if not document:
         raise HTTPException(404, "Документ не найден")
-    stop_stage = (body.stop_stage or "analyze").strip().lower()
-    if stop_stage not in {"local_processing", "prepare", "dimensions", "dimension_review", "analyze"}:
-        raise HTTPException(400, "stop_stage: local_processing|dimension_review|analyze")
+    stop_stage = (body.stop_stage or "dimension_review").strip().lower()
+    if stop_stage not in {"local_processing", "prepare", "dimensions", "dimension_review"}:
+        raise HTTPException(400, "stop_stage: local_processing|dimension_review")
     if stop_stage in {"prepare", "dimensions"}:
         stop_stage = "local_processing"
+    provider = (body.provider or ENV.get("AI_PROVIDER", "deepseek") or "deepseek").strip().lower()
+    if provider not in {"deepseek", "codex_cli"}:
+        raise HTTPException(400, "provider: deepseek|codex_cli")
     run_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     kind, kind_label = RUN_KIND_BY_STAGE.get(stop_stage, (stop_stage, stop_stage))
     excluded_pages = set()
@@ -547,7 +578,8 @@ def create_run(body: AnalyzeBody) -> dict[str, Any]:
         created_at=now(),
         kind=kind,
         kind_label=kind_label,
-        model=ENV.get("DEEPSEEK_MODEL", "deepseek-flash"),
+        model=ENV.get("CODEX_CLI_MODEL", "codex_cli_default") if provider == "codex_cli" else ENV.get("DEEPSEEK_MODEL", "deepseek-flash"),
+        provider=provider,
     )
     for line_id in body.line_ids:
         group = _group(document, line_id)
@@ -561,12 +593,13 @@ def create_run(body: AnalyzeBody) -> dict[str, Any]:
     run_db.save_run(run_dict(run))
     context = {
         "api_key": ENV.get("DEEPSEEK_API_KEY", ""),
-        "model": ENV.get("DEEPSEEK_MODEL", "deepseek-flash"),
+        "model": run.model,
+        "provider": provider,
         "document": document,
         "run": run,
     }
     threading.Thread(target=_run_pipeline, args=(run_id, context), daemon=True).start()
-    return {"run_id": run_id, "status": "running", "stop_stage": stop_stage, "line_ids": body.line_ids}
+    return {"run_id": run_id, "status": "running", "stop_stage": stop_stage, "line_ids": body.line_ids, "provider": provider}
 
 
 def _persist(run: RunState) -> None:
@@ -578,6 +611,7 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
     document = context["document"]
     api_key = context["api_key"]
     model = context["model"]
+    provider = context.get("provider", "deepseek")
     stop_stage = run.stop_stage
     pdf_path = document["pdf_path"]
     max_workers = max(1, int(os.getenv("PIPELINE_WORKERS", "4")))
@@ -684,6 +718,7 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                         model,
                         pdf_path=review_pdf_path,
                         page_number=page_run.page_number,
+                        provider=provider,
                     )
                     review = review_trace["answer"]
                     page_run.analysis["dimension_review"] = {
@@ -698,6 +733,7 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                         "response_raw": review_trace["response_raw"],
                         "answer": review,
                         "model": review_trace["model"],
+                        "provider": review_trace.get("provider", provider),
                         "prompt_name": "dimension_review",
                         "prompt_version": review_trace["prompt_version"],
                         "prompt_sha256": review_trace["prompt_sha256"],
@@ -709,7 +745,7 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                         "sha256": review_trace["prompt_sha256"],
                         "source": review_trace["prompt_source"],
                     }
-                    eval_result = evaluate_line_for_prompt(line.line_id, "dimension_review", review)
+                    eval_result = evaluate_line_for_prompt(line.line_id, "dimension_review", review, sheet=page_run.page_number)
                     if eval_result:
                         page_run.analysis["dimension_review"]["eval"] = aggregate_eval_results([
                             result for group_result in eval_result.values() for result in [group_result]
@@ -722,43 +758,7 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                 _persist(run)
                 return
 
-            page_run.stage = "analyze"
-            page_run.status = "running"
-            page_run.events.append({"time": now(), "stage": "analyze", "message": "запрос к анализатору"})
-            _persist(run)
-            if not api_key:
-                raise RuntimeError("DEEPSEEK_API_KEY не задан в .env")
-            trace = call_distance_ai_trace(
-                api_key=api_key,
-                model=model,
-                vertices=prepare.vertices,
-                numbers=prepare.numbers,
-                coordinates=prepare.coordinates,
-                event_callback=lambda name, payload: page_run.events.append({"time": now(), "stage": "analyze", "message": f"{name}: {payload}"}),
-            )
-            page_run.analysis = trace["answer"]
-            page_run.provider_trace = {
-                "prompt": trace["prompt"],
-                "payload": trace["payload"],
-                "response_raw": trace["response_raw"],
-                "status_code": trace["status_code"],
-                "elapsed_seconds": trace["elapsed_seconds"],
-                "model": trace["model"],
-                "prompt_name": trace.get("prompt_name", "analyze"),
-                "prompt_version": trace.get("prompt_version", "default"),
-                "prompt_source": trace.get("prompt_source", "default"),
-                "prompt_sha256": trace.get("prompt_sha256", ""),
-            }
-            page_run.prompt_revision = {
-                "name": trace.get("prompt_name", "analyze"),
-                "version": trace.get("prompt_version", "default"),
-                "source": trace.get("prompt_source", "default"),
-                "sha256": trace.get("prompt_sha256", ""),
-            }
-            page_run.stage = "done"
-            page_run.status = "complete"
-            page_run.events.append({"time": now(), "stage": "done", "message": f"main_chain: {(trace['answer'].get('main_chain') or {}).get('path')}"})
-            _persist(run)
+            raise RuntimeError(f"Неизвестный этап анализа: {stop_stage}")
         except Exception as error:  # noqa: BLE001
             page_run.status = "error"
             page_run.error = str(error)
@@ -795,18 +795,21 @@ def _eval_history_rows() -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for run in run_db.list_runs():
         for line in run.get("lines", []):
+            line_id = str(line.get("line_id") or "")
             for page in line.get("page_results", []):
                 review = (page.get("analysis") or {}).get("dimension_review")
                 if not isinstance(review, dict):
                     continue
-                eval_summary = review.get("eval")
-                if not isinstance(eval_summary, dict):
+                answer = review.get("answer")
+                if not isinstance(answer, dict):
                     continue
-                for group_id, stats in eval_summary.items():
-                    if not isinstance(stats, dict):
-                        continue
-                    row = {"group_id": group_id, "prompt_name": stats.get("prompt_name") or "dimension_review", **stats}
-                    rows.append(row)
+                eval_result = evaluate_line_for_prompt(
+                    line_id,
+                    "dimension_review",
+                    answer,
+                    sheet=page.get("page_number"),
+                )
+                rows.extend(eval_result.values())
     return rows
 
 
@@ -863,11 +866,30 @@ def list_runs() -> list[dict[str, Any]]:
 def get_run(run_id: str) -> dict[str, Any]:
     run = STATE["runs"].get(run_id)
     if run:
-        return run_dict(run)
+        return _with_current_eval(run_dict(run))
     persisted = run_db.load_run(run_id)
     if not persisted:
         raise HTTPException(404, "Прогон не найден")
-    return persisted
+    return _with_current_eval(persisted)
+
+
+def _with_current_eval(run: dict[str, Any]) -> dict[str, Any]:
+    for line in run.get("lines", []):
+        line_id = str(line.get("line_id") or "")
+        for page in line.get("page_results", []):
+            review = ((page.get("analysis") or {}).get("dimension_review") or {})
+            answer = review.get("answer")
+            if not isinstance(answer, dict):
+                continue
+            eval_result = evaluate_line_for_prompt(
+                line_id,
+                "dimension_review",
+                answer,
+                sheet=page.get("page_number"),
+            )
+            if eval_result:
+                review["eval"] = aggregate_eval_results(list(eval_result.values()))
+    return run
 
 
 def _run_export_rows(run: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
@@ -942,6 +964,7 @@ def export_run_excel(run_id: str) -> StreamingResponse:
             "source_name": run.get("source_name"),
             "status": run.get("status"),
             "created_at": run.get("created_at"),
+            "provider": run.get("provider"),
             "model": run.get("model"),
             "stop_stage": run.get("stop_stage"),
         }]).to_excel(writer, sheet_name="Сводка", index=False)
@@ -949,6 +972,74 @@ def export_run_excel(run_id: str) -> StreamingResponse:
             pd.DataFrame(rows or [{"status": "Нет данных"}]).to_excel(writer, sheet_name=sheet, index=False)
     output.seek(0)
     return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f'attachment; filename="{run_id}.xlsx"'})
+
+
+@app.get("/api/runs/{run_id}/export/review-data")
+def export_review_data(run_id: str) -> StreamingResponse:
+    run = get_run(run_id)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for line in run.get("lines", []):
+            line_id = str(line.get("line_id") or "line")
+            for page in line.get("page_results", []):
+                page_number = page.get("page_number") or "page"
+                prefix = "_".join([
+                    _safe_export_part(line_id),
+                    f"лист{_safe_export_part(page_number)}",
+                ])
+                files = page.get("files") or {}
+                markup_name = files.get("clean_local_markup_pdf")
+                markup_path = ARTIFACTS_DIR / run_id / line_id / markup_name if markup_name else None
+                if markup_path and markup_path.exists():
+                    images = pdf_pages_to_png(markup_path, max_pages=1, zoom=1.6)
+                    if images:
+                        archive.writestr(f"{prefix}_локальная-разметка_{timestamp}.png", images[0])
+                    else:
+                        archive.writestr(f"{prefix}_локальная-разметка-missing_{timestamp}.txt", "Не удалось отрисовать PDF разметки в PNG.")
+                else:
+                    archive.writestr(f"{prefix}_локальная-разметка-missing_{timestamp}.txt", "Файл локальной разметки не найден.")
+
+                review = ((page.get("analysis") or {}).get("dimension_review") or {})
+                trace = page.get("provider_trace") or {}
+                answer_payload = {
+                    "run_id": run_id,
+                    "group": line_id,
+                    "page_number": page_number,
+                    "prompt_revision": page.get("prompt_revision"),
+                    "model": trace.get("model") or review.get("model"),
+                    "answer": review.get("answer"),
+                    "lengths": review.get("lengths"),
+                    "eval": review.get("eval"),
+                    "response_raw": trace.get("response_raw"),
+                }
+                archive.writestr(
+                    f"{prefix}_ответ-провайдера_{timestamp}.json",
+                    json.dumps(answer_payload, ensure_ascii=False, indent=2),
+                )
+                payload_data = {
+                    "run_id": run_id,
+                    "group": line_id,
+                    "page_number": page_number,
+                    "payload": trace.get("payload"),
+                }
+                archive.writestr(
+                    f"{prefix}_payload_{timestamp}.json",
+                    json.dumps(payload_data, ensure_ascii=False, indent=2),
+                )
+    output.seek(0)
+    filename = f"{run_id}_review_data_{timestamp}.zip"
+    return StreamingResponse(
+        output,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+def _safe_export_part(value: Any) -> str:
+    text = str(value or "").strip()
+    safe = "".join(char if char.isalnum() or char in {"_", "-"} else "_" for char in text)
+    return safe.strip("_") or "item"
 
 
 def run_dict(run: RunState) -> dict[str, Any]:
@@ -959,6 +1050,7 @@ def run_dict(run: RunState) -> dict[str, Any]:
         "kind": run.kind,
         "kind_label": run.kind_label,
         "model": run.model,
+        "provider": run.provider,
         "status": run.status,
         "source_name": run.source_name,
         "line_ids": run.line_ids,

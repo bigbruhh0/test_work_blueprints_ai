@@ -275,6 +275,55 @@ select {
 
 .ghost-button:hover { color: var(--green); }
 
+.provider-menu {
+  position: relative;
+}
+
+.provider-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  min-width: 190px;
+  justify-content: flex-start;
+}
+
+.provider-toggle[aria-expanded="true"] {
+  border-color: var(--green);
+  box-shadow: 0 0 0 3px rgba(67, 120, 90, 0.12);
+}
+
+.provider-popover {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 10px);
+  z-index: 30;
+  width: 340px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 18px 44px rgba(35, 42, 47, 0.18);
+  color: var(--ink);
+}
+
+.provider-popover .check-row {
+  margin: 0;
+}
+
+.provider-connection-status {
+  margin-top: 10px;
+  display: grid;
+  gap: 6px;
+}
+
+.provider-connection-status p {
+  margin: 0;
+}
+
 .workspace-tabs {
   height: 46px;
   display: flex;
@@ -1677,6 +1726,42 @@ select {
 
 /* две колонки welcome: слева источник, справа группы + старт */
 .source-column .source-status { margin-top: auto; padding-top: 12px; font-size: 12px; }
+
+.provider-settings {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.codex-login-panel {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px;
+  background: rgba(255, 255, 255, 0.68);
+}
+
+.compact-row {
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.small-button {
+  min-height: 30px;
+  padding: 6px 10px;
+  font-size: 12px;
+}
+
+.command-hint {
+  margin: 10px 0 0;
+  padding: 10px;
+  border-radius: 8px;
+  background: #111827;
+  color: #e5e7eb;
+  white-space: pre-wrap;
+  font-size: 12px;
+  line-height: 1.45;
+}
 .source-column .upload-row { margin-bottom: 4px; }
 .groups-column .groups-list { flex: 1 1 auto; min-height: 200px; }
 

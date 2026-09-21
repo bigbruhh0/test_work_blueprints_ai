@@ -13,13 +13,40 @@
     }
   }
   </script>
-  <link rel="stylesheet" href="/static/styles.css?v=6">
-  <script src="/static/app.js?v=6" defer></script>
+  <link rel="stylesheet" href="/static/styles.css?v=9">
+  <script src="/static/app.js?v=9" defer></script>
 </head>
 <body>
   <header class="topbar">
     <div class="brand"><span class="brand-mark">∠</span><span>Изометрии<span class="brand-muted"> / mark pipeline</span></span></div>
-    <div class="top-status"><span class="status-dot" id="api-dot"></span><span id="api-status">API подключение</span><button class="ghost-button" id="history-button">История</button><button class="ghost-button" id="prompts-button">Промпты</button><button class="ghost-button" id="eval-button">Eval</button></div>
+    <div class="top-status">
+      <div class="provider-menu" id="provider-menu">
+        <button class="ghost-button provider-toggle" id="provider-toggle" type="button" aria-expanded="false">
+          <span class="status-dot" id="api-dot"></span>
+          <span id="api-status">Провайдер</span>
+        </button>
+        <div class="provider-popover" id="provider-popover" hidden>
+          <label class="check-row">Провайдер
+            <select id="provider-select">
+              <option value="deepseek">DeepSeek API</option>
+              <option value="codex_cli">Codex CLI</option>
+            </select>
+          </label>
+          <div id="provider-connection-status" class="provider-connection-status">Проверяю...</div>
+          <div class="codex-login-panel" id="codex-login-panel" hidden>
+            <div class="row compact-row">
+              <span id="codex-login-status" class="muted">Проверяю вход...</span>
+              <button class="ghost-button small-button" id="codex-login-check" type="button">Проверить вход</button>
+              <button class="ghost-button small-button" id="codex-login-start" type="button">Войти</button>
+            </div>
+            <pre id="codex-login-command" class="command-hint" hidden></pre>
+          </div>
+        </div>
+      </div>
+      <button class="ghost-button" id="history-button">История</button>
+      <button class="ghost-button" id="prompts-button">Промпты</button>
+      <button class="ghost-button" id="eval-button">Eval</button>
+    </div>
   </header>
 
   <main id="app" class="app-shell">
@@ -45,7 +72,6 @@
             <select id="stop-stage">
               <option value="local_processing">Локальная обработка</option>
               <option value="dimension_review">Карта размеров + проверка провайдером</option>
-              <option value="analyze">Полный анализ у провайдера</option>
             </select>
           </label>
           <label class="check-row">Исключить листы
@@ -67,6 +93,7 @@
       <div class="row result-actions">
         <a class="secondary-button" id="export-json" download>Экспорт JSON</a>
         <a class="secondary-button" id="export-excel" download>Экспорт Excel</a>
+        <a class="secondary-button" id="export-review-data" download>Выгрузить данные для сверки</a>
       </div>
       <div id="result-body"></div>
     </section>

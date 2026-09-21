@@ -1,4 +1,4 @@
-const state = { document: null, runId: null, selected: new Set(), sourceMode: 'local', filesByLine: {}, tracesByLine: {}, graphsByLine: {}, selectedPage: {}, currentRun: null, feedback: {}, manualEdit: false, three: null, viewers3d: new Set() };
+const state = { document: null, runId: null, selected: new Set(), sourceMode: 'local', provider: 'deepseek', config: null, filesByLine: {}, tracesByLine: {}, graphsByLine: {}, selectedPage: {}, currentRun: null, feedback: {}, manualEdit: false, three: null, viewers3d: new Set() };
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 const esc = (value) => String(value ?? '').replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -7,7 +7,6 @@ const STAGE_LABELS = {
   prepare: 'Локальная подготовка + разметка',
   dimensions: 'Локальная подготовка + привязка размеров',
   dimension_review: 'Карта размеров + проверка провайдером',
-  analyze: 'Анализ у провайдера',
   done: 'Готово',
   error: 'Ошибка',
 };
@@ -25,13 +24,98 @@ async function api(path, options) {
 async function init() {
   try {
     const config = await api('/api/config');
-    const model = config.deepseek ? config.model : 'ключ DEEPSEEK_API_KEY не задан';
-    $('#api-status').textContent = config.deepseek ? ('API: ' + config.model) : 'API: ключ не задан';
-    $('#source-status').textContent = 'Провайдер: ' + model + (config.default_pdf ? ' · файл: ' + config.default_pdf : '');
+    state.config = config;
+    state.provider = config.default_provider || 'deepseek';
+    $('#provider-select').value = state.provider;
+    $('#source-status').textContent = (config.default_pdf ? 'Файл: ' + config.default_pdf : '');
+    renderProviderSettings(config);
   } catch (error) {
     $('#api-status').textContent = 'Ошибка API';
     $('#source-status').textContent = 'Бэкенд недоступен: ' + String(error.message || error);
   }
+}
+
+function providerName(providerId, config) {
+  const provider = (config?.providers || []).find((item) => item.id === providerId);
+  return provider ? provider.label : providerId;
+}
+
+function renderProviderSettings(config) {
+  const codex = config.codex_cli || {};
+  updateCodexLoginStatus(codex);
+  $('#codex-login-panel').hidden = $('#provider-select').value !== 'codex_cli';
+  updateProviderConnectionStatus();
+}
+
+function updateCodexLoginStatus(status) {
+  if (state.config) state.config.codex_cli = status || {};
+  const node = $('#codex-login-status');
+  if (!status || !status.available) {
+    node.textContent = 'Codex CLI не найден';
+    node.className = 'badge error';
+    return;
+  }
+  if (status.logged_in) {
+    node.textContent = 'Codex CLI: вход выполнен';
+    node.className = 'badge ok';
+    return;
+  }
+  node.textContent = status.status || 'Codex CLI: нужен вход';
+  node.className = 'badge run';
+  updateProviderConnectionStatus();
+}
+
+function providerInfo(providerId) {
+  return (state.config?.providers || []).find((item) => item.id === providerId) || { id: providerId, label: providerId };
+}
+
+function isProviderConnected(providerId) {
+  const info = providerInfo(providerId);
+  if (providerId === 'deepseek') return Boolean(info.available || state.config?.deepseek);
+  if (providerId === 'codex_cli') return Boolean(info.available && (info.logged_in || state.config?.codex_cli?.logged_in));
+  return Boolean(info.available);
+}
+
+function updateProviderConnectionStatus() {
+  const selected = $('#provider-select').value || state.provider;
+  state.provider = selected;
+  const info = providerInfo(selected);
+  const connected = isProviderConnected(selected);
+  const apiDot = $('#api-dot');
+  apiDot.classList.toggle('ok', connected);
+  $('#api-status').textContent = connected ? ('Провайдер: ' + (info.label || selected)) : 'Провайдер не подключен';
+  const status = $('#provider-connection-status');
+  if (connected) {
+    status.innerHTML = '<span class="badge ok">Подключен</span><span class="muted"> ' + esc(info.label || selected) + (info.model ? ' · ' + esc(info.model) : '') + '</span>';
+  } else if (selected === 'deepseek') {
+    status.innerHTML = '<span class="badge error">Не подключен</span><p class="muted">Для DeepSeek нужен DEEPSEEK_API_KEY в .env или окружении.</p>';
+  } else if (selected === 'codex_cli') {
+    status.innerHTML = '<span class="badge error">Не подключен</span><p class="muted">Нужен вход в Codex CLI.</p>';
+  } else {
+    status.innerHTML = '<span class="badge error">Не подключен</span>';
+  }
+}
+
+async function refreshCodexLogin() {
+  try {
+    const status = await api('/api/providers/codex/status', { cache: 'no-store' });
+    updateCodexLoginStatus(status);
+    const info = providerInfo('codex_cli');
+    info.available = status.available;
+    info.logged_in = status.logged_in;
+    updateProviderConnectionStatus();
+  } catch (error) {
+    $('#codex-login-status').textContent = 'Ошибка проверки: ' + error.message;
+    $('#codex-login-status').className = 'badge error';
+    $('#codex-login-command').textContent = 'Для входа выполните в терминале:\n\ncodex login --device-auth\n\nПосле входа нажмите «Проверить вход».';
+    $('#codex-login-command').hidden = false;
+    updateProviderConnectionStatus();
+  }
+}
+
+function startCodexLogin() {
+  $('#codex-login-command').textContent = 'Для входа выполните в терминале:\n\ncodex login --device-auth\n\nПосле входа нажмите «Проверить вход».';
+  $('#codex-login-command').hidden = false;
 }
 
 const promptWorkspace = { list: [], activeName: null, active: null, versions: [], token: 0, busy: false };
@@ -324,6 +408,13 @@ function parseExcludedPages(rawValue) {
 async function startAnalysis() {
   const lineIds = $$('#groups-list input:checked').map((item) => item.value);
   if (!lineIds.length) { alert('Выберите хотя бы одну линию'); return; }
+  if (!isProviderConnected($('#provider-select').value)) {
+    $('#provider-popover').hidden = false;
+    $('#provider-toggle').setAttribute('aria-expanded', 'true');
+    updateProviderConnectionStatus();
+    alert('Выбранный провайдер не подключен');
+    return;
+  }
   let excludedPages = [];
   try {
     excludedPages = parseExcludedPages($('#exclude-pages').value);
@@ -334,7 +425,7 @@ async function startAnalysis() {
   try {
     const response = await api('/api/runs', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ document_id: state.document.document_id, line_ids: lineIds, stop_stage: $('#stop-stage').value, excluded_pages: excludedPages }),
+      body: JSON.stringify({ document_id: state.document.document_id, line_ids: lineIds, stop_stage: $('#stop-stage').value, excluded_pages: excludedPages, provider: $('#provider-select').value }),
     });
     state.runId = response.run_id;
     $('#runs-section').hidden = false;
@@ -381,7 +472,7 @@ function renderRun(run) {
   $('#run-title').textContent = run.source_name;
   const running = run.status === 'running';
   $('#run-status').innerHTML = '<div class="muted">Прогон <code>' + esc(run.run_id) + '</code> · до этапа «' + esc(run.stop_stage) + '» · статус: <b>'
-    + esc(run.status) + '</b>' + (running ? ' <span class="spinner"></span>' : '') + '</div>';
+    + esc(run.status) + '</b> · провайдер: <b>' + esc(run.provider || run.model || '—') + '</b>' + (running ? ' <span class="spinner"></span>' : '') + '</div>';
   const container = $('#lines-progress');
   container.innerHTML = '';
   for (const line of run.lines) {
@@ -1195,6 +1286,7 @@ function renderResults(run) {
   $('#result-title').textContent = run.run_id;
   $('#export-json').href = '/api/runs/' + encodeURIComponent(run.run_id) + '/export/json';
   $('#export-excel').href = '/api/runs/' + encodeURIComponent(run.run_id) + '/export/excel';
+  $('#export-review-data').href = '/api/runs/' + encodeURIComponent(run.run_id) + '/export/review-data';
   const body = $('#result-body');
   const openProviderState = openProviderKeys(body);
   body.innerHTML = run.lines.map(function (line) {
@@ -1359,6 +1451,7 @@ async function showHistory() {
       const when = run.created_at ? new Date(run.created_at).toLocaleString('ru-RU') : '';
       const kindLabel = run.kind_label || run.stop_stage || '';
       const model = run.model ? ' · ' + run.model : '';
+      const provider = run.provider ? ' · ' + run.provider : '';
       const manual = Number(run.manual_adjustment_count || 0) ? ' · ручных правок: ' + run.manual_adjustment_count : '';
       const feedback = run.feedback || {};
       const feedbackStats = Number(feedback.total || 0)
@@ -1369,7 +1462,7 @@ async function showHistory() {
         + '<div class="row"><b>' + esc(run.source_name || '') + '</b> <span class="badge ' + badge + '">' + esc(run.status) + '</span>'
         + '<span class="badge kind">' + esc(kindLabel) + '</span>'
         + '<span class="group-item-meta">' + esc(when) + '</span></div>'
-        + '<div class="muted">' + esc(run.run_id) + ' · ' + (run.line_ids || []).map(esc).join(', ') + esc(model) + esc(manual) + feedbackStats + '</div>'
+        + '<div class="muted">' + esc(run.run_id) + ' · ' + (run.line_ids || []).map(esc).join(', ') + esc(provider) + esc(model) + esc(manual) + feedbackStats + '</div>'
         + (run.error_count ? '<div class="badge error">Ошибок: ' + run.error_count + '<br>' + run.errors.map(esc).join('<br>') + '</div>' : '')
         + '<button class="open-run" type="button" data-open-run="' + esc(run.run_id) + '">Открыть →</button>'
         + '</div>';
@@ -1417,6 +1510,11 @@ document.addEventListener('DOMContentLoaded', function () {
     } else if (event.target && event.target.id === 'image-lightbox') {
       $('#image-lightbox').hidden = true;
     }
+    const menu = $('#provider-menu');
+    if (menu && !menu.contains(event.target)) {
+      $('#provider-popover').hidden = true;
+      $('#provider-toggle').setAttribute('aria-expanded', 'false');
+    }
   });
   $('#pdf-file').addEventListener('change', function () {
     const file = $('#pdf-file').files[0];
@@ -1424,6 +1522,25 @@ document.addEventListener('DOMContentLoaded', function () {
   });
   $('#load-pdf').addEventListener('click', loadPdf);
   $('#start-analysis').addEventListener('click', startAnalysis);
+  $('#provider-toggle').addEventListener('click', function (event) {
+    event.stopPropagation();
+    const popover = $('#provider-popover');
+    popover.hidden = !popover.hidden;
+    $('#provider-toggle').setAttribute('aria-expanded', String(!popover.hidden));
+    updateProviderConnectionStatus();
+  });
+  $('#provider-popover').addEventListener('click', function (event) {
+    event.stopPropagation();
+  });
+  $('#provider-select').addEventListener('change', function () {
+    state.provider = $('#provider-select').value;
+    $('#codex-login-panel').hidden = state.provider !== 'codex_cli';
+    $('#codex-login-command').hidden = true;
+    updateProviderConnectionStatus();
+    if (state.provider === 'codex_cli') refreshCodexLogin();
+  });
+  $('#codex-login-check').addEventListener('click', refreshCodexLogin);
+  $('#codex-login-start').addEventListener('click', startCodexLogin);
   $('#history-button').addEventListener('click', showHistory);
   $('#prompts-button').addEventListener('click', showPrompts);
   $('#eval-button').addEventListener('click', showEval);

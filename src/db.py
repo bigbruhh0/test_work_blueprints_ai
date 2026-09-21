@@ -151,6 +151,7 @@ def list_runs() -> list[dict[str, Any]]:
                 "kind": row["kind"],
                 "kind_label": row["kind_label"],
                 "model": row["model"],
+                "provider": data.get("provider", ""),
                 "error_count": len(errors),
                 "errors": errors[:3],
                 "manual_adjustment_count": manual_adjustment_count,
