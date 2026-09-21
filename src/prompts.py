@@ -8,17 +8,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 OVERRIDE_DIR = ROOT / ".cache" / "prompts"
-DEFAULT_PROMPT_FILE = ROOT / "mark_pipeline_test" / "prompt.txt"
-
 PROMPT_REGISTRY: dict[str, dict[str, str]] = {
-    "analyze": {
-        "title": "Анализ расстояний по вершинам",
-        "default_file": str(DEFAULT_PROMPT_FILE),
-        "usage": "Старый этап полного анализа у провайдера",
-    },
     "dimension_review": {
         "title": "Проверка кандидатов размеров и объектов вне трубы",
-        "default_file": str(ROOT / "mark_pipeline_test" / "dimension_review_prompt.txt"),
+        "default_file": str(ROOT / "prompts" / "defaults" / "dimension_review.txt"),
         "usage": "Этап «Карта размеров + проверка провайдером»",
     },
 }

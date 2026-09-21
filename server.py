@@ -31,6 +31,7 @@ from src.dimension_mapping import (
 )
 from src.dimension_review import build_map_text, calculate_lengths, codex_login_command, codex_login_status, review_map_with_provider
 from src.eval_data import aggregate_eval_results, evaluate_line_for_prompt, list_eval_groups, summarize_prompt_eval_rows
+from src.pdf_groups import get_pdf_cache_status, prepare_pdf_groups
 from src.prepare_stage import run_prepare
 from scripts.build_dimension_map import build_map as build_dimension_map, render_pdf as render_dimension_map
 
@@ -172,8 +173,6 @@ def load_default_pdf() -> dict[str, Any]:
 
 @app.post("/api/pdf/load")
 def load_pdf(body: LoadPdfBody) -> dict[str, Any]:
-    from src.pipeline import get_pdf_cache_status, prepare_pdf_groups
-
     resolved = Path((body.file_path or "").strip() or str(DEFAULT_PDF))
     if not resolved.exists():
         resolved = DEFAULT_PDF if DEFAULT_PDF.exists() else resolved

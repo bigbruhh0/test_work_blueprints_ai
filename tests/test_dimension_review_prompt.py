@@ -10,13 +10,13 @@ from src.dimension_mapping import _dimension_hints_from_text, _first_arrow_third
 
 class DimensionRuleTests(unittest.TestCase):
     def test_dimension_review_prompt_uses_deterministic_overlap_rules(self) -> None:
-        text = Path("mark_pipeline_test/dimension_review_prompt.txt").read_text(encoding="utf-8")
+        text = Path("prompts/defaults/dimension_review.txt").read_text(encoding="utf-8")
         self.assertIn("existing_mapping.valid=false", text)
         self.assertIn("последовательно разделена стрелками", text.lower())
         self.assertIn("не считай соседние значения перекрытием", text.lower())
 
     def test_dimension_review_prompt_covers_handwheel_and_cross_sheet(self) -> None:
-        text = Path("mark_pipeline_test/dimension_review_prompt.txt").read_text(encoding="utf-8")
+        text = Path("prompts/defaults/dimension_review.txt").read_text(encoding="utf-8")
         self.assertIn("штурвал", text.lower())
         self.assertIn("handwheel", text.lower())
         self.assertIn("с двух сторон", text.lower())

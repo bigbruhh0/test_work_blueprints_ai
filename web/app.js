@@ -514,7 +514,7 @@ const VIEWER_TABS = [
   { key: 'vertices_pdf', label: 'Вершины' },
   { key: 'coordinates_pdf', label: 'Координаты' },
   { key: 'numbers_txt', label: 'Числа (TXT)' },
-  { key: 'preprocess_annotations_pdf', label: 'Локальная разметка (старая)' },
+  { key: 'preprocess_annotations_pdf', label: 'Локальная разметка подготовки' },
   { key: 'dimensions_pdf', label: 'Размеры на графе' },
   { key: 'dimension_graph_pdf', label: 'Чистый граф трубы' },
   { key: 'dimension_skeleton_pdf', label: 'Контур и размерные линии' },

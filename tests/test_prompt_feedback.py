@@ -6,7 +6,7 @@ from unittest import mock
 
 import server
 from src import db, prompts
-from src.ai_client import _find_connection_rows
+from src.candidate_extractor import find_connection_rows
 from src.dimension_review import review_map_with_provider
 from src.models import Candidate, VertexMark
 
@@ -17,7 +17,7 @@ class PromptFeedbackTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
         registry = {}
-        for name in ("analyze", "dimension_review"):
+        for name in ("dimension_review",):
             default = root / (name + ".txt")
             default.write_text("default " + name, encoding="utf-8")
             registry[name] = {"title": name, "default_file": str(default)}
@@ -58,7 +58,7 @@ class PromptFeedbackTests(unittest.TestCase):
         self.feedback("D2", "down", "version one", version=1)
         self.feedback("D3", "up", "version one")
         self.feedback("D4", "up", "unknown text")
-        self.feedback("D5", "down", "another prompt", name="analyze")
+        self.feedback("D5", "down", "another prompt", name="other_prompt")
         before_rows = server.get_prompt("dimension_review")["versions"]
         expected_rows = {row["version"]: row["feedback"] for row in before_rows}
         for version, up, down in ((0, 1, 0), (1, 1, 1), (0, 1, 0)):
@@ -159,7 +159,7 @@ class PromptFeedbackTests(unittest.TestCase):
             VertexMark(id="V03", line_id="L1", page=216, label="V03", role="junction", x=150, y=50, confidence=1.0),
             VertexMark(id="V05", line_id="L1", page=216, label="V05", role="junction", x=250, y=80, confidence=1.0),
         ]
-        rows = _find_connection_rows(candidates, vertices)
+        rows = find_connection_rows(candidates, vertices)
         self.assertEqual([row["connection_type"] for row in rows], ["tie_in", "continuation", "other"])
         self.assertEqual(rows[0]["vertex_id"], "V04")
         self.assertEqual(rows[1]["target_sheet"], "2")

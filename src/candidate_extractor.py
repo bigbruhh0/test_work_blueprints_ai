@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import pdfplumber
 
-from .models import Candidate, LineGroup
+from .models import Candidate, LineGroup, VertexMark
 
 
 DIMENSION_RE = re.compile(r"^\d{2,5}$")
@@ -14,6 +14,108 @@ COORD_VALUE_RE = re.compile(r"^\d{5}$")
 DN_RE = re.compile(r"^DN\d+(X\d+)?$", re.IGNORECASE)
 LINE_REF_RE = re.compile(r"\b[A-ZА-Я]{2}[_-]\d{4}\b")
 COORD_LABELS = {"X", "Y", "Z", "Z+"}
+
+
+def _candidate_center(candidate: Candidate) -> tuple[float, float]:
+    return (
+        (candidate.bbox[0] + candidate.bbox[2]) / 2.0,
+        (candidate.bbox[1] + candidate.bbox[3]) / 2.0,
+    )
+
+
+def _extract_sheet_number(text: str) -> str | None:
+    if not text:
+        return None
+    patterns = (
+        r"(?:ЛИСТ|SHEET)\s*[:№]?\s*(\d+)",
+        r"(?:SEE\s+SHEET|CONTINUATION)\s*(?:[A-Z0-9\-_/]+\s+)?(\d+)",
+        r"(?:ЛИСТ|SHEET)\s*[:№]?\s*(?:№\s*)?(\d+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE | re.UNICODE)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _connection_classify(text: str) -> tuple[str, str | None, bool]:
+    normalized = (text or "").strip()
+    if not normalized:
+        return "other", None, False
+    upper = normalized.upper()
+    tie_in_keywords = (
+        "ПОДКЛЮЧЕНИЕ",
+        "ПОДСОЕДИНЕНИЕ",
+        "ВРЕЗКА",
+        "TIE-IN",
+        "TIE IN",
+        "CONNECTION",
+    )
+    if any(keyword in upper for keyword in tie_in_keywords):
+        return "tie_in", None, False
+    sheet_number = _extract_sheet_number(normalized)
+    if sheet_number is not None:
+        return "continuation", sheet_number, True
+    continuation_keywords = (
+        "СМ.",
+        "СМ ",
+        "SEE SHEET",
+        "SEE SHEET ",
+        "CONTINUATION",
+        "ЛИСТ",
+        "SHEET",
+    )
+    has_sheet_hint = any(keyword in upper for keyword in continuation_keywords)
+    if has_sheet_hint:
+        return "other", None, True
+    return "other", None, False
+
+
+def find_connection_rows(
+    candidates: list[Candidate],
+    vertices: list[VertexMark],
+) -> list[dict]:
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate.zone != "drawing":
+            continue
+        label = (candidate.text or "").strip()
+        if not label:
+            continue
+        connection_type, target_sheet, has_sheet_hint = _connection_classify(label)
+        if connection_type == "other" and not has_sheet_hint and not any(
+            keyword in label.upper()
+            for keyword in ("ПОДКЛЮЧЕНИЕ", "ВРЕЗКА", "TIE-IN", "TIE IN", "СМ.", "SEE SHEET", "CONTINUATION", "ЛИСТ", "SHEET")
+        ):
+            continue
+        cx, cy = _candidate_center(candidate)
+        nearest_vertex = None
+        nearest_distance = None
+        for vertex in vertices:
+            if vertex.page != candidate.page:
+                continue
+            dist = ((vertex.x - cx) ** 2 + (vertex.y - cy) ** 2) ** 0.5
+            if nearest_distance is None or dist < nearest_distance:
+                nearest_distance = dist
+                nearest_vertex = vertex
+        row = {
+            "id": f"CN-{candidate.id}",
+            "page": candidate.page,
+            "label": label,
+            "bbox": [round(value, 2) for value in candidate.bbox],
+            "center": [round(cx, 2), round(cy, 2)],
+            "connection_type": connection_type,
+            "vertex_id": nearest_vertex.id if nearest_vertex is not None else None,
+            "target_sheet": target_sheet,
+            "text_has_sheet_ref": has_sheet_hint,
+        }
+        row_id = f"{candidate.page}:{candidate.id}"
+        if row_id in seen:
+            continue
+        seen.add(row_id)
+        rows.append(row)
+    return rows
 
 
 def extract_candidates_for_groups(pdf_path: str | Path, groups: list[LineGroup]) -> list[Candidate]:
