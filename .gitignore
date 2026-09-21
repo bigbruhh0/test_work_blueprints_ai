@@ -7,3 +7,7 @@ __pycache__/
 .streamlit/secrets.toml
 exports/
 tmp/
+.run_err.log
+.run_out.log
+run_err.log
+run_out.log
