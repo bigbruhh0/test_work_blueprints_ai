@@ -1,14 +1,79 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import fitz
 
 from src.dimension_mapping import _dimension_hints_from_text, _first_arrow_third, _handwheel_arrow_segments, _handwheel_details, _handwheel_text_rects, _is_rectangle_side, _same_directed_contour, save_clean_local_markup_pdf, save_preprocess_annotation_pdf
+from src.dimension_mapping import _find_extension_strokes, _merge_dimension_stroke
 
 
 class DimensionRuleTests(unittest.TestCase):
+    def test_dimension_stroke_merge_does_not_absorb_other_labeled_dimensions(self) -> None:
+        first = SimpleNamespace(index=1, x0=0.0, y0=0.0, x1=100.0, y1=0.0, length=100.0, kind="dimension")
+        second = SimpleNamespace(index=2, x0=100.0, y0=0.0, x1=200.0, y1=0.0, length=100.0, kind="dimension")
+
+        merged = _merge_dimension_stroke(first, [first, second], blocked_indices={2})
+
+        self.assertEqual(merged["merged_indices"], [1])
+        self.assertEqual(merged["length_px"], 100.0)
+
+    def test_extension_strokes_are_selected_per_dimension_endpoint(self) -> None:
+        target = {"start": [0.0, 0.0], "end": [100.0, 0.0], "merged_indices": [1]}
+        edge = {"id": "E001", "start": [0.0, 30.0], "end": [100.0, 30.0]}
+        strokes = [
+            SimpleNamespace(index=1, x0=0.0, y0=0.0, x1=100.0, y1=0.0, length=100.0, kind="dimension"),
+            SimpleNamespace(index=2, x0=0.0, y0=0.0, x1=0.0, y1=30.0, length=30.0, kind="dimension"),
+            SimpleNamespace(index=3, x0=100.0, y0=0.0, x1=100.0, y1=30.0, length=30.0, kind="dimension"),
+            SimpleNamespace(index=4, x0=50.0, y0=0.0, x1=62.0, y1=4.0, length=12.65, kind="dimension"),
+        ]
+
+        extensions = _find_extension_strokes({"dimension_stroke": target}, edge, strokes)
+
+        self.assertEqual({item["index"] for item in extensions}, {2, 3})
+        self.assertEqual({item["target_endpoint"] for item in extensions}, {"start", "end"})
+        self.assertEqual({item["pipe_edge_id"] for item in extensions}, {"E001"})
+
+    def test_short_extension_strokes_are_allowed_when_tightly_attached(self) -> None:
+        target = {"start": [0.0, 0.0], "end": [100.0, 0.0], "merged_indices": [1]}
+        edge = {"id": "E001", "start": [100.0, 10.0], "end": [140.0, 10.0]}
+        strokes = [
+            SimpleNamespace(index=1, x0=0.0, y0=0.0, x1=100.0, y1=0.0, length=100.0, kind="dimension"),
+            SimpleNamespace(index=2, x0=100.0, y0=0.0, x1=109.0, y1=7.0, length=11.4, kind="dimension"),
+            SimpleNamespace(index=3, x0=100.0, y0=0.0, x1=125.0, y1=40.0, length=47.2, kind="dimension"),
+        ]
+
+        extensions = _find_extension_strokes({"dimension_stroke": target}, edge, strokes)
+
+        self.assertEqual([item["index"] for item in extensions], [2])
+
+    def test_extension_stroke_can_touch_dimension_endpoint_by_its_middle(self) -> None:
+        target = {"start": [0.0, 0.0], "end": [100.0, 0.0], "merged_indices": [1]}
+        edge = {"id": "E001", "start": [0.0, 28.0], "end": [60.0, 28.0]}
+        strokes = [
+            SimpleNamespace(index=1, x0=0.0, y0=0.0, x1=100.0, y1=0.0, length=100.0, kind="dimension"),
+            SimpleNamespace(index=2, x0=0.0, y0=-12.0, x1=0.0, y1=32.0, length=44.0, kind="dimension"),
+        ]
+
+        extensions = _find_extension_strokes({"dimension_stroke": target}, edge, strokes)
+
+        self.assertEqual([item["index"] for item in extensions], [2])
+        self.assertEqual(extensions[0]["target_endpoint"], "start")
+
+    def test_extension_stroke_rejects_touch_far_from_its_endpoint(self) -> None:
+        target = {"start": [0.0, 0.0], "end": [100.0, 0.0], "merged_indices": [1]}
+        edge = {"id": "E001", "start": [0.0, 28.0], "end": [60.0, 28.0]}
+        strokes = [
+            SimpleNamespace(index=1, x0=0.0, y0=0.0, x1=100.0, y1=0.0, length=100.0, kind="dimension"),
+            SimpleNamespace(index=2, x0=0.0, y0=-20.0, x1=0.0, y1=32.0, length=52.0, kind="dimension"),
+        ]
+
+        extensions = _find_extension_strokes({"dimension_stroke": target}, edge, strokes)
+
+        self.assertEqual(extensions, [])
+
     def test_dimension_review_prompt_uses_deterministic_overlap_rules(self) -> None:
         text = Path("prompts/defaults/dimension_review.txt").read_text(encoding="utf-8")
         self.assertIn("existing_mapping.valid=false", text)

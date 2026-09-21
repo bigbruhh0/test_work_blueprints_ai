@@ -312,7 +312,12 @@ def _nearest_edge_for_stroke(stroke: dict[str, Any], edges: list[dict[str, Any]]
     return best_edge, best_distance, best_projection
 
 
-def _merge_dimension_stroke(stroke: Any, strokes: list[Any]) -> dict[str, Any]:
+def _merge_dimension_stroke(
+    stroke: Any,
+    strokes: list[Any],
+    blocked_indices: set[int] | None = None,
+) -> dict[str, Any]:
+    blocked = blocked_indices or set()
     direction_x = stroke.x1 - stroke.x0
     direction_y = stroke.y1 - stroke.y0
     direction_length = math.hypot(direction_x, direction_y) or 1.0
@@ -324,7 +329,7 @@ def _merge_dimension_stroke(stroke: Any, strokes: list[Any]) -> dict[str, Any]:
     while changed:
         changed = False
         for candidate in strokes:
-            if candidate.index in used or candidate.kind != "dimension":
+            if candidate.index in used or candidate.index in blocked or candidate.kind != "dimension":
                 continue
             candidate_dx = candidate.x1 - candidate.x0
             candidate_dy = candidate.y1 - candidate.y0
@@ -418,43 +423,74 @@ def _add_pipe_anchor(dimension: dict[str, Any], edges: list[dict[str, Any]]) -> 
     }
 
 
-def _find_extension_strokes(dimension: dict[str, Any], edge: dict[str, Any] | None, strokes: list[Any]) -> list[dict[str, Any]]:
+def _find_extension_strokes(
+    dimension: dict[str, Any],
+    edge: dict[str, Any] | None,
+    strokes: list[Any],
+    edges: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     target = dimension.get("dimension_stroke")
-    if not target or edge is None:
+    if not target:
+        return []
+    candidate_edges = list(edges or [])
+    if edge is not None and all(item.get("id") != edge.get("id") for item in candidate_edges):
+        candidate_edges.insert(0, edge)
+    if not candidate_edges:
         return []
     target_points = [tuple(target["start"]), tuple(target["end"])]
-    candidates = []
     target_indices = set(target.get("merged_indices", []))
+    target_dx = target_points[1][0] - target_points[0][0]
+    target_dy = target_points[1][1] - target_points[0][1]
+    target_length = math.hypot(target_dx, target_dy) or 1.0
+    candidates_by_endpoint: dict[int, tuple[float, dict[str, Any]]] = {}
     for stroke in strokes:
         if stroke.kind != "dimension" or stroke.index in target_indices:
             continue
+        if stroke.length < 8.0:
+            continue
+        stroke_dx = stroke.x1 - stroke.x0
+        stroke_dy = stroke.y1 - stroke.y0
+        stroke_length = math.hypot(stroke_dx, stroke_dy) or 1.0
+        parallel_score = abs((target_dx * stroke_dx + target_dy * stroke_dy) / (target_length * stroke_length))
+        if parallel_score > 0.92:
+            continue
         endpoints = [(stroke.x0, stroke.y0), (stroke.x1, stroke.y1)]
-        target_gaps = [
-            min(math.hypot(point[0] - target_point[0], point[1] - target_point[1]) for target_point in target_points)
-            for point in endpoints
-        ]
-        pipe_gaps = [
-            _distance_to_segment(point, tuple(edge["start"]), tuple(edge["end"]))[0]
-            for point in endpoints
-        ]
-        assignments = [
-            (target_gaps[0], pipe_gaps[1]),
-            (target_gaps[1], pipe_gaps[0]),
-        ]
-        target_gap, pipe_gap = min(assignments, key=lambda item: item[0] + item[1])
-        if target_gap <= 18.0 and pipe_gap <= 22.0 and stroke.length >= 8.0:
-            candidates.append(
-                {
-                    "index": stroke.index,
-                    "start": [round(stroke.x0, 2), round(stroke.y0, 2)],
-                    "end": [round(stroke.x1, 2), round(stroke.y1, 2)],
-                    "length_px": round(stroke.length, 2),
-                    "target_gap_px": round(target_gap, 2),
-                    "pipe_gap_px": round(pipe_gap, 2),
-                }
-            )
-    candidates.sort(key=lambda item: item["target_gap_px"] + item["pipe_gap_px"])
-    return candidates[:2]
+        variants = []
+        for endpoint_index, target_point in enumerate(target_points):
+            target_gap, _position, touch_point = _distance_to_segment(target_point, endpoints[0], endpoints[1])
+            touch_endpoint_gap = min(math.hypot(touch_point[0] - point[0], touch_point[1] - point[1]) for point in endpoints)
+            for pipe_candidate in endpoints:
+                nearest_edge, pipe_gap = min(
+                    (
+                        (candidate_edge, _distance_to_segment(pipe_candidate, tuple(candidate_edge["start"]), tuple(candidate_edge["end"]))[0])
+                        for candidate_edge in candidate_edges
+                    ),
+                    key=lambda item: item[1],
+                )
+                selected_bonus = 0.0 if edge is not None and nearest_edge.get("id") == edge.get("id") else 6.0
+                variants.append((target_gap * 3.0 + touch_endpoint_gap + pipe_gap + parallel_score * 8.0 + selected_bonus, endpoint_index, target_gap, touch_endpoint_gap, pipe_gap, nearest_edge.get("id")))
+        score, endpoint_index, target_gap, touch_endpoint_gap, pipe_gap, pipe_edge_id = min(variants, key=lambda item: item[0])
+        short_stroke = stroke.length < 18.0
+        target_limit = 5.0 if short_stroke else 9.0
+        touch_endpoint_limit = 4.0 if short_stroke else 12.0
+        pipe_limit = 12.0 if short_stroke else 36.0
+        if target_gap <= target_limit and touch_endpoint_gap <= touch_endpoint_limit and pipe_gap <= pipe_limit:
+            row = {
+                "index": stroke.index,
+                "start": [round(stroke.x0, 2), round(stroke.y0, 2)],
+                "end": [round(stroke.x1, 2), round(stroke.y1, 2)],
+                "length_px": round(stroke.length, 2),
+                "target_endpoint": "start" if endpoint_index == 0 else "end",
+                "target_gap_px": round(target_gap, 2),
+                "touch_endpoint_gap_px": round(touch_endpoint_gap, 2),
+                "pipe_gap_px": round(pipe_gap, 2),
+                "pipe_edge_id": pipe_edge_id,
+                "parallel_score": round(parallel_score, 4),
+            }
+            previous = candidates_by_endpoint.get(endpoint_index)
+            if previous is None or score < previous[0]:
+                candidates_by_endpoint[endpoint_index] = (score, row)
+    return [item[1] for item in sorted(candidates_by_endpoint.values(), key=lambda item: item[0])][:2]
 
 
 def map_dimensions(pdf_path: str | Path, page_number: int) -> dict[str, Any]:
@@ -484,6 +520,7 @@ def map_dimensions(pdf_path: str | Path, page_number: int) -> dict[str, Any]:
             for candidate_id, stroke_index in vector_graph.attached.items()
             if 0 <= stroke_index < len(vector_graph.strokes)
         }
+        attached_indices = {stroke.index for stroke in attached_strokes.values()}
         mapped = []
         for index, (text, rect) in enumerate(dimensions, start=1):
             center = ((rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2)
@@ -544,7 +581,8 @@ def map_dimensions(pdf_path: str | Path, page_number: int) -> dict[str, Any]:
             mapped[-1]["dimension_stroke"] = None
             attached = attached_strokes.get(mapped[-1]["id"])
             if attached is not None:
-                initial_stroke = _merge_dimension_stroke(attached, vector_graph.strokes)
+                blocked_indices = attached_indices - {attached.index}
+                initial_stroke = _merge_dimension_stroke(attached, vector_graph.strokes, blocked_indices)
                 mapped[-1]["dimension_stroke"] = initial_stroke
                 mapped[-1]["leader_stroke"] = None
                 pipe_edge = next((item for item in edges if item["id"] == mapped[-1].get("edge_id")), None)
@@ -552,7 +590,7 @@ def map_dimensions(pdf_path: str | Path, page_number: int) -> dict[str, Any]:
                     target = _resolve_leader_target(attached, pipe_edge, vector_graph.strokes)
                     if target is not None:
                         mapped[-1]["leader_stroke"] = initial_stroke
-                        mapped[-1]["dimension_stroke"] = _merge_dimension_stroke(target, vector_graph.strokes)
+                        mapped[-1]["dimension_stroke"] = _merge_dimension_stroke(target, vector_graph.strokes, attached_indices - {target.index})
                         mapped[-1]["leader_attached"] = True
                         mapped[-1]["attachment_kind"] = "leader_to_dimension_arrow"
                 else:
@@ -562,6 +600,7 @@ def map_dimensions(pdf_path: str | Path, page_number: int) -> dict[str, Any]:
                     mapped[-1],
                     next((item for item in edges if item["id"] == mapped[-1].get("edge_id")), None),
                     vector_graph.strokes,
+                    edges,
                 )
                 mapped[-1]["leader_attached"] = True
                 if mapped[-1]["edge_id"] is None:
@@ -924,7 +963,7 @@ def save_clean_local_markup_pdf(
     output_pdf: str | Path,
     mapping: dict[str, Any],
 ) -> None:
-    """Pure QA overlay: vertex markers and minimal boxes around selected dimension numbers only."""
+    """Pure QA overlay: vertices, dimension labels, and highlighted dimension geometry."""
     with fitz.open(str(pdf_path)) as document:
         page = document[page_number - 1]
         output = fitz.open()
@@ -960,6 +999,51 @@ def save_clean_local_markup_pdf(
             center = fitz.Point(vertex["x"], vertex["y"])
             marked.draw_circle(center, 6, color=color, fill=color, width=1.2)
             marked.insert_text(center + (8, -8), vertex.get("id", "V?"), fontsize=8, fontname="helv", color=color)
+
+        def _stroke_points(stroke: dict[str, Any]) -> tuple[fitz.Point, fitz.Point] | None:
+            start = stroke.get("start")
+            end = stroke.get("end")
+            if not start or not end or len(start) < 2 or len(end) < 2:
+                return None
+            return fitz.Point(float(start[0]), float(start[1])), fitz.Point(float(end[0]), float(end[1]))
+
+        def _stroke_key(stroke: dict[str, Any]) -> tuple[float, float, float, float] | None:
+            points = _stroke_points(stroke)
+            if points is None:
+                return None
+            start, end = points
+            first = (round(start.x, 2), round(start.y, 2))
+            second = (round(end.x, 2), round(end.y, 2))
+            ordered = sorted((first, second))
+            return (*ordered[0], *ordered[1])
+
+        highlighted_strokes: set[tuple[float, float, float, float]] = set()
+        dimension_line_color = (0.0, 0.72, 0.20)
+        extension_line_color = (0.0, 0.86, 0.28)
+        for dimension in mapping.get("dimensions", []):
+            status = dimension.get("status")
+            if status in {"cross_sheet_reference", "unresolved", "invalid_overlap"}:
+                continue
+            if status != "handwheel" and not dimension.get("valid", True):
+                continue
+            stroke_specs: list[tuple[dict[str, Any] | None, tuple[float, float, float], float]] = [
+                (dimension.get("dimension_stroke"), dimension_line_color, 2.2),
+                (dimension.get("leader_stroke"), extension_line_color, 1.7),
+            ]
+            stroke_specs.extend(
+                (stroke, extension_line_color, 1.7)
+                for stroke in (dimension.get("extension_strokes") or [])
+                if isinstance(stroke, dict)
+            )
+            for stroke, color, width in stroke_specs:
+                if not isinstance(stroke, dict):
+                    continue
+                key = _stroke_key(stroke)
+                points = _stroke_points(stroke)
+                if key is None or points is None or key in highlighted_strokes:
+                    continue
+                highlighted_strokes.add(key)
+                marked.draw_line(points[0], points[1], color=color, width=width)
 
         for dimension in mapping.get("dimensions", []):
             label_center = dimension.get("label_center")

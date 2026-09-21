@@ -509,7 +509,7 @@ function renderRun(run) {
 }
 
 const VIEWER_TABS = [
-  { key: 'clean_local_markup_pdf', label: 'Локальная разметка (чистая)' },
+  { key: 'clean_local_markup_pdf', label: 'Локальная разметка' },
   { key: 'numbers_pdf', label: 'Разметка чисел' },
   { key: 'vertices_pdf', label: 'Вершины' },
   { key: 'coordinates_pdf', label: 'Координаты' },
