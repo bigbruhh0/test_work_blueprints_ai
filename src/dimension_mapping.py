@@ -548,12 +548,28 @@ def save_preprocess_annotation_pdf(
         output.close()
 
 
-def _handwheel_text_rects(words: list[tuple[Any, ...]]) -> list[fitz.Rect]:
-    return [
-        fitz.Rect(word[0], word[1], word[2], word[3])
-        for word in words
-        if "штурвал" in str(word[4] or "").strip().casefold()
-    ]
+def _handwheel_text_rects(words: list[tuple[Any, ...]]) -> list[tuple[str, fitz.Rect]]:
+    rows: dict[tuple[Any, Any], list[tuple[Any, ...]]] = {}
+    for word in words:
+        text = str(word[4] or "").strip()
+        if not text:
+            continue
+        key = (word[5], word[6])
+        rows.setdefault(key, []).append(word)
+
+    handwheel_rows = []
+    for row_words in rows.values():
+        if not any("штурвал" in str(word[4]).casefold() for word in row_words):
+            continue
+        row_words.sort(key=lambda word: (word[0], word[7]))
+        rect = fitz.Rect(
+            min(word[0] for word in row_words),
+            min(word[1] for word in row_words),
+            max(word[2] for word in row_words),
+            max(word[3] for word in row_words),
+        )
+        handwheel_rows.append((" ".join(str(word[4]).strip() for word in row_words), rect))
+    return handwheel_rows
 
 
 def _distance_to_rect(point: tuple[float, float], rect: fitz.Rect) -> float:
@@ -562,37 +578,206 @@ def _distance_to_rect(point: tuple[float, float], rect: fitz.Rect) -> float:
     return math.hypot(dx, dy)
 
 
-def _handwheel_arrow_segments(
-    text_rects: list[fitz.Rect],
+def _drawing_segments(
     drawings: list[dict[str, Any]],
+    rectangles: list[fitz.Rect] | None = None,
 ) -> list[tuple[tuple[float, float], tuple[float, float]]]:
-    segments: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    segments = []
     for drawing in drawings:
         for item in drawing.get("items", []):
-            if not item or item[0] != "l":
+            if not item or item[0] not in {"l", "c"}:
                 continue
-            start, end = item[1], item[2]
+            points = [point for point in item[1:] if hasattr(point, "x")]
+            if len(points) < 2:
+                continue
+            start, end = points[0], points[-1]
             first = (float(start.x), float(start.y))
             second = (float(end.x), float(end.y))
             if math.hypot(second[0] - first[0], second[1] - first[1]) >= 6.0:
+                if rectangles and _is_rectangle_side(first, second, rectangles):
+                    continue
                 segments.append((first, second))
+    return segments
 
-    selected: list[tuple[tuple[float, float], tuple[float, float]]] = []
+
+def _is_rectangle_side(
+    start: tuple[float, float],
+    end: tuple[float, float],
+    rectangles: list[fitz.Rect],
+    tolerance: float = 1.5,
+) -> bool:
+    for rect in rectangles:
+        on_left = abs(start[0] - rect.x0) <= tolerance and abs(end[0] - rect.x0) <= tolerance
+        on_right = abs(start[0] - rect.x1) <= tolerance and abs(end[0] - rect.x1) <= tolerance
+        on_top = abs(start[1] - rect.y0) <= tolerance and abs(end[1] - rect.y0) <= tolerance
+        on_bottom = abs(start[1] - rect.y1) <= tolerance and abs(end[1] - rect.y1) <= tolerance
+        if (on_left or on_right) and min(start[1], end[1]) >= rect.y0 - tolerance and max(start[1], end[1]) <= rect.y1 + tolerance:
+            return True
+        if (on_top or on_bottom) and min(start[0], end[0]) >= rect.x0 - tolerance and max(start[0], end[0]) <= rect.x1 + tolerance:
+            return True
+    return False
+
+
+def _has_explicit_arrowhead(
+    tip: tuple[float, float],
+    main_segment: tuple[tuple[float, float], tuple[float, float]],
+    segments: list[tuple[tuple[float, float], tuple[float, float]]],
+) -> bool:
+    main_length = math.hypot(
+        main_segment[1][0] - main_segment[0][0],
+        main_segment[1][1] - main_segment[0][1],
+    )
+    arrow_legs = []
+    for start, end in segments:
+        if (start, end) == main_segment or (end, start) == main_segment:
+            continue
+        start_gap = math.hypot(start[0] - tip[0], start[1] - tip[1])
+        end_gap = math.hypot(end[0] - tip[0], end[1] - tip[1])
+        if min(start_gap, end_gap) > 3.0:
+            continue
+        outer = end if start_gap <= end_gap else start
+        leg_length = math.hypot(outer[0] - tip[0], outer[1] - tip[1])
+        if 3.0 <= leg_length <= min(24.0, max(8.0, main_length * 0.3)):
+            arrow_legs.append(outer)
+
+    for first_index, first in enumerate(arrow_legs):
+        for second in arrow_legs[first_index + 1:]:
+            first_length = math.hypot(first[0] - tip[0], first[1] - tip[1]) or 1.0
+            second_length = math.hypot(second[0] - tip[0], second[1] - tip[1]) or 1.0
+            cosine = (
+                (first[0] - tip[0]) * (second[0] - tip[0])
+                + (first[1] - tip[1]) * (second[1] - tip[1])
+            ) / (first_length * second_length)
+            if -0.6 <= cosine <= 0.95:
+                return True
+    return False
+
+
+def _handwheel_arrow_segments(
+    text_rects: list[fitz.Rect],
+    drawings: list[dict[str, Any]],
+    rectangles: list[fitz.Rect] | None = None,
+) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+    return [path[0] for path in _handwheel_arrow_paths(text_rects, drawings, rectangles)]
+
+
+def _handwheel_arrow_paths(
+    text_rects: list[fitz.Rect],
+    drawings: list[dict[str, Any]],
+    rectangles: list[fitz.Rect] | None = None,
+) -> list[list[tuple[tuple[float, float], tuple[float, float]]]]:
+    segments = _drawing_segments(drawings, rectangles)
+
+    selected: list[list[tuple[tuple[float, float], tuple[float, float]]]] = []
     for text_rect in text_rects:
         candidates = []
-        for start, end in segments:
+        for segment_index, (start, end) in enumerate(segments):
             start_gap = _distance_to_rect(start, text_rect)
             end_gap = _distance_to_rect(end, text_rect)
             nearest_gap = min(start_gap, end_gap)
-            if nearest_gap > 32.0:
+            if nearest_gap > 24.0:
                 continue
             if end_gap < start_gap:
                 start, end = end, start
-            candidates.append((nearest_gap, -(math.hypot(end[0] - start[0], end[1] - start[1])), start, end))
+            queue = [(segment_index, end, [(start, end)], {segment_index})]
+            while queue:
+                current_index, current_tip, path, visited = queue.pop(0)
+                current_segment = path[-1]
+                if _has_explicit_arrowhead(current_tip, current_segment, segments):
+                    candidates.append((nearest_gap, path))
+                    break
+                if len(path) >= 12:
+                    continue
+                for next_index, (next_start, next_end) in enumerate(segments):
+                    if next_index in visited:
+                        continue
+                    start_distance = math.hypot(next_start[0] - current_tip[0], next_start[1] - current_tip[1])
+                    end_distance = math.hypot(next_end[0] - current_tip[0], next_end[1] - current_tip[1])
+                    if min(start_distance, end_distance) > 3.0:
+                        continue
+                    if end_distance < start_distance:
+                        next_start, next_end = next_end, next_start
+                    queue.append((next_index, next_end, path + [(next_start, next_end)], visited | {next_index}))
         if candidates:
-            _gap, _negative_length, start, end = min(candidates, key=lambda item: (item[0], item[1]))
-            selected.append((start, end))
+            _gap, path = min(candidates, key=lambda item: (item[0], len(item[1])))
+            selected.append(path)
     return selected
+
+
+def _first_arrow_third(segment: dict[str, list[float]]) -> tuple[list[float], list[float]]:
+    start = segment["start"]
+    end = segment["end"]
+    return [
+        start,
+        [
+            round(start[0] + (end[0] - start[0]) / 3.0, 2),
+            round(start[1] + (end[1] - start[1]) / 3.0, 2),
+        ],
+    ]
+
+
+def _handwheel_details(
+    page: Any,
+    mapping: dict[str, Any],
+) -> list[dict[str, Any]]:
+    text_rows = _handwheel_text_rects(page.get_text("words"))
+    details: list[dict[str, Any]] = []
+    edges = mapping.get("edges", [])
+    drawings = page.get_drawings()
+    rectangles = mark_pipeline.find_rectangles(page, page.rect)
+    for index, (label, text_rect) in enumerate(text_rows, start=1):
+        row: dict[str, Any] = {
+            "id": f"HW-{index:03d}",
+            "label": label,
+            "bbox": [round(text_rect.x0, 2), round(text_rect.y0, 2), round(text_rect.x1, 2), round(text_rect.y1, 2)],
+            "arrow_found": False,
+            "arrow_start": None,
+            "arrow_end": None,
+            "edge_id": None,
+            "edge_distance_px": None,
+        }
+        paths = _handwheel_arrow_paths([text_rect], drawings, rectangles)
+        if not paths:
+            details.append(row)
+            continue
+        path = paths[0]
+        start = path[0][0]
+        end = path[-1][1]
+        row["arrow_found"] = True
+        row["arrow_start"] = [round(start[0], 2), round(start[1], 2)]
+        row["arrow_end"] = [round(end[0], 2), round(end[1], 2)]
+        row["arrow_segments"] = [
+            {
+                "start": [round(segment[0][0], 2), round(segment[0][1], 2)],
+                "end": [round(segment[1][0], 2), round(segment[1][1], 2)],
+            }
+            for segment in path
+        ]
+        nearest = []
+        for edge in edges:
+            gap, _position, _projection = _distance_to_segment(
+                end,
+                tuple(edge["start"]),
+                tuple(edge["end"]),
+            )
+            nearest.append((gap, edge.get("id")))
+        if nearest:
+            gap, edge_id = min(nearest, key=lambda item: item[0])
+            if gap <= 45.0:
+                row["edge_id"] = edge_id
+                row["edge_distance_px"] = round(gap, 2)
+        if row["edge_id"] is None:
+            row["edge_id"] = f"HW_EDGE_{index:03d}"
+            row["edge_created"] = True
+            row["edge_kind"] = "handwheel_attachment"
+            row["is_pipe_edge"] = False
+            row["edge_reason"] = "Для штурвала не найдено существующее трубное ребро; создано отдельное ребро привязки арматуры."
+        else:
+            row["edge_created"] = False
+            row["edge_kind"] = "pipe_edge"
+            row["is_pipe_edge"] = True
+        details.append(row)
+    return details
 
 
 def save_clean_local_markup_pdf(
@@ -609,21 +794,25 @@ def save_clean_local_markup_pdf(
         marked.show_pdf_page(marked.rect, document, page_number - 1)
 
         handwheel_color = (0.14, 0.39, 0.92)
-        handwheel_rects = _handwheel_text_rects(page.get_text("words"))
-        for rect in handwheel_rects:
+        handwheel_details = _handwheel_details(page, mapping)
+        for item in handwheel_details:
             marked.draw_rect(
-                rect,
+                fitz.Rect(*item["bbox"]),
                 color=handwheel_color,
                 fill=None,
                 width=1.6,
             )
-        for start, end in _handwheel_arrow_segments(
-            handwheel_rects,
-            page.get_drawings(),
-        ):
+        for item in handwheel_details:
+            if not item["arrow_found"]:
+                continue
+            segments = item.get("arrow_segments", [])
+            if not segments:
+                continue
+            segment = segments[0]
+            first_start, first_end = _first_arrow_third(segment)
             marked.draw_line(
-                fitz.Point(*start),
-                fitz.Point(*end),
+                fitz.Point(*first_start),
+                fitz.Point(*first_end),
                 color=handwheel_color,
                 width=1.6,
             )

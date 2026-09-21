@@ -32,6 +32,7 @@ from .models import (
     Uncertainty,
     VertexMark,
 )
+from .dimension_mapping import _handwheel_details
 from .route_reconstruction import extract_local_vertices
 
 
@@ -749,6 +750,57 @@ class DeepSeekAIClient(AIClient):
                 )
         return _find_handwheel_rows(candidates, vertices)
 
+    def _handwheel_payload_rows(self, group: LineGroup, candidates: list[Candidate]) -> list[dict[str, Any]]:
+        rows = self._handwheel_rows_for_group(group, candidates)
+        if not self.pdf_path:
+            return rows
+        by_page: dict[int, list[dict[str, Any]]] = {}
+        for row in rows:
+            by_page.setdefault(int(row.get("page") or 0), []).append(row)
+        try:
+            with pymupdf.open(str(self.pdf_path)) as document:
+                for page_info in group.pages:
+                    details = _handwheel_details(document[page_info.page_number - 1], {"edges": []})
+                    for detail in details:
+                        detail_page_rows = by_page.setdefault(page_info.page_number, [])
+                        detail_center = (
+                            (detail["bbox"][0] + detail["bbox"][2]) / 2,
+                            (detail["bbox"][1] + detail["bbox"][3]) / 2,
+                        )
+                        matching = None
+                        for row in detail_page_rows:
+                            bbox = row.get("bbox") or []
+                            if len(bbox) < 4:
+                                continue
+                            row_center = ((bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2)
+                            if abs(row_center[0] - detail_center[0]) <= 8 and abs(row_center[1] - detail_center[1]) <= 8:
+                                matching = row
+                                break
+                        if matching is None:
+                            matching = {
+                                "id": detail["id"],
+                                "page": page_info.page_number,
+                                "label": detail["label"],
+                                "bbox": detail["bbox"],
+                                "confidence": 0.7,
+                                "reason": "Найдено напрямую по тексту PDF.",
+                            }
+                            detail_page_rows.append(matching)
+                        matching.update({
+                            "arrow_found": detail["arrow_found"],
+                            "arrow_start": detail["arrow_start"],
+                            "arrow_end": detail["arrow_end"],
+                            "edge_id": detail["edge_id"],
+                            "edge_distance_px": detail["edge_distance_px"],
+                            "edge_created": detail.get("edge_created", False),
+                            "edge_kind": detail.get("edge_kind"),
+                            "is_pipe_edge": detail.get("is_pipe_edge", False),
+                            "edge_reason": detail.get("edge_reason"),
+                        })
+        except (OSError, IndexError, ValueError):
+            return rows
+        return [row for page_rows in by_page.values() for row in page_rows]
+
     def _graph_prompt_for_group(
         self,
         group: LineGroup,
@@ -780,7 +832,7 @@ class DeepSeekAIClient(AIClient):
             for item in classifications[:220]
         ]
         known_vertex_rows = self._known_vertex_rows_for_group(group, candidates)
-        handwheel_rows = self._handwheel_rows_for_group(group, candidates)
+        handwheel_rows = self._handwheel_payload_rows(group, candidates)
         return f"""
 Ты анализируешь один или несколько листов изометрического чертежа трубопровода.
 
@@ -850,6 +902,14 @@ class DeepSeekAIClient(AIClient):
 
 Подтвержденные штурвалы/рукоятки/маховики, найденные по ключевым словам и привязке к ближайшей вершине/оси:
 {json.dumps(handwheel_rows, ensure_ascii=False, indent=2)}
+
+Для каждого штурвала отдельно учитывай поля стрелки:
+- arrow_found=true означает, что найден векторный сегмент, один конец которого ближайший к bbox надписи;
+- arrow_start и arrow_end задают направление от надписи наружу;
+- edge_id используй только если он не null и подтверждается геометрией; null означает, что локально ребро не определено;
+- если edge_created=true, это synthetic edge только для привязки штурвала, а не трубное ребро;
+- is_pipe_edge=false означает, что этот edge нельзя использовать для длины трубы;
+- edge_distance_px является расстоянием до предполагаемого ребра в PDF-пикселях и не является длиной трубы.
 
 Извлеченный текст страниц:
 {chr(10).join(pages_text)}
@@ -954,7 +1014,7 @@ class DeepSeekAIClient(AIClient):
 
         # Заранее считаем штурвалы для всей группы — они понадобятся и для картинки,
         # и для события в UI, и для аннотаций результата.
-        handwheel_rows = self._handwheel_rows_for_group(group, candidates)
+        handwheel_rows = self._handwheel_payload_rows(group, candidates)
         if handwheel_rows:
             self._emit(
                 "deepseek.handwheels.found",
@@ -996,6 +1056,11 @@ class DeepSeekAIClient(AIClient):
                             "bbox": [float(value) for value in bbox[:4]],
                             "label": row.get("label"),
                             "target_vertex_id": row.get("target_vertex_id"),
+                            "arrow_found": row.get("arrow_found", False),
+                            "arrow_start": row.get("arrow_start"),
+                            "arrow_end": row.get("arrow_end"),
+                            "edge_id": row.get("edge_id"),
+                            "edge_distance_px": row.get("edge_distance_px"),
                         })
                     except (TypeError, ValueError):
                         continue

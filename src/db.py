@@ -38,6 +38,24 @@ def init_db() -> None:
                 connection.execute(f"ALTER TABLE runs ADD COLUMN {column} TEXT")
             except sqlite3.OperationalError:
                 pass
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS analysis_feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                line_id TEXT NOT NULL,
+                page_number INTEGER NOT NULL,
+                candidate_id TEXT NOT NULL,
+                rating TEXT NOT NULL CHECK (rating IN ('up', 'down')),
+                prompt_name TEXT,
+                prompt_version TEXT,
+                prompt_sha256 TEXT,
+                context TEXT NOT NULL,
+                UNIQUE(run_id, line_id, page_number, candidate_id)
+            )
+            """
+        )
 
 
 def _now() -> str:
@@ -90,6 +108,17 @@ def list_runs() -> list[dict[str, Any]]:
         rows = connection.execute(
             "SELECT run_id, created_at, updated_at, status, source_name, line_ids, stop_stage, kind, kind_label, model, data FROM runs ORDER BY created_at DESC"
         ).fetchall()
+        feedback_rows = connection.execute(
+            """
+            SELECT run_id,
+                   SUM(CASE WHEN rating = 'up' THEN 1 ELSE 0 END) AS positive,
+                   SUM(CASE WHEN rating = 'down' THEN 1 ELSE 0 END) AS negative,
+                   COUNT(*) AS total
+            FROM analysis_feedback
+            GROUP BY run_id
+            """
+        ).fetchall()
+    feedback_by_run = {row["run_id"]: dict(row) for row in feedback_rows}
     output = []
     for row in rows:
         try:
@@ -101,12 +130,15 @@ def list_runs() -> list[dict[str, Any]]:
         except (TypeError, ValueError):
             data = {}
         errors = []
+        manual_adjustment_count = 0
+        feedback = feedback_by_run.get(row["run_id"], {})
         for line in data.get("lines", []):
             if line.get("error"):
                 errors.append(line["error"])
             for page in line.get("page_results", []):
                 if page.get("error"):
                     errors.append(f"стр. {page.get('page_number')}: {page['error']}")
+                manual_adjustment_count += len(((page.get("analysis") or {}).get("manual_adjustments") or {}))
         output.append(
             {
                 "run_id": row["run_id"],
@@ -121,6 +153,89 @@ def list_runs() -> list[dict[str, Any]]:
                 "model": row["model"],
                 "error_count": len(errors),
                 "errors": errors[:3],
+                "manual_adjustment_count": manual_adjustment_count,
+                "feedback": {
+                    "positive": int(feedback.get("positive") or 0),
+                    "negative": int(feedback.get("negative") or 0),
+                    "total": int(feedback.get("total") or 0),
+                },
             }
         )
     return output
+
+
+def save_feedback(feedback: dict[str, Any]) -> dict[str, Any]:
+    created_at = _now()
+    with _connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO analysis_feedback
+                (created_at, run_id, line_id, page_number, candidate_id, rating,
+                 prompt_name, prompt_version, prompt_sha256, context)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(run_id, line_id, page_number, candidate_id) DO UPDATE SET
+                created_at = excluded.created_at,
+                rating = excluded.rating,
+                prompt_name = excluded.prompt_name,
+                prompt_version = excluded.prompt_version,
+                prompt_sha256 = excluded.prompt_sha256,
+                context = excluded.context
+            """,
+            (
+                created_at,
+                feedback["run_id"],
+                feedback["line_id"],
+                int(feedback["page_number"]),
+                feedback["candidate_id"],
+                feedback["rating"],
+                feedback.get("prompt_name"),
+                feedback.get("prompt_version"),
+                feedback.get("prompt_sha256"),
+                json.dumps(feedback.get("context", {}), ensure_ascii=False),
+            ),
+        )
+        row = connection.execute(
+            """
+            SELECT id, created_at, run_id, line_id, page_number, candidate_id,
+                   rating, prompt_name, prompt_version, prompt_sha256, context
+            FROM analysis_feedback
+            WHERE run_id = ? AND line_id = ? AND page_number = ? AND candidate_id = ?
+            """,
+            (feedback["run_id"], feedback["line_id"], int(feedback["page_number"]), feedback["candidate_id"]),
+        ).fetchone()
+    result = dict(row)
+    result["context"] = json.loads(result["context"] or "{}")
+    return result
+
+
+def feedback_summary() -> list[dict[str, Any]]:
+    with _connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT prompt_name, prompt_version, prompt_sha256,
+                   SUM(CASE WHEN rating = 'up' THEN 1 ELSE 0 END) AS positive,
+                   SUM(CASE WHEN rating = 'down' THEN 1 ELSE 0 END) AS negative,
+                   COUNT(*) AS total
+            FROM analysis_feedback
+            GROUP BY prompt_name, prompt_version, prompt_sha256
+            ORDER BY prompt_name, prompt_version
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def feedback_rows(prompt_name: str | None = None) -> list[dict[str, Any]]:
+    with _connect() as connection:
+        if prompt_name:
+            rows = connection.execute(
+                "SELECT * FROM analysis_feedback WHERE prompt_name = ? ORDER BY created_at DESC",
+                (prompt_name,),
+            ).fetchall()
+        else:
+            rows = connection.execute("SELECT * FROM analysis_feedback ORDER BY created_at DESC").fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["context"] = json.loads(item.get("context") or "{}")
+        result.append(item)
+    return result

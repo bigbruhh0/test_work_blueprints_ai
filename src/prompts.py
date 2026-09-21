@@ -68,7 +68,7 @@ def load_prompt_revision(name: str) -> dict[str, object]:
     versions = list_versions(name)
     override = _override_path(name).exists()
     sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
-    matching = next((item for item in versions if item.get("sha256") == sha256), None)
+    matching = next((item for item in reversed(versions) if item.get("sha256") == sha256), None)
     return {
         "name": name,
         "text": text,
@@ -81,6 +81,8 @@ def load_prompt_revision(name: str) -> dict[str, object]:
 def save_prompt(name: str, text: str) -> None:
     if name not in PROMPT_REGISTRY:
         raise KeyError(f"Неизвестный промпт: {name}")
+    if load_prompt(name) == text:
+        return
     OVERRIDE_DIR.mkdir(parents=True, exist_ok=True)
     _override_path(name).write_text(text, encoding="utf-8")
     entry = {

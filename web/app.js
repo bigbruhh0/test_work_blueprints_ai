@@ -1,4 +1,4 @@
-const state = { document: null, runId: null, selected: new Set(), sourceMode: 'local', filesByLine: {}, tracesByLine: {}, graphsByLine: {}, selectedPage: {}, currentRun: null, three: null, viewers3d: new Set() };
+const state = { document: null, runId: null, selected: new Set(), sourceMode: 'local', filesByLine: {}, tracesByLine: {}, graphsByLine: {}, selectedPage: {}, currentRun: null, feedback: {}, manualEdit: false, three: null, viewers3d: new Set() };
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 const esc = (value) => String(value ?? '').replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -34,7 +34,7 @@ async function init() {
   }
 }
 
-let promptsState = { list: [], current: null };
+let promptsState = { list: [], current: null, selectionToken: 0 };
 
 async function showPrompts() {
   try {
@@ -45,8 +45,13 @@ async function showPrompts() {
     $('#result-section').hidden = true;
     $('#history-section').hidden = true;
     renderPromptTabs(list);
+    if (!list.some(function (item) { return item.name === promptsState.current; })) {
+      promptsState.current = null;
+    }
     if (list.length && !promptsState.current) {
       await selectPrompt(list[0].name);
+    } else if (promptsState.current) {
+      await selectPrompt(promptsState.current);
     }
     $('#prompt-section').scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch (error) {
@@ -60,8 +65,18 @@ function renderPromptTabs(list) {
   list.forEach(function (item) {
     const button = document.createElement('button');
     button.type = 'button';
-    button.className = 'viewer-tab' + (promptsState.current === item.name ? ' on' : '');
-    button.textContent = item.title + (item.source === 'override' ? ' ·' : '');
+    button.className = 'prompt-picker-item' + (promptsState.current === item.name ? ' on' : '');
+    const selected = promptsState.current === item.name;
+    button.setAttribute('aria-selected', selected ? 'true' : 'false');
+    if (selected) {
+      button.style.background = '#a8d1b9';
+      button.style.border = '3px solid #167b59';
+      button.style.boxShadow = '0 0 0 3px rgba(22, 123, 89, .2)';
+    }
+    const feedback = item.feedback || {};
+    button.innerHTML = '<span class="prompt-tab-title">' + esc(item.title) + '</span>'
+      + '<span class="prompt-feedback prompt-feedback-up" title="Thumbs up">↑ ' + Number(feedback.positive || 0) + '</span>'
+      + '<span class="prompt-feedback prompt-feedback-down" title="Thumbs down">↓ ' + Number(feedback.negative || 0) + '</span>';
     button.dataset.name = item.name;
     button.addEventListener('click', function () { selectPrompt(item.name); });
     container.appendChild(button);
@@ -70,24 +85,38 @@ function renderPromptTabs(list) {
 
 async function selectPrompt(name) {
   promptsState.current = name;
+  const selectionToken = ++promptsState.selectionToken;
   const item = promptsState.list.find(function (p) { return p.name === name; });
-  $('#prompt-tabs').querySelectorAll('.viewer-tab').forEach(function (button) {
-    button.classList.toggle('on', button.dataset.name === name);
+  $('#prompt-tabs').querySelectorAll('.prompt-picker-item').forEach(function (button) {
+    const selected = button.dataset.name === name;
+    button.classList.toggle('on', selected);
+    button.setAttribute('aria-selected', selected ? 'true' : 'false');
+    button.style.background = selected ? '#a8d1b9' : '';
+    button.style.border = selected ? '3px solid #167b59' : '';
+    button.style.outline = selected ? '3px solid #167b59' : '';
+    button.style.outlineOffset = selected ? '2px' : '';
+    button.style.boxShadow = selected ? '0 0 0 3px rgba(22, 123, 89, .2)' : '';
   });
   try {
     const data = await api('/api/prompts/' + name);
+    if (selectionToken !== promptsState.selectionToken) return;
     $('#prompt-editor').value = data.text;
-    $('#prompt-meta').textContent = (item ? item.title : name) + (item && item.usage ? ' · используется: ' + item.usage : '') + ' · источник: ' + data.source
-      + ' · версия: ' + (data.version ?? 'default') + ' · sha256: ' + String(data.sha256 || '').slice(0, 12);
-    await loadPromptVersions(name);
+      $('#prompt-active-title').textContent = data.title || (item ? item.title : name);
+      $('#prompt-active-version').textContent = data.version ?? 'default';
+      $('#prompt-active-sha').textContent = String(data.sha256 || '').slice(0, 16);
+      const activeFeedback = data.feedback || {};
+      $('#prompt-active-stats').innerHTML = '<span class="prompt-feedback prompt-feedback-up">↑ ' + Number(activeFeedback.positive || 0) + '</span>'
+        + '<span class="prompt-feedback prompt-feedback-down">↓ ' + Number(activeFeedback.negative || 0) + '</span>';
+    await loadPromptVersions(name, selectionToken);
   } catch (error) {
     $('#prompt-status').textContent = 'Ошибка: ' + error.message;
   }
 }
 
-async function loadPromptVersions(name) {
+async function loadPromptVersions(name, selectionToken) {
   try {
     const data = await api('/api/prompts/' + name + '/versions');
+    if (selectionToken != null && selectionToken !== promptsState.selectionToken) return;
     const versions = data.versions || [];
     const container = $('#prompt-versions');
     if (!versions.length) {
@@ -96,31 +125,36 @@ async function loadPromptVersions(name) {
     }
     container.innerHTML = versions.map(function (version) {
       const when = version.created_at ? new Date(version.created_at).toLocaleString('ru-RU') : '';
+      const feedback = version.feedback || {};
       return '<div class="version-row">'
         + '<span class="mono">v' + version.version + '</span>'
         + '<span class="muted">' + esc(when) + ' · ' + version.length + ' симв.</span>'
-        + '<button type="button" class="viewer-tab" data-restore-version="' + version.version + '">Восстановить</button>'
+        + '<span class="version-feedback"><span class="prompt-feedback prompt-feedback-up">↑ ' + Number(feedback.positive || 0) + '</span><span class="prompt-feedback prompt-feedback-down">↓ ' + Number(feedback.negative || 0) + '</span></span>'
+        + '<button type="button" class="prompt-use-button" data-use-version="' + version.version + '">Использовать</button>'
         + '</div>';
     }).join('');
-    container.querySelectorAll('[data-restore-version]').forEach(function (button) {
-      button.addEventListener('click', function () { restorePromptVersion(Number(button.dataset.restoreVersion)); });
+    container.querySelectorAll('[data-use-version]').forEach(function (button) {
+      button.addEventListener('click', function () { usePromptVersion(Number(button.dataset.useVersion)); });
     });
   } catch (error) {
     $('#prompt-versions').innerHTML = '<div class="badge error">' + esc(error.message) + '</div>';
   }
 }
 
-async function restorePromptVersion(version) {
+async function usePromptVersion(version) {
   const name = promptsState.current;
   if (!name) return;
   try {
-    await api('/api/prompts/' + name + '/restore', {
+    const restored = await api('/api/prompts/' + name + '/restore', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ version: version }),
     });
+    const list = await api('/api/prompts');
+    promptsState.list = list;
+    renderPromptTabs(list);
     await selectPrompt(name);
-    $('#prompt-status').textContent = 'Восстановлена версия v' + version;
+    $('#prompt-status').textContent = 'Используется версия v' + (restored.version ?? version);
   } catch (error) {
     $('#prompt-status').textContent = 'Ошибка: ' + error.message;
   }
@@ -140,21 +174,6 @@ async function saveCurrentPrompt() {
     promptsState.list = list;
     renderPromptTabs(list);
     await selectPrompt(name);
-  } catch (error) {
-    $('#prompt-status').textContent = 'Ошибка: ' + error.message;
-  }
-}
-
-async function resetCurrentPrompt() {
-  const name = promptsState.current;
-  if (!name) return;
-  try {
-    await api('/api/prompts/' + name + '/reset', { method: 'POST' });
-    await selectPrompt(name);
-    $('#prompt-status').textContent = 'Сброшено к исходному';
-    const list = await api('/api/prompts');
-    promptsState.list = list;
-    renderPromptTabs(list);
   } catch (error) {
     $('#prompt-status').textContent = 'Ошибка: ' + error.message;
   }
@@ -296,6 +315,7 @@ async function pollRun() {
     renderRun(run);
     if (run.status === 'complete' || run.status === 'error') {
       $('#runs-section').hidden = true;
+      await refreshFeedback();
       renderResults(run);
       return;
     }
@@ -304,6 +324,19 @@ async function pollRun() {
     return;
   }
   setTimeout(pollRun, 1800);
+}
+
+async function refreshFeedback() {
+  try {
+    const data = await api('/api/feedback');
+    state.feedback = {};
+    (data.rows || []).forEach(function (row) {
+      const key = [row.run_id, row.line_id, row.page_number, row.candidate_id].join('|');
+      state.feedback[key] = row.rating;
+    });
+  } catch (error) {
+    console.warn('Не удалось загрузить оценки анализа', error);
+  }
 }
 
 function renderRun(run) {
@@ -361,6 +394,12 @@ const VIEWER_TABS = [
   { key: 'dimension_map_pdf', label: 'Диагностическая карта' },
   { key: 'dimension_review_json', label: 'Решение провайдера (JSON)' },
 ];
+const PRIMARY_VIEWER_KEYS = new Set([
+  'clean_local_markup_pdf',
+  'dimensions_json',
+  'dimension_map_pdf',
+  'dimension_review_json',
+]);
 
 function pageKey(lineId, pageNumber) { return lineId + '::' + pageNumber; }
 
@@ -390,11 +429,13 @@ function viewerCard(lineId, pageResult, runId) {
   if (state.graphsByLine[lineId]) tabs.push({ key: 'graph_3d', label: '3D граф' });
   if (pageResult.provider_trace) tabs.push({ key: 'ai_trace', label: 'AI запрос' });
   if (!tabs.length) return '';
-  const initial = tabs[0];
-  const buttons = tabs.map(function (tab, index) {
+  const primaryTabs = tabs.filter(function (tab) { return PRIMARY_VIEWER_KEYS.has(tab.key) || tab.key === 'ai_trace' || tab.key === 'graph' || tab.key === 'graph_3d'; });
+  const otherTabs = tabs.filter(function (tab) { return !primaryTabs.includes(tab); });
+  const initial = primaryTabs[0] || tabs[0];
+  const renderButtons = function (items) { return items.map(function (tab, index) {
     return '<button type="button" data-tab="' + esc(tab.key) + '" class="viewer-tab' + (index === 0 ? ' on' : '') + '">'
       + esc(tab.label) + '</button>';
-  }).join('');
+  }).join(''); };
   const initialBody = initial.key === 'ai_trace'
     ? '<p class="muted">Откройте вкладку «AI запрос».</p>'
     : initial.key === 'graph'
@@ -403,7 +444,8 @@ function viewerCard(lineId, pageResult, runId) {
       ? '<div class="graph-3d-loading"><span class="spinner"></span> Загружаю 3D-сцену...</div>'
     : '<img class="viewer-frame" src="' + viewerImageUrl(runId, lineId, files[initial.key]) + '" alt="">';
   return '<div class="viewer" data-line="' + esc(lineId) + '" data-page="' + pageResult.page_number + '">'
-    + '<div class="row viewer-tabs">' + buttons + '</div>'
+    + '<div class="row viewer-tabs">' + renderButtons(primaryTabs) + (otherTabs.length ? '<button type="button" class="viewer-tab viewer-more" data-show-other-tabs>Показать прочие</button>' : '') + '</div>'
+    + (otherTabs.length ? '<div class="row viewer-tabs viewer-other-tabs" hidden>' + renderButtons(otherTabs) + '</div>' : '')
     + '<div class="viewer-frame-wrap">' + initialBody + '</div>'
     + '</div>';
 }
@@ -412,6 +454,26 @@ function bindViewer(card) {
   card.querySelectorAll('.viewer-tab').forEach(function (button) {
     button.addEventListener('click', function () { showViewerTab(card, button.dataset.tab); });
   });
+  const more = card.querySelector('[data-show-other-tabs]');
+  if (more) {
+    more.addEventListener('click', function () {
+      const other = card.querySelector('.viewer-other-tabs');
+      other.hidden = !other.hidden;
+      more.textContent = other.hidden ? 'Показать прочие' : 'Скрыть прочие';
+    });
+  }
+}
+
+function copyViewerText(button, text) {
+  navigator.clipboard.writeText(text).then(function () {
+    const original = button.textContent;
+    button.textContent = 'Скопировано';
+    setTimeout(function () { button.textContent = original; }, 1200);
+  });
+}
+
+function copyableBlock(text, className) {
+  return '<div class="copyable-text"><button type="button" class="copy-text-button">Копировать</button><pre class="' + (className || 'raw-json') + '">' + esc(text) + '</pre></div>';
 }
 
 function parseNumbersTxt(text) {
@@ -446,13 +508,36 @@ function renderTrace(trace) {
     + (trace.prompt_sha256 ? 'sha256: ' + esc(String(trace.prompt_sha256).slice(0, 12)) + ' · ' : '')
     + (trace.status_code != null ? 'status: ' + esc(trace.status_code) + ' · ' : '')
     + (trace.elapsed_seconds != null ? 'время: ' + esc(trace.elapsed_seconds) + 's' : '');
+  const section = function (title, text) {
+    return '<details class="trace-section"><summary>' + esc(title) + '</summary><div class="trace-content"><button type="button" class="copy-text-button trace-copy">Копировать</button><pre class="raw-json">' + esc(text) + '</pre></div></details>';
+  };
   return '<div class="trace-block">'
     + '<p class="muted">' + meta + '</p>'
-    + '<div class="trace-section"><b>Prompt</b><pre class="raw-json">' + esc(trace.prompt || '') + '</pre></div>'
-    + '<div class="trace-section"><b>Payload</b><pre class="raw-json">' + esc(payloadPretty) + '</pre></div>'
-    + '<div class="trace-section"><b>Ответ (raw)</b><pre class="raw-json">' + esc(responsePretty) + '</pre></div>'
-    + (answerPretty ? '<div class="trace-section"><b>Ответ (parsed)</b><pre class="raw-json">' + esc(answerPretty) + '</pre></div>' : '')
+    + section('Prompt', trace.prompt || '')
+    + section('Payload', payloadPretty)
+    + section('Ответ (raw)', responsePretty)
+    + (answerPretty ? section('Ответ (parsed)', answerPretty) : '')
+    + '<button type="button" class="trace-back-button" aria-label="Вернуться к выбору AI запроса">↑ AI запрос</button>'
     + '</div>';
+}
+
+function bindTraceControls(card, wrap) {
+  wrap.querySelectorAll('.trace-copy').forEach(function (button) {
+    button.addEventListener('click', function () {
+      const content = button.parentElement.querySelector('.raw-json');
+      copyViewerText(button, content ? content.textContent : '');
+    });
+  });
+  const backButton = wrap.querySelector('.trace-back-button');
+  if (backButton) {
+    backButton.addEventListener('click', function () {
+      const tab = card.querySelector('.viewer-tab[data-tab="ai_trace"]');
+      if (tab) {
+        tab.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        tab.focus({ preventScroll: true });
+      }
+    });
+  }
 }
 
 function renderGraph(graph) {
@@ -743,6 +828,7 @@ async function showViewerTab(card, tabKey) {
   const files = state.filesByLine[key] || {};
   if (tabKey === 'ai_trace') {
     wrap.innerHTML = renderTrace(state.tracesByLine[key]);
+    bindTraceControls(card, wrap);
     return;
   }
   if (tabKey === 'graph') {
@@ -767,7 +853,8 @@ async function showViewerTab(card, tabKey) {
             return '<tr>' + row.map(function (cell) { return '<td>' + esc(cell) + '</td>'; }).join('') + '</tr>';
           }).join('') + '</tbody></table></div>';
       };
-      wrap.innerHTML = table(sections.numbers, 'Числа') + table(sections.coordinates, 'Координаты') + table(sections.vertices, 'Вершины');
+      wrap.innerHTML = '<button type="button" class="copy-text-button numbers-copy">Копировать исходный TXT</button>' + table(sections.numbers, 'Числа') + table(sections.coordinates, 'Координаты') + table(sections.vertices, 'Вершины');
+      wrap.querySelector('.numbers-copy').addEventListener('click', function () { copyViewerText(this, text); });
     } catch (error) {
       wrap.innerHTML = '<div class="badge error">Ошибка: ' + esc(error.message) + '</div>';
     }
@@ -778,7 +865,9 @@ async function showViewerTab(card, tabKey) {
     try {
       const response = await fetch(viewerImageUrl(runId, lineId, filename));
       const data = await response.json();
-      wrap.innerHTML = '<pre class="raw-json">' + esc(JSON.stringify(data, null, 2)) + '</pre>';
+      const pretty = JSON.stringify(data, null, 2);
+      wrap.innerHTML = copyableBlock(pretty);
+      wrap.querySelector('.copy-text-button').addEventListener('click', function () { copyViewerText(this, pretty); });
     } catch (error) { wrap.innerHTML = '<div class="badge error">Ошибка: ' + esc(error.message) + '</div>'; }
     return;
   }
@@ -787,7 +876,9 @@ async function showViewerTab(card, tabKey) {
     try {
       const response = await fetch(viewerImageUrl(runId, lineId, filename));
       const data = await response.json();
-      wrap.innerHTML = '<pre class="raw-json">' + esc(JSON.stringify(data, null, 2)) + '</pre>';
+      const pretty = JSON.stringify(data, null, 2);
+      wrap.innerHTML = copyableBlock(pretty);
+      wrap.querySelector('.copy-text-button').addEventListener('click', function () { copyViewerText(this, pretty); });
     } catch (error) { wrap.innerHTML = '<div class="badge error">Ошибка: ' + esc(error.message) + '</div>'; }
     return;
   }
@@ -855,7 +946,11 @@ function pageDetailHtml(lineId, pr) {
   if (analysis.dimension_mapping) {
     const mapping = analysis.dimension_mapping;
     const dimensions = mapping.dimensions || [];
+    const handwheels = mapping.handwheels || [];
     const review = analysis.dimension_review;
+    const providerAvailable = !!(review && review.answer && Array.isArray(review.answer.candidate_decisions));
+    const manualEditing = state.manualEdit && providerAvailable;
+    const manualAdjustments = analysis.manual_adjustments || {};
     const localCandidates = dimensions.map(function (item, index) {
       return {
         id: item.id || ('D' + (index + 1)),
@@ -907,30 +1002,55 @@ function pageDetailHtml(lineId, pr) {
       ? '<div class="review-summary"><div class="kpi"><div><span class="kpi-label">Чистая длина</span><strong>' + esc(lengths.clean_length_mm) + ' мм</strong></div><div><span class="kpi-label">Грязная длина</span><strong>' + esc(lengths.dirty_length_mm) + ' мм</strong></div></div><div class="route-kpis">' + routeKpi('Основная линия', lengths.main) + routeKpi('Ответвления', lengths.branch) + '</div><div class="notes"><b>Проверка провайдером</b><p>Сомнения: <b>' + esc(lengths.ambiguous_length_mm) + ' мм</b> · дубли включённых: ' + esc((lengths.duplicate_included_candidate_ids || []).join(', ') || '—') + '</p>' + branchInfo + crossSheetInfo + '<p>include: ' + esc((lengths.included_candidate_ids || []).join(', ') || '—') + '<br>exclude: ' + esc((lengths.excluded_candidate_ids || []).join(', ') || '—') + '<br>ambiguous: ' + esc((lengths.ambiguous_candidate_ids || []).join(', ') || '—') + '</p></div>' + invalidCandidates + evalStats + '</div>'
       : '';
     const localCandidatesBlock = localCandidates.length
-      ? '<div class="notes"><b>Локальные кандидаты</b><table class="data-table"><thead><tr><th>ID</th><th>Текст</th><th>Ключ</th><th>Статус</th><th>Ребро</th></tr></thead><tbody>'
+      ? '<details class="notes collapsible-result"><summary>Локальные кандидаты (' + localCandidates.length + ')</summary><table class="data-table"><thead><tr><th>ID</th><th>Текст</th><th>Ключ</th><th>Статус</th><th>Ребро</th></tr></thead><tbody>'
         + localCandidates.map(function (item) {
           return '<tr class="candidate-' + esc(item.status) + '"><td>' + esc(item.id) + '</td><td>' + esc(item.text) + '</td><td>' + esc((item.hints || []).join(', ') || item.kind) + '</td><td>' + esc(item.status) + '</td><td>' + esc(item.edge_id || '—') + '</td></tr>';
-        }).join('') + '</tbody></table></div>'
+        }).join('') + '</tbody></table></details>'
       : '';
-    const handwheelBlock = localHandwheels.length
-      ? '<div class="notes"><b>Штурвалы / рукоятки / маховики</b><table class="data-table"><thead><tr><th>ID</th><th>Текст</th><th>Статус</th><th>Ребро</th></tr></thead><tbody>'
-        + localHandwheels.map(function (item) {
-          return '<tr class="candidate-handwheel"><td>' + esc(item.id) + '</td><td>' + esc(item.text) + '</td><td>' + esc(item.status) + '</td><td>' + esc(item.edge_id || '—') + '</td></tr>';
-        }).join('') + '</tbody></table></div>'
+    const handwheelRows = handwheels.length ? handwheels : localHandwheels.map(function (item) {
+      return { id: item.id, label: item.text, arrow_found: false, edge_id: item.edge_id || null };
+    });
+    const handwheelBlock = handwheelRows.length
+      ? '<details class="notes collapsible-result"><summary>Штурвалы / рукоятки / маховики (' + handwheelRows.length + ')</summary><table class="data-table"><thead><tr><th>ID</th><th>Текст</th><th>Статус</th><th>Ребро</th></tr></thead><tbody>'
+        + handwheelRows.map(function (item) {
+          const arrow = item.arrow_found ? 'найдена' : 'не найдена';
+          const edge = item.edge_id || 'не определено';
+          const edgeNote = item.edge_created ? ' (создано для штурвала)' : '';
+          return '<tr class="candidate-handwheel"><td>' + esc(item.id) + '</td><td>' + esc(item.label || item.text || 'ШТУРВАЛ') + '</td><td>стрелка: ' + arrow + '</td><td>' + esc(edge + edgeNote) + '</td></tr>';
+        }).join('') + '</tbody></table></details>'
       : '';
-
-    return '<h4>Лист ' + pr.page_number + ' — привязка размеров</h4>'
-      + '<p class="muted">Рёбер графа: ' + (mapping.edges || []).length + ' · размеров: ' + dimensions.length + '</p>'
-      + reviewBlock
-      + localCandidatesBlock
-      + handwheelBlock
-      + '<table class="data-table"><thead><tr><th>Размер</th><th>Отрезок</th><th>Зазор, px</th><th>Статус</th><th>Пояснение модели</th></tr></thead><tbody>'
+    const providerTable = '<table class="data-table provider-result-table"><thead><tr><th>Размер</th><th>Отрезок</th><th>Статус</th><th>Пояснение модели</th></tr></thead><tbody>'
       + (dimensions.map(function (item) {
         const reviewDecision = review && review.answer && (review.answer.candidate_decisions || []).find(function (row) { return row.candidate_id === item.id; });
         const status = reviewDecision ? reviewDecision.decision : item.status;
-        return '<tr class="candidate-' + esc(status) + '"><td>' + esc(item.text) + '</td><td>' + esc(item.edge_id || '—') + '</td><td>' + esc(item.gap_px ?? '—') + '</td><td>' + esc(status) + (item.leader_attached ? ' · стрелка' : '') + (item.conflict_with ? ' → ' + esc(item.conflict_with) : '') + '</td><td class="candidate-reason">' + esc(reviewDecision ? reviewDecision.reason : '') + '</td></tr>';
-      }).join('') || '<tr><td colspan="5" class="muted">Размеров нет</td></tr>')
-      + '</tbody></table>' + downloads + viewer;
+        const manuallyChanged = !!manualAdjustments[item.id];
+        const statusControl = manualEditing
+          ? '<select class="manual-status-select" data-line="' + esc(lineId) + '" data-page="' + pr.page_number + '" data-candidate="' + esc(item.id) + '">'
+            + ['include', 'exclude', 'ambiguous'].map(function (option) { return '<option value="' + option + '"' + (option === status ? ' selected' : '') + '>' + option + '</option>'; }).join('')
+            + '</select>'
+          : esc(status);
+        const feedbackKey = [state.runId, lineId, pr.page_number, item.id].join('|');
+        const rating = state.feedback[feedbackKey] || '';
+        const feedbackButtons = '<span class="feedback-buttons" data-feedback-key="' + esc(feedbackKey) + '" data-line="' + esc(lineId) + '" data-page="' + pr.page_number + '" data-candidate="' + esc(item.id) + '">'
+          + '<button type="button" class="feedback-btn feedback-up' + (rating === 'up' ? ' selected' : '') + '" title="Полезный результат" aria-label="Палец вверх">👍</button>'
+          + '<button type="button" class="feedback-btn feedback-down' + (rating === 'down' ? ' selected' : '') + '" title="Неверный результат" aria-label="Палец вниз">👎</button>'
+          + '</span> ';
+        return '<tr class="candidate-' + esc(status) + '"><td>' + feedbackButtons + (manuallyChanged ? '<span class="manual-change-badge" title="Статус изменён вручную">!</span> ' : '') + esc(item.text) + '</td><td>' + esc(item.edge_id || '—') + '</td><td>' + statusControl + (item.leader_attached ? ' · стрелка' : '') + (item.conflict_with ? ' → ' + esc(item.conflict_with) : '') + '</td><td class="candidate-reason">' + esc(reviewDecision ? reviewDecision.reason : '') + '</td></tr>';
+      }).join('') || '<tr><td colspan="4" class="muted">Размеров нет</td></tr>')
+      + '</tbody></table>';
+    const providerBlock = providerAvailable
+      ? '<details class="notes collapsible-result provider-result" data-provider-key="' + esc(lineId + '::' + pr.page_number) + '"><summary>Решение провайдера</summary>'
+        + '<div class="manual-edit-toolbar"><button type="button" class="manual-edit-toggle' + (manualEditing ? ' active' : '') + '" data-manual-edit-toggle>'
+        + (manualEditing ? 'Завершить ручную правку' : 'Подправить вручную') + '</button>'
+        + (manualEditing ? '<span class="muted">Статусы размеров доступны для изменения</span>' : '') + '</div>'
+        + reviewBlock + providerTable + '</details>'
+      : '<details class="notes collapsible-result provider-result provider-result-disabled" data-provider-key="' + esc(lineId + '::' + pr.page_number) + '"><summary>Решение провайдера · недоступно</summary><p class="muted">Для этого прогона решение провайдера не запускалось.</p></details>';
+
+    return '<h4>Лист ' + pr.page_number + ' — привязка размеров</h4>'
+      + '<p class="muted">Рёбер графа: ' + (mapping.edges || []).length + ' · размеров: ' + dimensions.length + '</p>'
+      + localCandidatesBlock
+      + handwheelBlock
+      + providerBlock + downloads + viewer;
   }
   const main = analysis.main_chain || {};
   const segments = main.segments || [];
@@ -960,6 +1080,76 @@ function pageDetailHtml(lineId, pr) {
     + viewer;
 }
 
+function bindFeedbackButtons(root) {
+  $$('.feedback-buttons', root).forEach(function (container) {
+    container.querySelectorAll('.feedback-btn').forEach(function (button) {
+      button.addEventListener('click', async function () {
+        const rating = button.classList.contains('feedback-up') ? 'up' : 'down';
+        const payload = {
+          run_id: state.runId,
+          line_id: container.dataset.line,
+          page_number: Number(container.dataset.page),
+          candidate_id: container.dataset.candidate,
+          rating: rating,
+        };
+        button.disabled = true;
+        try {
+          await api('/api/feedback', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+          state.feedback[container.dataset.feedbackKey] = rating;
+          container.querySelectorAll('.feedback-btn').forEach(function (item) {
+            item.classList.toggle('selected', item === button);
+          });
+          const prompts = await api('/api/prompts');
+          promptsState.list = prompts;
+          renderPromptTabs(prompts);
+        } catch (error) {
+          alert('Не удалось сохранить оценку: ' + error.message);
+        } finally {
+          button.disabled = false;
+        }
+      });
+    });
+  });
+}
+
+function bindManualEditing(root) {
+  const toggle = $('[data-manual-edit-toggle]', root);
+  if (toggle) {
+    toggle.addEventListener('click', function () {
+      state.manualEdit = !state.manualEdit;
+      renderResults(state.currentRun);
+    });
+  }
+  $$('.manual-status-select', root).forEach(function (select) {
+    select.addEventListener('change', async function () {
+      select.disabled = true;
+      try {
+        const updated = await api('/api/manual-status', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            run_id: state.runId,
+            line_id: select.dataset.line,
+            page_number: Number(select.dataset.page),
+            candidate_id: select.dataset.candidate,
+            status: select.value,
+          }),
+        });
+        state.currentRun = updated;
+        await refreshFeedback();
+        renderResults(updated);
+      } catch (error) {
+        alert('Не удалось сохранить ручную правку: ' + error.message);
+        select.disabled = false;
+      }
+    });
+  });
+}
+
 function renderResults(run) {
   state.runId = run.run_id;
   state.currentRun = run;
@@ -969,6 +1159,7 @@ function renderResults(run) {
   $('#export-json').href = '/api/runs/' + encodeURIComponent(run.run_id) + '/export/json';
   $('#export-excel').href = '/api/runs/' + encodeURIComponent(run.run_id) + '/export/excel';
   const body = $('#result-body');
+  const openProviderState = openProviderKeys(body);
   body.innerHTML = run.lines.map(function (line) {
     const pages = line.page_results || [];
     let totalMain = 0;
@@ -1009,17 +1200,14 @@ function renderResults(run) {
       + (state.graphsByLine[line.line_id]
         ? '<section class="result-3d-block"><div class="panel-title"><span>ТОПОЛОГИЯ / ' + esc(line.line_id) + '</span><h2>3D-граф трубы</h2></div><div class="line-graph-3d" data-graph-3d-line="' + esc(line.line_id) + '"><div class="graph-3d-loading"><span class="spinner"></span> Загружаю 3D-сцену...</div></div></section>'
         : '')
-      + '<div class="kpi">'
       + (hasDimensionReview
-        ? '<div><span class="kpi-label">Основная линия · чистая / грязная</span><strong>' + reviewCleanMain + ' / ' + reviewDirtyMain + ' мм</strong></div>'
+        ? '<div class="kpi">'
+          + '<div><span class="kpi-label">Основная линия · чистая / грязная</span><strong>' + reviewCleanMain + ' / ' + reviewDirtyMain + ' мм</strong></div>'
           + '<div><span class="kpi-label">Ответвления · чистая / грязная</span><strong>' + reviewCleanBranch + ' / ' + reviewDirtyBranch + ' мм</strong></div>'
           + '<div><span class="kpi-label">Рёбер</span><strong>' + edgeCount + '</strong></div>'
           + '<div><span class="kpi-label">Листов</span><strong>' + pages.length + '</strong></div>'
-        : '<div><span class="kpi-label">Сумма (все листы)</span><strong>' + totalMain + ' мм</strong></div>'
-          + '<div><span class="kpi-label">Рёбер</span><strong>' + edgeCount + '</strong></div>'
-          + '<div><span class="kpi-label">Ответвлений</span><strong>' + totalBranches + '</strong></div>'
-          + '<div><span class="kpi-label">Непривязанных</span><strong>' + totalSkipped + '</strong></div>')
-      + '</div>'
+          + '</div>'
+        : '')
       + '<div class="row page-selector-row">' + pageButtons + '</div>'
       + '<div class="page-content" data-line="' + esc(line.line_id) + '">'
       + (firstPage ? pageDetailHtml(line.line_id, firstPage) : '<p class="muted">Страниц нет</p>')
@@ -1032,6 +1220,9 @@ function renderResults(run) {
   });
   bindPageSelectors();
   $('#result-body').querySelectorAll('.viewer').forEach(bindViewer);
+  bindFeedbackButtons($('#result-body'));
+  bindManualEditing($('#result-body'));
+  restoreProviderKeys(body, openProviderState);
 }
 
 function bindPageSelectors() {
@@ -1050,8 +1241,24 @@ function bindPageSelectors() {
       if (pr) {
         content.innerHTML = pageDetailHtml(lineId, pr);
         content.querySelectorAll('.viewer').forEach(bindViewer);
+        bindFeedbackButtons(content);
+        bindManualEditing(content);
       }
     });
+  });
+}
+
+function openProviderKeys(root) {
+  const keys = new Set();
+  root.querySelectorAll('details[data-provider-key][open]').forEach(function (details) {
+    keys.add(details.dataset.providerKey);
+  });
+  return keys;
+}
+
+function restoreProviderKeys(root, keys) {
+  root.querySelectorAll('details[data-provider-key]').forEach(function (details) {
+    details.open = keys.has(details.dataset.providerKey);
   });
 }
 
@@ -1115,11 +1322,17 @@ async function showHistory() {
       const when = run.created_at ? new Date(run.created_at).toLocaleString('ru-RU') : '';
       const kindLabel = run.kind_label || run.stop_stage || '';
       const model = run.model ? ' · ' + run.model : '';
+      const manual = Number(run.manual_adjustment_count || 0) ? ' · ручных правок: ' + run.manual_adjustment_count : '';
+      const feedback = run.feedback || {};
+      const feedbackStats = Number(feedback.total || 0)
+        ? ' · <span class="prompt-feedback prompt-feedback-up">↑ ' + Number(feedback.positive || 0) + '</span>'
+          + ' <span class="prompt-feedback prompt-feedback-down">↓ ' + Number(feedback.negative || 0) + '</span>'
+        : '';
       return '<div class="line-card history-row" data-run-id="' + esc(run.run_id) + '">'
         + '<div class="row"><b>' + esc(run.source_name || '') + '</b> <span class="badge ' + badge + '">' + esc(run.status) + '</span>'
         + '<span class="badge kind">' + esc(kindLabel) + '</span>'
         + '<span class="group-item-meta">' + esc(when) + '</span></div>'
-        + '<div class="muted">' + esc(run.run_id) + ' · ' + (run.line_ids || []).map(esc).join(', ') + esc(model) + '</div>'
+        + '<div class="muted">' + esc(run.run_id) + ' · ' + (run.line_ids || []).map(esc).join(', ') + esc(model) + esc(manual) + feedbackStats + '</div>'
         + (run.error_count ? '<div class="badge error">Ошибок: ' + run.error_count + '<br>' + run.errors.map(esc).join('<br>') + '</div>' : '')
         + '<button class="open-run" type="button" data-open-run="' + esc(run.run_id) + '">Открыть →</button>'
         + '</div>';
@@ -1144,6 +1357,7 @@ async function openHistoryRun(runId) {
       renderRun(run);
       pollRun();
     } else {
+      await refreshFeedback();
       renderResults(run);
     }
   } catch (error) {
@@ -1177,7 +1391,6 @@ document.addEventListener('DOMContentLoaded', function () {
   $('#prompts-button').addEventListener('click', showPrompts);
   $('#eval-button').addEventListener('click', showEval);
   $('#save-prompt').addEventListener('click', saveCurrentPrompt);
-  $('#reset-prompt').addEventListener('click', resetCurrentPrompt);
   $('#groups-search').addEventListener('input', function (event) {
     const query = String(event.currentTarget.value).trim().toUpperCase().replace(/-/g, '_');
     $$('#groups-list .group-item').forEach(function (row) {

@@ -5,7 +5,7 @@ from unittest import mock
 
 import fitz
 
-from src.dimension_mapping import _dimension_hints_from_text, _handwheel_arrow_segments, _handwheel_text_rects, _same_directed_contour, save_clean_local_markup_pdf, save_preprocess_annotation_pdf
+from src.dimension_mapping import _dimension_hints_from_text, _first_arrow_third, _handwheel_arrow_segments, _handwheel_details, _handwheel_text_rects, _is_rectangle_side, _same_directed_contour, save_clean_local_markup_pdf, save_preprocess_annotation_pdf
 
 
 class DimensionRuleTests(unittest.TestCase):
@@ -164,17 +164,111 @@ class DimensionRuleTests(unittest.TestCase):
     def test_clean_local_markup_pdf_marks_shtrval_text_found_on_page(self) -> None:
         rects = _handwheel_text_rects([
             (40, 60, 100, 80, "ШТУРВАЛ", 0, 0, 0),
-            (10, 10, 20, 20, "3100", 0, 0, 1),
+            (10, 10, 20, 20, "3100", 1, 1, 0),
         ])
-        self.assertEqual(rects, [fitz.Rect(40, 60, 100, 80)])
+        self.assertEqual(rects, [("ШТУРВАЛ", fitz.Rect(40, 60, 100, 80))])
+
+    def test_handwheel_text_rect_contains_complete_same_line_label(self) -> None:
+        rows = _handwheel_text_rects([
+            (40, 60, 100, 80, "ШТУРВАЛ", 2, 3, 0),
+            (104, 60, 140, 80, "EAST", 2, 3, 1),
+            (10, 10, 20, 20, "3100", 4, 1, 0),
+        ])
+
+        self.assertEqual(rows, [("ШТУРВАЛ EAST", fitz.Rect(40, 60, 140, 80))])
 
     def test_handwheel_arrow_segment_starts_near_label(self) -> None:
         rects = [fitz.Rect(40, 60, 100, 80)]
-        drawings = [{"items": [("l", fitz.Point(150, 100), fitz.Point(100, 70))]}]
+        drawings = [{"items": [
+            ("l", fitz.Point(160, 120), fitz.Point(100, 70)),
+            ("l", fitz.Point(160, 120), fitz.Point(145, 105)),
+            ("l", fitz.Point(160, 120), fitz.Point(150, 125)),
+        ]}]
 
         segments = _handwheel_arrow_segments(rects, drawings)
 
-        self.assertEqual(segments, [((100.0, 70.0), (150.0, 100.0))])
+        self.assertEqual(segments, [((100.0, 70.0), (160.0, 120.0))])
+
+    def test_handwheel_plain_line_is_not_an_arrow(self) -> None:
+        rects = [fitz.Rect(40, 60, 100, 80)]
+        drawings = [{"items": [("l", fitz.Point(150, 100), fitz.Point(100, 70))]}]
+
+        self.assertEqual(_handwheel_arrow_segments(rects, drawings), [])
+
+    def test_rectangle_side_is_not_an_arrow_segment(self) -> None:
+        rectangles = [fitz.Rect(40, 40, 80, 70)]
+
+        self.assertTrue(_is_rectangle_side((40, 40), (40, 70), rectangles))
+        self.assertFalse(_is_rectangle_side((80, 70), (100, 90), rectangles))
+
+    def test_handwheel_distant_neighboring_v_is_not_an_arrow(self) -> None:
+        rects = [fitz.Rect(40, 60, 100, 80)]
+        drawings = [{"items": [
+            ("l", fitz.Point(130, 70), fitz.Point(180, 120)),
+            ("l", fitz.Point(180, 120), fitz.Point(165, 112)),
+            ("l", fitz.Point(180, 120), fitz.Point(170, 135)),
+        ]}]
+
+        self.assertEqual(_handwheel_arrow_segments(rects, drawings), [])
+
+    def test_handwheel_narrow_realistic_arrowhead_is_detected(self) -> None:
+        rects = [fitz.Rect(40, 60, 100, 80)]
+        drawings = [{"items": [
+            ("l", fitz.Point(120, 70), fitz.Point(160, 120)),
+            ("l", fitz.Point(160, 120), fitz.Point(155, 115)),
+            ("l", fitz.Point(157, 114), fitz.Point(160, 120)),
+        ]}]
+
+        self.assertEqual(_handwheel_arrow_segments(rects, drawings), [((120.0, 70.0), (160.0, 120.0))])
+
+    def test_handwheel_details_report_arrow_and_edge(self) -> None:
+        with fitz.open() as doc:
+            page = doc.new_page(width=300, height=200)
+            page_type = type(page)
+            mapping = {"edges": [{"id": "E001", "start": [160, 120], "end": [260, 120]}]}
+            with mock.patch.object(page_type, "get_text", return_value=[(40, 60, 100, 80, "ШТУРВАЛ", 0, 0, 0)]), mock.patch.object(
+                page_type,
+                "get_drawings",
+                return_value=[{"items": [
+                    ("l", fitz.Point(160, 120), fitz.Point(100, 70)),
+                    ("l", fitz.Point(160, 120), fitz.Point(145, 105)),
+                    ("l", fitz.Point(160, 120), fitz.Point(150, 125)),
+                ]}],
+            ):
+                details = _handwheel_details(page, mapping)
+
+        self.assertEqual(details[0]["arrow_found"], True)
+        self.assertEqual(details[0]["edge_id"], "E001")
+
+    def test_handwheel_without_pipe_edge_gets_non_pipe_attachment_edge(self) -> None:
+        with fitz.open() as doc:
+            page = doc.new_page(width=300, height=200)
+            page_type = type(page)
+            with mock.patch.object(page_type, "get_text", return_value=[(40, 60, 100, 80, "ШТУРВАЛ", 0, 0, 0)]), mock.patch.object(
+                page_type,
+                "get_drawings",
+                return_value=[{"items": [
+                    ("l", fitz.Point(160, 120), fitz.Point(100, 70)),
+                    ("l", fitz.Point(160, 120), fitz.Point(145, 105)),
+                    ("l", fitz.Point(160, 120), fitz.Point(150, 125)),
+                ]}],
+            ):
+                details = _handwheel_details(page, {"edges": []})
+
+        self.assertEqual(details[0]["edge_id"], "HW_EDGE_001")
+        self.assertTrue(details[0]["edge_created"])
+        self.assertFalse(details[0]["is_pipe_edge"])
+
+    def test_clean_markup_uses_visible_blue_arrow_overlay(self) -> None:
+        source = Path('src/dimension_mapping.py').read_text(encoding='utf-8')
+        self.assertIn('segments[0]', source)
+        self.assertIn('width=1.6', source)
+
+    def test_clean_markup_uses_first_third_of_arrow_segment(self) -> None:
+        start, end = _first_arrow_third({"start": [100.0, 70.0], "end": [160.0, 120.0]})
+
+        self.assertEqual(start, [100.0, 70.0])
+        self.assertEqual(end, [120.0, 86.67])
 
     def test_review_map_with_provider_accepts_single_page_markup_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

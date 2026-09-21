@@ -13,7 +13,7 @@
     }
   }
   </script>
-  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/styles.css?v=3">
   <script src="/static/app.js" defer></script>
 </head>
 <body>
@@ -77,21 +77,34 @@
     </section>
 
     <section class="analysis-page" id="prompt-section" hidden>
-      <div class="panel-title"><span>ПРОМПТЫ</span><h2>Редактор промптов</h2></div>
-      <div class="row prompt-tabs" id="prompt-tabs"></div>
-      <div class="row">
-        <span class="pill-soft" id="prompt-meta"></span>
+      <div class="prompt-page-head">
+        <div class="panel-title"><span>ПРОМПТЫ</span><h2>Редактор промптов</h2></div>
+        <div class="prompt-picker" id="prompt-tabs" aria-label="Выбор промпта"></div>
       </div>
-      <textarea id="prompt-editor" class="prompt-editor" spellcheck="false"></textarea>
-      <div class="row">
-        <button class="primary-button" id="save-prompt">Сохранить промпт</button>
-        <button class="secondary-button" id="reset-prompt">Сбросить к исходному</button>
-        <span id="prompt-status" class="pill-soft"></span>
-      </div>
-      <div class="prompt-versions">
-        <b>История версий</b>
+      <section class="prompt-active-card">
+        <div class="prompt-active-heading">
+          <div>
+            <div class="prompt-eyebrow">ТЕКУЩИЙ ПРОМПТ</div>
+            <h3 id="prompt-active-title">—</h3>
+          </div>
+          <div class="prompt-active-stats" id="prompt-active-stats"></div>
+        </div>
+        <div class="prompt-active-meta">
+          <span>версия <b id="prompt-active-version">—</b></span>
+          <span>sha <code id="prompt-active-sha">—</code></span>
+        </div>
+      </section>
+      <section class="prompt-editor-card">
+        <textarea id="prompt-editor" class="prompt-editor" spellcheck="false" aria-label="Текст текущего промпта"></textarea>
+        <div class="prompt-editor-actions">
+          <button class="primary-button" id="save-prompt">Сохранить</button>
+          <span id="prompt-status" class="pill-soft"></span>
+        </div>
+      </section>
+      <section class="prompt-history-card">
+        <div class="prompt-history-heading"><h3>Версии промпта</h3><span class="muted">Выберите версию, которую нужно сделать текущей</span></div>
         <div id="prompt-versions"></div>
-      </div>
+      </section>
     </section>
 
     <section class="analysis-page" id="eval-section" hidden>

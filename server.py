@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import fitz
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response, StreamingResponse
@@ -20,6 +21,7 @@ from pydantic import BaseModel
 
 from src import db as run_db
 from src.dimension_mapping import (
+    _handwheel_details,
     run_dimension_mapping,
     save_clean_graph_pdf,
     save_clean_local_markup_pdf,
@@ -195,14 +197,164 @@ class AnalyzeBody(BaseModel):
 
 
 @app.get("/api/prompts")
-def list_prompts() -> list[dict[str, str]]:
+def list_prompts() -> list[dict[str, Any]]:
     from src import prompts
 
-    return prompts.list_prompts()
+    summary = {
+        (item.get("prompt_name"), item.get("prompt_version"), item.get("prompt_sha256")): item
+        for item in run_db.feedback_summary()
+    }
+    output = []
+    for item in prompts.list_prompts():
+        active = prompts.load_prompt_revision(item["name"])
+        active_key = (item["name"], str(active.get("version")), active.get("sha256"))
+        active_row = summary.get(active_key, {})
+        legacy_row = summary.get((item["name"], None, None), {})
+        positive = int(active_row.get("positive") or 0) + int(legacy_row.get("positive") or 0)
+        negative = int(active_row.get("negative") or 0) + int(legacy_row.get("negative") or 0)
+        output.append({
+            **item,
+            "feedback": {
+                "positive": positive,
+                "negative": negative,
+                "total": positive + negative,
+            },
+        })
+    return output
 
 
 class PromptBody(BaseModel):
     text: str
+
+
+class FeedbackBody(BaseModel):
+    run_id: str
+    line_id: str
+    page_number: int
+    candidate_id: str
+    rating: str
+
+
+class ManualStatusBody(BaseModel):
+    run_id: str
+    line_id: str
+    page_number: int
+    candidate_id: str
+    status: str
+
+
+@app.post("/api/feedback")
+def save_analysis_feedback(body: FeedbackBody) -> dict[str, Any]:
+    if body.rating not in {"up", "down"}:
+        raise HTTPException(400, "rating must be up or down")
+    run = get_run(body.run_id)
+    line = next((item for item in run.get("lines", []) if item.get("line_id") == body.line_id), None)
+    page = next((item for item in (line or {}).get("page_results", []) if item.get("page_number") == body.page_number), None)
+    if page is None:
+        raise HTTPException(404, "Страница результата не найдена")
+    mapping = ((page.get("analysis") or {}).get("dimension_mapping") or {})
+    dimension = next((item for item in mapping.get("dimensions", []) if item.get("id") == body.candidate_id), None)
+    if dimension is None:
+        raise HTTPException(404, "Кандидат размера не найден")
+    review = (page.get("analysis") or {}).get("dimension_review") or {}
+    if not review or not review.get("answer"):
+        raise HTTPException(400, "Оценка доступна только после этапа провайдера")
+    decision = next((item for item in (review.get("answer") or {}).get("candidate_decisions", []) if item.get("candidate_id") == body.candidate_id), {})
+    trace = page.get("provider_trace") or {}
+    revision = page.get("prompt_revision") or {}
+    context = {
+        "source_name": run.get("source_name"),
+        "dimension": dimension,
+        "decision": decision,
+        "lengths": review.get("lengths"),
+        "prompt": trace.get("prompt"),
+        "payload": trace.get("payload"),
+        "response_raw": trace.get("response_raw"),
+    }
+    return run_db.save_feedback({
+        "run_id": body.run_id,
+        "line_id": body.line_id,
+        "page_number": body.page_number,
+        "candidate_id": body.candidate_id,
+        "rating": body.rating,
+        "prompt_name": revision.get("name") or trace.get("prompt_name") or "dimension_review",
+        "prompt_version": revision.get("version") or trace.get("prompt_version"),
+        "prompt_sha256": revision.get("sha256") or trace.get("prompt_sha256"),
+        "context": context,
+    })
+
+
+@app.get("/api/feedback")
+def list_analysis_feedback(prompt_name: str | None = None) -> dict[str, Any]:
+    return {"rows": run_db.feedback_rows(prompt_name), "summary": run_db.feedback_summary()}
+
+
+@app.post("/api/manual-status")
+def update_manual_status(body: ManualStatusBody) -> dict[str, Any]:
+    if body.status not in {"include", "exclude", "ambiguous"}:
+        raise HTTPException(400, "status must be include, exclude, or ambiguous")
+    run = get_run(body.run_id)
+    line = next((item for item in run.get("lines", []) if item.get("line_id") == body.line_id), None)
+    page = next((item for item in (line or {}).get("page_results", []) if item.get("page_number") == body.page_number), None)
+    if page is None:
+        raise HTTPException(404, "Страница результата не найдена")
+    analysis = page.get("analysis") or {}
+    if not analysis.get("dimension_review") or not (analysis["dimension_review"].get("answer") or {}).get("candidate_decisions"):
+        raise HTTPException(400, "Ручная правка доступна только после этапа провайдера")
+    mapping = analysis.get("dimension_mapping") or {}
+    dimension = next((item for item in mapping.get("dimensions", []) if item.get("id") == body.candidate_id), None)
+    review = analysis.get("dimension_review") or {}
+    answer = review.get("answer") or {}
+    decisions = answer.setdefault("candidate_decisions", [])
+    decision = next((item for item in decisions if item.get("candidate_id") == body.candidate_id), None)
+    if dimension is None or decision is None:
+        raise HTTPException(404, "Кандидат размера не найден")
+    old_status = decision.get("decision") or dimension.get("status")
+    decision["decision"] = body.status
+    decision["reason"] = f"Ручная правка пользователя: {old_status} -> {body.status}."
+    manual_adjustments = analysis.setdefault("manual_adjustments", {})
+    manual_adjustments[body.candidate_id] = {
+        "old_status": old_status,
+        "new_status": body.status,
+        "changed_at": now(),
+        "source": "user_manual_edit",
+    }
+    review["answer"] = answer
+    review["lengths"] = calculate_lengths(mapping, answer)
+    analysis["dimension_review"] = review
+    page["analysis"] = analysis
+    trace = page.get("provider_trace") or {}
+    revision = page.get("prompt_revision") or {}
+    run_db.save_feedback({
+        "run_id": body.run_id,
+        "line_id": body.line_id,
+        "page_number": body.page_number,
+        "candidate_id": body.candidate_id,
+        "rating": "down",
+        "prompt_name": revision.get("name") or trace.get("prompt_name") or "dimension_review",
+        "prompt_version": revision.get("version") or trace.get("prompt_version"),
+        "prompt_sha256": revision.get("sha256") or trace.get("prompt_sha256"),
+        "context": {
+            "source_name": run.get("source_name"),
+            "manual_adjustment": manual_adjustments[body.candidate_id],
+            "dimension": dimension,
+            "decision": decision,
+            "lengths_after": review["lengths"],
+            "prompt": trace.get("prompt"),
+            "payload": trace.get("payload"),
+            "response_raw": trace.get("response_raw"),
+        },
+    })
+    persisted_state = STATE["runs"].get(body.run_id)
+    if persisted_state:
+        target_line = persisted_state.lines.get(body.line_id)
+        target_page = target_line.page_results.get(body.page_number) if target_line else None
+        if target_page:
+            target_page.analysis = analysis
+            _persist(persisted_state)
+            return run_dict(persisted_state)
+    run_db.save_run(run)
+    return run
 
 
 @app.get("/api/prompts/{name}")
@@ -212,6 +364,27 @@ def get_prompt(name: str) -> dict[str, Any]:
     if name not in prompts.PROMPT_REGISTRY:
         raise HTTPException(404, "Промпт не найден")
     revision = prompts.load_prompt_revision(name)
+    feedback_rows = run_db.feedback_summary()
+    active_row = next(
+        (
+            item for item in feedback_rows
+            if item.get("prompt_name") == name
+            and str(item.get("prompt_version")) == str(revision.get("version"))
+            and item.get("prompt_sha256") == revision.get("sha256")
+        ),
+        {},
+    )
+    legacy_row = next(
+        (
+            item for item in feedback_rows
+            if item.get("prompt_name") == name
+            and not item.get("prompt_version")
+            and not item.get("prompt_sha256")
+        ),
+        {},
+    )
+    positive = int(active_row.get("positive") or 0) + int(legacy_row.get("positive") or 0)
+    negative = int(active_row.get("negative") or 0) + int(legacy_row.get("negative") or 0)
     return {
         "name": name,
         "title": prompts.PROMPT_REGISTRY[name].get("title", name),
@@ -219,6 +392,7 @@ def get_prompt(name: str) -> dict[str, Any]:
         "version": revision["version"],
         "sha256": revision["sha256"],
         "text": revision["text"],
+        "feedback": {"positive": positive, "negative": negative, "total": positive + negative},
     }
 
 
@@ -248,7 +422,39 @@ def list_prompt_versions(name: str) -> dict[str, Any]:
 
     if name not in prompts.PROMPT_REGISTRY:
         raise HTTPException(404, "Промпт не найден")
-    return {"name": name, "versions": prompts.list_versions(name)}
+    summaries = {
+        (str(item.get("prompt_version")), item.get("prompt_sha256")): item
+        for item in run_db.feedback_summary()
+        if item.get("prompt_name") == name
+    }
+    active_revision = prompts.load_prompt_revision(name)
+    legacy_summary = next(
+        (
+            item for item in run_db.feedback_summary()
+            if item.get("prompt_name") == name
+            and not item.get("prompt_version")
+            and not item.get("prompt_sha256")
+        ),
+        None,
+    )
+    versions = []
+    for version in prompts.list_versions(name):
+        summary = summaries.get((str(version.get("version")), version.get("sha256")), {})
+        if version.get("version") == active_revision.get("version") and legacy_summary:
+            summary = {
+                "positive": int(summary.get("positive") or 0) + int(legacy_summary.get("positive") or 0),
+                "negative": int(summary.get("negative") or 0) + int(legacy_summary.get("negative") or 0),
+                "total": int(summary.get("total") or 0) + int(legacy_summary.get("total") or 0),
+            }
+        versions.append({
+            **version,
+            "feedback": {
+                "positive": int(summary.get("positive") or 0),
+                "negative": int(summary.get("negative") or 0),
+                "total": int(summary.get("total") or 0),
+            },
+        })
+    return {"name": name, "versions": versions}
 
 
 class RestoreBody(BaseModel):
@@ -265,7 +471,13 @@ def restore_prompt_version(name: str, body: RestoreBody) -> dict[str, Any]:
         prompts.restore_version(name, body.version)
     except IndexError as error:
         raise HTTPException(400, str(error)) from error
-    return {"name": name, "version": body.version, "source": "override"}
+    revision = prompts.load_prompt_revision(name)
+    return {
+        "name": name,
+        "version": revision["version"],
+        "sha256": revision["sha256"],
+        "source": "override",
+    }
 
 
 @app.post("/api/runs")
@@ -379,6 +591,24 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                 dimensions_pdf = run_dir / f"{pdf_stem}_page{page_run.page_number}_dimensions_marked.pdf"
                 dimensions_json = run_dir / f"{pdf_stem}_page{page_run.page_number}_dimensions.json"
                 mapping = run_dimension_mapping(pdf_path, page_run.page_number, dimensions_pdf, dimensions_json)
+                with fitz.open(str(pdf_path)) as source_document:
+                    mapping["handwheels"] = _handwheel_details(
+                        source_document[page_run.page_number - 1],
+                        mapping,
+                    )
+                mapping["handwheel_edges"] = [
+                    {
+                        "id": item["edge_id"],
+                        "edge_kind": item.get("edge_kind"),
+                        "is_pipe_edge": item.get("is_pipe_edge", False),
+                        "handwheel_id": item["id"],
+                        "arrow_start": item.get("arrow_start"),
+                        "arrow_end": item.get("arrow_end"),
+                        "reason": item.get("edge_reason", "Привязка штурвала к существующему ребру."),
+                    }
+                    for item in mapping["handwheels"]
+                    if item.get("edge_id")
+                ]
                 preprocess_pdf = run_dir / f"{pdf_stem}_page{page_run.page_number}_preprocess_annotations.pdf"
                 save_preprocess_annotation_pdf(pdf_path, page_run.page_number, preprocess_pdf, mapping)
                 clean_markup_pdf = run_dir / f"{pdf_stem}_page{page_run.page_number}_clean_local_markup.pdf"
@@ -390,6 +620,7 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                 dimension_map_pdf = run_dir / f"{pdf_stem}_page{page_run.page_number}_dimension_map.pdf"
                 dimension_map_json = run_dir / f"{pdf_stem}_page{page_run.page_number}_dimension_map.json"
                 dimension_map = build_dimension_map(Path(pdf_path), page_run.page_number)
+                dimension_map["handwheels"] = mapping.get("handwheels", [])
                 dimension_map_json.write_text(json.dumps(dimension_map, ensure_ascii=False, indent=2), encoding="utf-8")
                 render_dimension_map(Path(pdf_path), page_run.page_number, dimension_map_pdf, dimension_map)
                 page_run.analysis = {"dimension_mapping": mapping, "dimension_map": dimension_map}
