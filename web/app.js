@@ -1,4 +1,4 @@
-const state = { document: null, runId: null, selected: new Set(), sourceMode: 'local', filesByLine: {}, tracesByLine: {}, graphsByLine: {}, selectedPage: {}, currentRun: null, feedback: {}, manualEdit: false, three: null, viewers3d: new Set() };
+const state = { document: null, runId: null, selected: new Set(), sourceMode: 'local', provider: 'deepseek', config: null, filesByLine: {}, tracesByLine: {}, graphsByLine: {}, selectedPage: {}, currentRun: null, feedback: {}, manualEdit: false, three: null, viewers3d: new Set() };
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 const esc = (value) => String(value ?? '').replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -7,7 +7,6 @@ const STAGE_LABELS = {
   prepare: 'Локальная подготовка + разметка',
   dimensions: 'Локальная подготовка + привязка размеров',
   dimension_review: 'Карта размеров + проверка провайдером',
-  analyze: 'Анализ у провайдера',
   done: 'Готово',
   error: 'Ошибка',
 };
@@ -25,157 +24,279 @@ async function api(path, options) {
 async function init() {
   try {
     const config = await api('/api/config');
-    const model = config.deepseek ? config.model : 'ключ DEEPSEEK_API_KEY не задан';
-    $('#api-status').textContent = config.deepseek ? ('API: ' + config.model) : 'API: ключ не задан';
-    $('#source-status').textContent = 'Провайдер: ' + model + (config.default_pdf ? ' · файл: ' + config.default_pdf : '');
+    state.config = config;
+    state.provider = config.default_provider || 'deepseek';
+    $('#provider-select').value = state.provider;
+    $('#source-status').textContent = (config.default_pdf ? 'Файл: ' + config.default_pdf : '');
+    renderProviderSettings(config);
   } catch (error) {
     $('#api-status').textContent = 'Ошибка API';
     $('#source-status').textContent = 'Бэкенд недоступен: ' + String(error.message || error);
   }
 }
 
-let promptsState = { list: [], current: null, selectionToken: 0 };
+function providerName(providerId, config) {
+  const provider = (config?.providers || []).find((item) => item.id === providerId);
+  return provider ? provider.label : providerId;
+}
+
+function renderProviderSettings(config) {
+  const codex = config.codex_cli || {};
+  updateCodexLoginStatus(codex);
+  $('#codex-login-panel').hidden = $('#provider-select').value !== 'codex_cli';
+  updateProviderConnectionStatus();
+}
+
+function updateCodexLoginStatus(status) {
+  if (state.config) state.config.codex_cli = status || {};
+  const node = $('#codex-login-status');
+  if (!status || !status.available) {
+    node.textContent = 'Codex CLI не найден';
+    node.className = 'badge error';
+    return;
+  }
+  if (status.logged_in) {
+    node.textContent = 'Codex CLI: вход выполнен';
+    node.className = 'badge ok';
+    return;
+  }
+  node.textContent = status.status || 'Codex CLI: нужен вход';
+  node.className = 'badge run';
+  updateProviderConnectionStatus();
+}
+
+function providerInfo(providerId) {
+  return (state.config?.providers || []).find((item) => item.id === providerId) || { id: providerId, label: providerId };
+}
+
+function isProviderConnected(providerId) {
+  const info = providerInfo(providerId);
+  if (providerId === 'deepseek') return Boolean(info.available || state.config?.deepseek);
+  if (providerId === 'codex_cli') return Boolean(info.available && (info.logged_in || state.config?.codex_cli?.logged_in));
+  return Boolean(info.available);
+}
+
+function updateProviderConnectionStatus() {
+  const selected = $('#provider-select').value || state.provider;
+  state.provider = selected;
+  const info = providerInfo(selected);
+  const connected = isProviderConnected(selected);
+  const apiDot = $('#api-dot');
+  apiDot.classList.toggle('ok', connected);
+  $('#api-status').textContent = connected ? ('Провайдер: ' + (info.label || selected)) : 'Провайдер не подключен';
+  const status = $('#provider-connection-status');
+  if (connected) {
+    status.innerHTML = '<span class="badge ok">Подключен</span><span class="muted"> ' + esc(info.label || selected) + (info.model ? ' · ' + esc(info.model) : '') + '</span>';
+  } else if (selected === 'deepseek') {
+    status.innerHTML = '<span class="badge error">Не подключен</span><p class="muted">Для DeepSeek нужен DEEPSEEK_API_KEY в .env или окружении.</p>';
+  } else if (selected === 'codex_cli') {
+    status.innerHTML = '<span class="badge error">Не подключен</span><p class="muted">Нужен вход в Codex CLI.</p>';
+  } else {
+    status.innerHTML = '<span class="badge error">Не подключен</span>';
+  }
+}
+
+async function refreshCodexLogin() {
+  try {
+    const status = await api('/api/providers/codex/status', { cache: 'no-store' });
+    updateCodexLoginStatus(status);
+    const info = providerInfo('codex_cli');
+    info.available = status.available;
+    info.logged_in = status.logged_in;
+    updateProviderConnectionStatus();
+  } catch (error) {
+    $('#codex-login-status').textContent = 'Ошибка проверки: ' + error.message;
+    $('#codex-login-status').className = 'badge error';
+    $('#codex-login-command').textContent = 'Для входа выполните в терминале:\n\ncodex login --device-auth\n\nПосле входа нажмите «Проверить вход».';
+    $('#codex-login-command').hidden = false;
+    updateProviderConnectionStatus();
+  }
+}
+
+function startCodexLogin() {
+  $('#codex-login-command').textContent = 'Для входа выполните в терминале:\n\ncodex login --device-auth\n\nПосле входа нажмите «Проверить вход».';
+  $('#codex-login-command').hidden = false;
+}
+
+const promptWorkspace = { list: [], activeName: null, active: null, versions: [], token: 0, busy: false };
+
+function promptFeedback(feedback) {
+  const data = feedback || {};
+  return '<span class="prompt-feedback prompt-feedback-up">↑ ' + Number(data.positive || 0) + '</span>'
+    + '<span class="prompt-feedback prompt-feedback-down">↓ ' + Number(data.negative || 0) + '</span>';
+}
 
 async function showPrompts() {
+  $('#prompt-section').hidden = false;
+  $('#runs-section').hidden = true;
+  $('#result-section').hidden = true;
+  $('#history-section').hidden = true;
+  $('#eval-section').hidden = true;
+  if (promptWorkspace.busy) return;
   try {
-    const list = await api('/api/prompts');
-    promptsState.list = list;
-    $('#prompt-section').hidden = false;
-    $('#runs-section').hidden = true;
-    $('#result-section').hidden = true;
-    $('#history-section').hidden = true;
-    renderPromptTabs(list);
-    if (!list.some(function (item) { return item.name === promptsState.current; })) {
-      promptsState.current = null;
+    promptWorkspace.list = await api('/api/prompts', { cache: 'no-store' });
+    if (!promptWorkspace.list.some((item) => item.name === promptWorkspace.activeName)) {
+      promptWorkspace.activeName = promptWorkspace.list[0]?.name || null;
     }
-    if (list.length && !promptsState.current) {
-      await selectPrompt(list[0].name);
-    } else if (promptsState.current) {
-      await selectPrompt(promptsState.current);
-    }
+    renderPromptCatalog();
+    if (promptWorkspace.activeName) await loadPromptWorkspace(promptWorkspace.activeName);
     $('#prompt-section').scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch (error) {
-    $('#prompt-status').textContent = 'Ошибка: ' + error.message;
+    setPromptStatus('Ошибка: ' + error.message, true);
   }
 }
 
-function renderPromptTabs(list) {
+function setPromptStatus(message, error = false) {
+  const node = $('#prompt-status');
+  node.textContent = message;
+  node.classList.toggle('error', error);
+}
+
+function setPromptBusy(busy) {
+  promptWorkspace.busy = busy;
+  $('.prompt-detail').setAttribute('aria-busy', String(busy));
+  $('#save-prompt').disabled = busy || !promptWorkspace.active;
+  $('#prompt-editor').disabled = busy || !promptWorkspace.active;
+  $$('#prompt-tabs button, #prompt-versions button').forEach((button) => { button.disabled = busy; });
+}
+
+function clearPromptDetails() {
+  promptWorkspace.active = null;
+  promptWorkspace.versions = [];
+  $('#prompt-active-title').textContent = promptWorkspace.list.find((item) => item.name === promptWorkspace.activeName)?.title || '';
+  $('#prompt-active-version').textContent = '…';
+  $('#prompt-active-source').textContent = '';
+  $('#prompt-active-sha').textContent = '';
+  $('#prompt-active-stats').replaceChildren();
+  $('#prompt-versions').replaceChildren();
+  $('#prompt-editor').value = '';
+}
+
+function applyPromptSnapshot(data) {
+  if (data.name !== promptWorkspace.activeName) return;
+  promptWorkspace.active = data;
+  promptWorkspace.versions = Array.isArray(data.versions) ? data.versions : [];
+  const item = promptWorkspace.list.find((entry) => entry.name === data.name);
+  if (item) Object.assign(item, { active_version: data.version, active_sha256: data.sha256 });
+  renderPromptCatalog();
+  renderActivePrompt();
+  renderPromptVersions();
+  setPromptStatus('Активна версия v' + data.version);
+}
+
+function renderPromptCatalog() {
   const container = $('#prompt-tabs');
-  container.innerHTML = '';
-  list.forEach(function (item) {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'prompt-picker-item' + (promptsState.current === item.name ? ' on' : '');
-    const selected = promptsState.current === item.name;
-    button.setAttribute('aria-selected', selected ? 'true' : 'false');
-    if (selected) {
-      button.style.background = '#a8d1b9';
-      button.style.border = '3px solid #167b59';
-      button.style.boxShadow = '0 0 0 3px rgba(22, 123, 89, .2)';
-    }
-    const feedback = item.feedback || {};
-    button.innerHTML = '<span class="prompt-tab-title">' + esc(item.title) + '</span>'
-      + '<span class="prompt-feedback prompt-feedback-up" title="Thumbs up">↑ ' + Number(feedback.positive || 0) + '</span>'
-      + '<span class="prompt-feedback prompt-feedback-down" title="Thumbs down">↓ ' + Number(feedback.negative || 0) + '</span>';
-    button.dataset.name = item.name;
-    button.addEventListener('click', function () { selectPrompt(item.name); });
-    container.appendChild(button);
+  $('#prompt-catalog-count').textContent = String(promptWorkspace.list.length);
+  container.innerHTML = promptWorkspace.list.map((item) => {
+    const active = item.name === promptWorkspace.activeName;
+    const version = item.active_version ?? 'default';
+    return '<button type="button" class="prompt-catalog-item' + (active ? ' is-active' : '') + '"'
+      + ' data-prompt-name="' + esc(item.name) + '" aria-selected="' + active + '">'
+      + '<span class="prompt-catalog-mark">' + (active ? '✓' : '') + '</span>'
+      + '<span class="prompt-catalog-copy"><b>' + esc(item.title || item.name) + '</b>'
+      + '<small>' + esc(item.name) + ' · v' + esc(version) + '</small></span>'
+      + '</button>';
+  }).join('') || '<div class="muted">Промпты не найдены</div>';
+  container.querySelectorAll('[data-prompt-name]').forEach((button) => {
+    button.addEventListener('click', () => loadPromptWorkspace(button.dataset.promptName));
   });
 }
 
-async function selectPrompt(name) {
-  promptsState.current = name;
-  const selectionToken = ++promptsState.selectionToken;
-  const item = promptsState.list.find(function (p) { return p.name === name; });
-  $('#prompt-tabs').querySelectorAll('.prompt-picker-item').forEach(function (button) {
-    const selected = button.dataset.name === name;
-    button.classList.toggle('on', selected);
-    button.setAttribute('aria-selected', selected ? 'true' : 'false');
-    button.style.background = selected ? '#a8d1b9' : '';
-    button.style.border = selected ? '3px solid #167b59' : '';
-    button.style.outline = selected ? '3px solid #167b59' : '';
-    button.style.outlineOffset = selected ? '2px' : '';
-    button.style.boxShadow = selected ? '0 0 0 3px rgba(22, 123, 89, .2)' : '';
-  });
-  try {
-    const data = await api('/api/prompts/' + name);
-    if (selectionToken !== promptsState.selectionToken) return;
-    $('#prompt-editor').value = data.text;
-      $('#prompt-active-title').textContent = data.title || (item ? item.title : name);
-      $('#prompt-active-version').textContent = data.version ?? 'default';
-      $('#prompt-active-sha').textContent = String(data.sha256 || '').slice(0, 16);
-      const activeFeedback = data.feedback || {};
-      $('#prompt-active-stats').innerHTML = '<span class="prompt-feedback prompt-feedback-up">↑ ' + Number(activeFeedback.positive || 0) + '</span>'
-        + '<span class="prompt-feedback prompt-feedback-down">↓ ' + Number(activeFeedback.negative || 0) + '</span>';
-    await loadPromptVersions(name, selectionToken);
-  } catch (error) {
-    $('#prompt-status').textContent = 'Ошибка: ' + error.message;
+function renderActivePrompt() {
+  const data = promptWorkspace.active;
+  if (!data) return;
+  $('#prompt-active-title').textContent = data.title || data.name;
+  $('#prompt-active-version').textContent = data.version ?? 'default';
+  $('#prompt-active-source').textContent = data.source || 'default';
+  $('#prompt-active-sha').textContent = String(data.sha256 || '').slice(0, 16);
+  const activeFeedback = data.active_feedback;
+  const promptTotal = data.prompt_feedback || {};
+  const legacy = data.unversioned_feedback || {};
+  $('#prompt-active-stats').innerHTML = '<div class="prompt-stat-card" data-stat-scope="version"><small>Текущая версия · v' + esc(data.version) + '</small><span>' + promptFeedback(activeFeedback) + '</span></div>'
+    + '<div class="prompt-stat-card" data-stat-scope="prompt"><small>Все версии промпта</small><span>' + promptFeedback(promptTotal) + '</span></div>'
+    + (Number(legacy.total || 0) > 0
+      ? '<div class="prompt-stat-card is-legacy"><small>Без версии</small><span>' + promptFeedback(legacy) + '</span></div>'
+      : '');
+  $('#prompt-editor').value = data.text || '';
+}
+
+function renderPromptVersions() {
+  const container = $('#prompt-versions');
+  const versions = Array.isArray(promptWorkspace.versions) ? promptWorkspace.versions : [];
+  if (!versions.length) {
+    container.innerHTML = '<div class="prompt-empty">История пока пуста</div>';
+    return;
   }
+  container.innerHTML = versions.map((version) => {
+    const safeVersion = version || {};
+    const active = Boolean(safeVersion.is_active);
+    const when = safeVersion.created_at ? new Date(safeVersion.created_at).toLocaleString('ru-RU') : 'Встроенная версия';
+    return '<article data-version="' + esc(safeVersion.version) + '" class="prompt-version' + (active ? ' is-current' : '') + '">'
+      + '<div class="prompt-version-main"><div class="prompt-version-title"><b>v' + esc(safeVersion.version) + '</b>'
+      + (active ? '<span class="prompt-current-version">ТЕКУЩАЯ</span>' : '') + '</div>'
+      + '<small>' + esc(when) + ' · ' + Number(safeVersion.length || 0) + ' символов</small></div>'
+      + '<div class="prompt-version-stats">' + promptFeedback(safeVersion.feedback) + '</div>'
+      + (active ? '<span class="prompt-version-lock">Активна</span>' : '<button type="button" class="prompt-use-button" data-use-version="' + esc(safeVersion.version) + '">Сделать текущей</button>')
+      + '</article>';
+  }).join('');
+  container.querySelectorAll('[data-use-version]').forEach((button) => {
+    button.addEventListener('click', () => usePromptVersion(Number(button.dataset.useVersion)));
+  });
 }
 
-async function loadPromptVersions(name, selectionToken) {
+async function loadPromptWorkspace(name) {
+  if (promptWorkspace.busy) return;
+  const token = ++promptWorkspace.token;
+  promptWorkspace.activeName = name;
+  clearPromptDetails();
+  renderPromptCatalog();
+  setPromptBusy(true);
+  setPromptStatus('Загрузка…');
   try {
-    const data = await api('/api/prompts/' + name + '/versions');
-    if (selectionToken != null && selectionToken !== promptsState.selectionToken) return;
-    const versions = data.versions || [];
-    const container = $('#prompt-versions');
-    if (!versions.length) {
-      container.innerHTML = '<p class="muted">Версий пока нет — сохраните промпт, чтобы появилась первая версия.</p>';
-      return;
-    }
-    container.innerHTML = versions.map(function (version) {
-      const when = version.created_at ? new Date(version.created_at).toLocaleString('ru-RU') : '';
-      const feedback = version.feedback || {};
-      return '<div class="version-row">'
-        + '<span class="mono">v' + version.version + '</span>'
-        + '<span class="muted">' + esc(when) + ' · ' + version.length + ' симв.</span>'
-        + '<span class="version-feedback"><span class="prompt-feedback prompt-feedback-up">↑ ' + Number(feedback.positive || 0) + '</span><span class="prompt-feedback prompt-feedback-down">↓ ' + Number(feedback.negative || 0) + '</span></span>'
-        + '<button type="button" class="prompt-use-button" data-use-version="' + version.version + '">Использовать</button>'
-        + '</div>';
-    }).join('');
-    container.querySelectorAll('[data-use-version]').forEach(function (button) {
-      button.addEventListener('click', function () { usePromptVersion(Number(button.dataset.useVersion)); });
-    });
+    const active = await api('/api/prompts/' + encodeURIComponent(name), { cache: 'no-store' });
+    if (token !== promptWorkspace.token) return;
+    applyPromptSnapshot(active);
   } catch (error) {
-    $('#prompt-versions').innerHTML = '<div class="badge error">' + esc(error.message) + '</div>';
+    if (token === promptWorkspace.token) setPromptStatus('Ошибка: ' + error.message, true);
+  } finally {
+    if (token === promptWorkspace.token) setPromptBusy(false);
   }
 }
 
 async function usePromptVersion(version) {
-  const name = promptsState.current;
-  if (!name) return;
+  const name = promptWorkspace.activeName;
+  if (!name || promptWorkspace.busy) return;
+  clearPromptDetails();
+  setPromptBusy(true);
+  setPromptStatus('Переключение версии…');
   try {
-    const restored = await api('/api/prompts/' + name + '/restore', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ version: version }),
+    const restored = await api('/api/prompts/' + encodeURIComponent(name) + '/restore', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ version }),
     });
-    const list = await api('/api/prompts');
-    promptsState.list = list;
-    renderPromptTabs(list);
-    await selectPrompt(name);
-    $('#prompt-status').textContent = 'Используется версия v' + (restored.version ?? version);
+    applyPromptSnapshot(restored);
   } catch (error) {
-    $('#prompt-status').textContent = 'Ошибка: ' + error.message;
+    setPromptStatus('Ошибка: ' + error.message, true);
+  } finally {
+    setPromptBusy(false);
   }
 }
 
 async function saveCurrentPrompt() {
-  const name = promptsState.current;
-  if (!name) return;
+  const name = promptWorkspace.activeName;
+  if (!name || promptWorkspace.busy || !promptWorkspace.active) return;
+  const text = $('#prompt-editor').value;
+  setPromptBusy(true);
+  setPromptStatus('Сохранение…');
   try {
-    await api('/api/prompts/' + name, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: $('#prompt-editor').value }),
+    const saved = await api('/api/prompts/' + encodeURIComponent(name), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }),
     });
-    $('#prompt-status').textContent = 'Сохранено — применяется к новым запросам';
-    const list = await api('/api/prompts');
-    promptsState.list = list;
-    renderPromptTabs(list);
-    await selectPrompt(name);
+    applyPromptSnapshot(saved);
+    setPromptStatus('Новая версия сохранена');
   } catch (error) {
-    $('#prompt-status').textContent = 'Ошибка: ' + error.message;
+    setPromptStatus('Ошибка: ' + error.message, true);
+  } finally {
+    setPromptBusy(false);
   }
 }
 
@@ -287,6 +408,13 @@ function parseExcludedPages(rawValue) {
 async function startAnalysis() {
   const lineIds = $$('#groups-list input:checked').map((item) => item.value);
   if (!lineIds.length) { alert('Выберите хотя бы одну линию'); return; }
+  if (!isProviderConnected($('#provider-select').value)) {
+    $('#provider-popover').hidden = false;
+    $('#provider-toggle').setAttribute('aria-expanded', 'true');
+    updateProviderConnectionStatus();
+    alert('Выбранный провайдер не подключен');
+    return;
+  }
   let excludedPages = [];
   try {
     excludedPages = parseExcludedPages($('#exclude-pages').value);
@@ -297,7 +425,7 @@ async function startAnalysis() {
   try {
     const response = await api('/api/runs', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ document_id: state.document.document_id, line_ids: lineIds, stop_stage: $('#stop-stage').value, excluded_pages: excludedPages }),
+      body: JSON.stringify({ document_id: state.document.document_id, line_ids: lineIds, stop_stage: $('#stop-stage').value, excluded_pages: excludedPages, provider: $('#provider-select').value }),
     });
     state.runId = response.run_id;
     $('#runs-section').hidden = false;
@@ -344,7 +472,7 @@ function renderRun(run) {
   $('#run-title').textContent = run.source_name;
   const running = run.status === 'running';
   $('#run-status').innerHTML = '<div class="muted">Прогон <code>' + esc(run.run_id) + '</code> · до этапа «' + esc(run.stop_stage) + '» · статус: <b>'
-    + esc(run.status) + '</b>' + (running ? ' <span class="spinner"></span>' : '') + '</div>';
+    + esc(run.status) + '</b> · провайдер: <b>' + esc(run.provider || run.model || '—') + '</b>' + (running ? ' <span class="spinner"></span>' : '') + '</div>';
   const container = $('#lines-progress');
   container.innerHTML = '';
   for (const line of run.lines) {
@@ -1104,8 +1232,8 @@ function bindFeedbackButtons(root) {
             item.classList.toggle('selected', item === button);
           });
           const prompts = await api('/api/prompts');
-          promptsState.list = prompts;
-          renderPromptTabs(prompts);
+          promptWorkspace.list = prompts;
+          if (!$('#prompt-section').hidden) renderPromptCatalog();
         } catch (error) {
           alert('Не удалось сохранить оценку: ' + error.message);
         } finally {
@@ -1158,6 +1286,7 @@ function renderResults(run) {
   $('#result-title').textContent = run.run_id;
   $('#export-json').href = '/api/runs/' + encodeURIComponent(run.run_id) + '/export/json';
   $('#export-excel').href = '/api/runs/' + encodeURIComponent(run.run_id) + '/export/excel';
+  $('#export-review-data').href = '/api/runs/' + encodeURIComponent(run.run_id) + '/export/review-data';
   const body = $('#result-body');
   const openProviderState = openProviderKeys(body);
   body.innerHTML = run.lines.map(function (line) {
@@ -1322,6 +1451,7 @@ async function showHistory() {
       const when = run.created_at ? new Date(run.created_at).toLocaleString('ru-RU') : '';
       const kindLabel = run.kind_label || run.stop_stage || '';
       const model = run.model ? ' · ' + run.model : '';
+      const provider = run.provider ? ' · ' + run.provider : '';
       const manual = Number(run.manual_adjustment_count || 0) ? ' · ручных правок: ' + run.manual_adjustment_count : '';
       const feedback = run.feedback || {};
       const feedbackStats = Number(feedback.total || 0)
@@ -1332,7 +1462,7 @@ async function showHistory() {
         + '<div class="row"><b>' + esc(run.source_name || '') + '</b> <span class="badge ' + badge + '">' + esc(run.status) + '</span>'
         + '<span class="badge kind">' + esc(kindLabel) + '</span>'
         + '<span class="group-item-meta">' + esc(when) + '</span></div>'
-        + '<div class="muted">' + esc(run.run_id) + ' · ' + (run.line_ids || []).map(esc).join(', ') + esc(model) + esc(manual) + feedbackStats + '</div>'
+        + '<div class="muted">' + esc(run.run_id) + ' · ' + (run.line_ids || []).map(esc).join(', ') + esc(provider) + esc(model) + esc(manual) + feedbackStats + '</div>'
         + (run.error_count ? '<div class="badge error">Ошибок: ' + run.error_count + '<br>' + run.errors.map(esc).join('<br>') + '</div>' : '')
         + '<button class="open-run" type="button" data-open-run="' + esc(run.run_id) + '">Открыть →</button>'
         + '</div>';
@@ -1380,6 +1510,11 @@ document.addEventListener('DOMContentLoaded', function () {
     } else if (event.target && event.target.id === 'image-lightbox') {
       $('#image-lightbox').hidden = true;
     }
+    const menu = $('#provider-menu');
+    if (menu && !menu.contains(event.target)) {
+      $('#provider-popover').hidden = true;
+      $('#provider-toggle').setAttribute('aria-expanded', 'false');
+    }
   });
   $('#pdf-file').addEventListener('change', function () {
     const file = $('#pdf-file').files[0];
@@ -1387,6 +1522,25 @@ document.addEventListener('DOMContentLoaded', function () {
   });
   $('#load-pdf').addEventListener('click', loadPdf);
   $('#start-analysis').addEventListener('click', startAnalysis);
+  $('#provider-toggle').addEventListener('click', function (event) {
+    event.stopPropagation();
+    const popover = $('#provider-popover');
+    popover.hidden = !popover.hidden;
+    $('#provider-toggle').setAttribute('aria-expanded', String(!popover.hidden));
+    updateProviderConnectionStatus();
+  });
+  $('#provider-popover').addEventListener('click', function (event) {
+    event.stopPropagation();
+  });
+  $('#provider-select').addEventListener('change', function () {
+    state.provider = $('#provider-select').value;
+    $('#codex-login-panel').hidden = state.provider !== 'codex_cli';
+    $('#codex-login-command').hidden = true;
+    updateProviderConnectionStatus();
+    if (state.provider === 'codex_cli') refreshCodexLogin();
+  });
+  $('#codex-login-check').addEventListener('click', refreshCodexLogin);
+  $('#codex-login-start').addEventListener('click', startCodexLogin);
   $('#history-button').addEventListener('click', showHistory);
   $('#prompts-button').addEventListener('click', showPrompts);
   $('#eval-button').addEventListener('click', showEval);

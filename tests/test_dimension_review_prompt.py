@@ -161,6 +161,36 @@ class DimensionRuleTests(unittest.TestCase):
                 page = doc[0]
                 self.assertGreater(len(page.get_drawings()), 0)
 
+    def test_clean_local_markup_pdf_marks_connection_boxes_when_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            source_pdf = tmp_path / "sample.pdf"
+            output_pdf = tmp_path / "clean_local_markup.pdf"
+            with fitz.open() as doc:
+                page = doc.new_page(width=200, height=200)
+                page.draw_line((30, 100), (170, 100), color=(0.1, 0.4, 0.9), width=2)
+                doc.save(source_pdf)
+
+            mapping = {
+                "vertices": [],
+                "dimensions": [],
+                "connections": [
+                    {
+                        "id": "CN-1",
+                        "label": "ПОДКЛЮЧЕНИЕ V-505",
+                        "bbox": [20, 30, 110, 50],
+                        "connection_type": "tie_in",
+                    }
+                ],
+            }
+
+            save_clean_local_markup_pdf(source_pdf, 1, output_pdf, mapping)
+
+            self.assertTrue(output_pdf.exists())
+            with fitz.open(str(output_pdf)) as doc:
+                page = doc[0]
+                self.assertGreater(len(page.get_drawings()), 0)
+
     def test_clean_local_markup_pdf_marks_shtrval_text_found_on_page(self) -> None:
         rects = _handwheel_text_rects([
             (40, 60, 100, 80, "ШТУРВАЛ", 0, 0, 0),

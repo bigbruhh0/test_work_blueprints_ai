@@ -6,6 +6,7 @@ import os
 import shutil
 import threading
 import uuid
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -28,8 +29,7 @@ from src.dimension_mapping import (
     save_preprocess_annotation_pdf,
     save_skeleton_pdf,
 )
-from src.distance_ai import call_distance_ai_trace
-from src.dimension_review import build_map_text, calculate_lengths, review_map_with_provider
+from src.dimension_review import build_map_text, calculate_lengths, codex_login_command, codex_login_status, review_map_with_provider
 from src.eval_data import aggregate_eval_results, evaluate_line_for_prompt, list_eval_groups, summarize_prompt_eval_rows
 from src.prepare_stage import run_prepare
 from scripts.build_dimension_map import build_map as build_dimension_map, render_pdf as render_dimension_map
@@ -44,7 +44,6 @@ load_dotenv(ROOT / ".env")
 PIPELINE_STEPS = [
     ("local_processing", "Локальная обработка"),
     ("dimension_review", "Карта размеров + проверка провайдером"),
-    ("analyze", "Анализ у провайдера"),
 ]
 
 # Расширяемый реестр конфигураций запуска. stop_stage -> ключ + человекочитаемая метка.
@@ -53,7 +52,6 @@ RUN_KIND_BY_STAGE = {
     "prepare": ("local_prepare", "Локальная обработка"),
     "dimensions": ("dimension_mapping", "Локальная обработка"),
     "dimension_review": ("dimension_review", "Карта размеров + проверка провайдером"),
-    "analyze": ("deepseek_analyze", "Анализ DeepSeek"),
 }
 ENV: dict[str, str] = {}
 app = FastAPI(title="Isometry Mark Pipeline")
@@ -92,12 +90,13 @@ class RunState:
     source_name: str
     pdf_path: str
     line_ids: list[str]
-    stop_stage: str = "analyze"
+    stop_stage: str = "dimension_review"
     status: str = "running"
     created_at: str = ""
     kind: str = ""
     kind_label: str = ""
     model: str = ""
+    provider: str = "deepseek"
     lines: dict[str, LineRun] = field(default_factory=dict)
 
 
@@ -121,17 +120,45 @@ def startup() -> None:
 
 @app.get("/")
 def index() -> FileResponse:
-    return FileResponse(WEB_DIR / "index.html")
+    return FileResponse(WEB_DIR / "index.html", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/config")
 def config() -> dict[str, Any]:
+    default_provider = ENV.get("AI_PROVIDER", "deepseek").strip().lower() or "deepseek"
+    if default_provider not in {"deepseek", "codex_cli"}:
+        default_provider = "deepseek"
+    codex_status = codex_login_status()
     return {
         "pipeline_steps": [{"id": key, "label": label} for key, label in PIPELINE_STEPS],
         "deepseek": bool(ENV.get("DEEPSEEK_API_KEY")),
         "model": ENV.get("DEEPSEEK_MODEL", "deepseek-flash"),
+        "default_provider": default_provider,
+        "providers": [
+            {"id": "deepseek", "label": "DeepSeek API", "available": bool(ENV.get("DEEPSEEK_API_KEY")), "model": ENV.get("DEEPSEEK_MODEL", "deepseek-flash")},
+            {"id": "codex_cli", "label": "Codex CLI", "available": bool(codex_status.get("available")), "logged_in": bool(codex_status.get("logged_in")), "model": ENV.get("CODEX_CLI_MODEL", "default")},
+        ],
+        "codex_cli": codex_status,
         "default_pdf": DEFAULT_PDF.name if DEFAULT_PDF.exists() else "",
     }
+
+
+@app.get("/api/providers/codex/status")
+def codex_provider_status() -> dict[str, Any]:
+    return codex_login_status()
+
+
+@app.post("/api/providers/codex/login")
+def codex_provider_login() -> dict[str, Any]:
+    status = codex_login_status()
+    if status.get("logged_in"):
+        return {"status": status, "command": "", "note": "Codex CLI уже авторизован."}
+    return {"status": status, **codex_login_command()}
+
+
+@app.get("/api/providers/codex/login")
+def codex_provider_login_info() -> dict[str, Any]:
+    return codex_provider_login()
 
 
 class LoadPdfBody(BaseModel):
@@ -192,33 +219,73 @@ def _group(document: dict[str, Any], line_id: str):
 class AnalyzeBody(BaseModel):
     document_id: str
     line_ids: list[str]
-    stop_stage: str = "analyze"
+    stop_stage: str = "dimension_review"
     excluded_pages: list[int] = []
+    provider: str = "deepseek"
+
+
+def _versioned_prompt_feedback_summary() -> list[dict[str, Any]]:
+    """Resolve legacy feedback to a prompt revision by exact prompt-text hash."""
+    from src import prompts
+
+    grouped: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
+    for row in run_db.feedback_rows():
+        prompt_name = row.get("prompt_name")
+        revision = prompts.resolve_recorded_revision(
+            prompt_name, row.get("prompt_version"), row.get("prompt_sha256"),
+            (row.get("context") or {}).get("prompt"),
+        ) if prompt_name else {}
+        prompt_version = revision.get("version")
+        prompt_sha256 = revision.get("sha256")
+        key = (prompt_name, prompt_version, prompt_sha256)
+        summary = grouped.setdefault(key, {
+            "prompt_name": prompt_name,
+            "prompt_version": prompt_version,
+            "prompt_sha256": prompt_sha256,
+            "positive": 0,
+            "negative": 0,
+            "total": 0,
+        })
+        summary["positive" if row.get("rating") == "up" else "negative"] += 1
+        summary["total"] += 1
+    return list(grouped.values())
+
+
+def _prompt_feedback_counts(
+    rows: list[dict[str, Any]], name: str, revision: dict[str, Any] | None = None,
+    *, unversioned: bool = False,
+) -> dict[str, int]:
+    matching = [row for row in rows if row.get("prompt_name") == name]
+    if revision is not None:
+        matching = [row for row in matching
+                    if str(row.get("prompt_version")) == str(revision.get("version"))
+                    and row.get("prompt_sha256") == revision.get("sha256")]
+    elif unversioned:
+        matching = [row for row in matching
+                    if row.get("prompt_version") in (None, "", "unversioned")
+                    or not row.get("prompt_sha256")]
+    positive = sum(int(row.get("positive") or 0) for row in matching)
+    negative = sum(int(row.get("negative") or 0) for row in matching)
+    return {"positive": positive, "negative": negative, "total": positive + negative}
 
 
 @app.get("/api/prompts")
 def list_prompts() -> list[dict[str, Any]]:
     from src import prompts
 
-    summary = {
-        (item.get("prompt_name"), item.get("prompt_version"), item.get("prompt_sha256")): item
-        for item in run_db.feedback_summary()
-    }
+    summary_rows = _versioned_prompt_feedback_summary()
     output = []
     for item in prompts.list_prompts():
         active = prompts.load_prompt_revision(item["name"])
-        active_key = (item["name"], str(active.get("version")), active.get("sha256"))
-        active_row = summary.get(active_key, {})
-        legacy_row = summary.get((item["name"], None, None), {})
-        positive = int(active_row.get("positive") or 0) + int(legacy_row.get("positive") or 0)
-        negative = int(active_row.get("negative") or 0) + int(legacy_row.get("negative") or 0)
+        active_feedback = _prompt_feedback_counts(summary_rows, item["name"], active)
         output.append({
             **item,
-            "feedback": {
-                "positive": positive,
-                "negative": negative,
-                "total": positive + negative,
-            },
+            "active_version": active.get("version", "default"),
+            "active_sha256": active.get("sha256", ""),
+            "feedback": active_feedback,
+            "active_feedback": active_feedback,
+            "prompt_feedback": _prompt_feedback_counts(summary_rows, item["name"]),
+            "unversioned_feedback": _prompt_feedback_counts(summary_rows, item["name"], unversioned=True),
         })
     return output
 
@@ -243,6 +310,25 @@ class ManualStatusBody(BaseModel):
     status: str
 
 
+def _feedback_revision(page: dict[str, Any]) -> dict[str, Any]:
+    from src import prompts
+
+    trace = page.get("provider_trace") or {}
+    revision = page.get("prompt_revision") or {}
+    version = revision.get("version")
+    if version is None:
+        version = trace.get("prompt_version")
+    resolved = prompts.resolve_recorded_revision(
+        revision.get("name") or trace.get("prompt_name") or "dimension_review",
+        version, revision.get("sha256") or trace.get("prompt_sha256"), trace.get("prompt"),
+    )
+    return {
+        "prompt_name": resolved["name"],
+        "prompt_version": resolved["version"],
+        "prompt_sha256": resolved["sha256"],
+    }
+
+
 @app.post("/api/feedback")
 def save_analysis_feedback(body: FeedbackBody) -> dict[str, Any]:
     if body.rating not in {"up", "down"}:
@@ -261,7 +347,6 @@ def save_analysis_feedback(body: FeedbackBody) -> dict[str, Any]:
         raise HTTPException(400, "Оценка доступна только после этапа провайдера")
     decision = next((item for item in (review.get("answer") or {}).get("candidate_decisions", []) if item.get("candidate_id") == body.candidate_id), {})
     trace = page.get("provider_trace") or {}
-    revision = page.get("prompt_revision") or {}
     context = {
         "source_name": run.get("source_name"),
         "dimension": dimension,
@@ -277,16 +362,17 @@ def save_analysis_feedback(body: FeedbackBody) -> dict[str, Any]:
         "page_number": body.page_number,
         "candidate_id": body.candidate_id,
         "rating": body.rating,
-        "prompt_name": revision.get("name") or trace.get("prompt_name") or "dimension_review",
-        "prompt_version": revision.get("version") or trace.get("prompt_version"),
-        "prompt_sha256": revision.get("sha256") or trace.get("prompt_sha256"),
+        **_feedback_revision(page),
         "context": context,
     })
 
 
 @app.get("/api/feedback")
 def list_analysis_feedback(prompt_name: str | None = None) -> dict[str, Any]:
-    return {"rows": run_db.feedback_rows(prompt_name), "summary": run_db.feedback_summary()}
+    summary = _versioned_prompt_feedback_summary()
+    if prompt_name:
+        summary = [row for row in summary if row.get("prompt_name") == prompt_name]
+    return {"rows": run_db.feedback_rows(prompt_name), "summary": summary}
 
 
 @app.post("/api/manual-status")
@@ -324,16 +410,13 @@ def update_manual_status(body: ManualStatusBody) -> dict[str, Any]:
     analysis["dimension_review"] = review
     page["analysis"] = analysis
     trace = page.get("provider_trace") or {}
-    revision = page.get("prompt_revision") or {}
     run_db.save_feedback({
         "run_id": body.run_id,
         "line_id": body.line_id,
         "page_number": body.page_number,
         "candidate_id": body.candidate_id,
         "rating": "down",
-        "prompt_name": revision.get("name") or trace.get("prompt_name") or "dimension_review",
-        "prompt_version": revision.get("version") or trace.get("prompt_version"),
-        "prompt_sha256": revision.get("sha256") or trace.get("prompt_sha256"),
+        **_feedback_revision(page),
         "context": {
             "source_name": run.get("source_name"),
             "manual_adjustment": manual_adjustments[body.candidate_id],
@@ -364,27 +447,8 @@ def get_prompt(name: str) -> dict[str, Any]:
     if name not in prompts.PROMPT_REGISTRY:
         raise HTTPException(404, "Промпт не найден")
     revision = prompts.load_prompt_revision(name)
-    feedback_rows = run_db.feedback_summary()
-    active_row = next(
-        (
-            item for item in feedback_rows
-            if item.get("prompt_name") == name
-            and str(item.get("prompt_version")) == str(revision.get("version"))
-            and item.get("prompt_sha256") == revision.get("sha256")
-        ),
-        {},
-    )
-    legacy_row = next(
-        (
-            item for item in feedback_rows
-            if item.get("prompt_name") == name
-            and not item.get("prompt_version")
-            and not item.get("prompt_sha256")
-        ),
-        {},
-    )
-    positive = int(active_row.get("positive") or 0) + int(legacy_row.get("positive") or 0)
-    negative = int(active_row.get("negative") or 0) + int(legacy_row.get("negative") or 0)
+    feedback_rows = _versioned_prompt_feedback_summary()
+    active_feedback = _prompt_feedback_counts(feedback_rows, name, revision)
     return {
         "name": name,
         "title": prompts.PROMPT_REGISTRY[name].get("title", name),
@@ -392,18 +456,22 @@ def get_prompt(name: str) -> dict[str, Any]:
         "version": revision["version"],
         "sha256": revision["sha256"],
         "text": revision["text"],
-        "feedback": {"positive": positive, "negative": negative, "total": positive + negative},
+        "feedback": active_feedback,
+        "active_feedback": active_feedback,
+        "prompt_feedback": _prompt_feedback_counts(feedback_rows, name),
+        "unversioned_feedback": _prompt_feedback_counts(feedback_rows, name, unversioned=True),
+        "versions": _prompt_version_rows(name, revision, feedback_rows),
     }
 
 
 @app.post("/api/prompts/{name}")
-def save_prompt(name: str, body: PromptBody) -> dict[str, str]:
+def save_prompt(name: str, body: PromptBody) -> dict[str, Any]:
     from src import prompts
 
     if name not in prompts.PROMPT_REGISTRY:
         raise HTTPException(404, "Промпт не найден")
     prompts.save_prompt(name, body.text)
-    return {"name": name, "source": "override"}
+    return get_prompt(name)
 
 
 @app.post("/api/prompts/{name}/reset")
@@ -418,43 +486,46 @@ def reset_prompt(name: str) -> dict[str, str]:
 
 @app.get("/api/prompts/{name}/versions")
 def list_prompt_versions(name: str) -> dict[str, Any]:
+    snapshot = get_prompt(name)
+    return {key: snapshot[key] for key in ("name", "versions", "unversioned_feedback")}
+
+
+def _prompt_version_rows(
+    name: str, active_revision: dict[str, Any], feedback_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     from src import prompts
 
-    if name not in prompts.PROMPT_REGISTRY:
-        raise HTTPException(404, "Промпт не найден")
-    summaries = {
-        (str(item.get("prompt_version")), item.get("prompt_sha256")): item
-        for item in run_db.feedback_summary()
-        if item.get("prompt_name") == name
-    }
-    active_revision = prompts.load_prompt_revision(name)
-    legacy_summary = next(
-        (
-            item for item in run_db.feedback_summary()
-            if item.get("prompt_name") == name
-            and not item.get("prompt_version")
-            and not item.get("prompt_sha256")
-        ),
-        None,
-    )
+    stored_versions = prompts.list_versions(name)
+    active_key = (str(active_revision.get("version", "default")), active_revision.get("sha256"))
+
     versions = []
-    for version in prompts.list_versions(name):
-        summary = summaries.get((str(version.get("version")), version.get("sha256")), {})
-        if version.get("version") == active_revision.get("version") and legacy_summary:
-            summary = {
-                "positive": int(summary.get("positive") or 0) + int(legacy_summary.get("positive") or 0),
-                "negative": int(summary.get("negative") or 0) + int(legacy_summary.get("negative") or 0),
-                "total": int(summary.get("total") or 0) + int(legacy_summary.get("total") or 0),
-            }
+    if not any(
+        (str(version.get("version")), version.get("sha256")) == active_key
+        for version in stored_versions
+    ):
+        active_feedback = _prompt_feedback_counts(feedback_rows, name, active_revision)
+        active_text = str(active_revision.get("text") or "")
+        versions.append({
+            "version": active_revision.get("version", "default"),
+            "created_at": "",
+            "preview": active_text[:80],
+            "length": len(active_text),
+            "sha256": active_revision.get("sha256", ""),
+            "source": active_revision.get("source", "default"),
+            "is_active": True,
+            "feedback": active_feedback,
+        })
+
+    for version in stored_versions:
         versions.append({
             **version,
-            "feedback": {
-                "positive": int(summary.get("positive") or 0),
-                "negative": int(summary.get("negative") or 0),
-                "total": int(summary.get("total") or 0),
-            },
+            "is_active": (
+                str(version.get("version")) == str(active_revision.get("version"))
+                and version.get("sha256") == active_revision.get("sha256")
+            ),
+            "feedback": _prompt_feedback_counts(feedback_rows, name, version),
         })
-    return {"name": name, "versions": versions}
+    return versions
 
 
 class RestoreBody(BaseModel):
@@ -471,13 +542,7 @@ def restore_prompt_version(name: str, body: RestoreBody) -> dict[str, Any]:
         prompts.restore_version(name, body.version)
     except IndexError as error:
         raise HTTPException(400, str(error)) from error
-    revision = prompts.load_prompt_revision(name)
-    return {
-        "name": name,
-        "version": revision["version"],
-        "sha256": revision["sha256"],
-        "source": "override",
-    }
+    return get_prompt(name)
 
 
 @app.post("/api/runs")
@@ -485,11 +550,14 @@ def create_run(body: AnalyzeBody) -> dict[str, Any]:
     document = STATE["documents"].get(body.document_id)
     if not document:
         raise HTTPException(404, "Документ не найден")
-    stop_stage = (body.stop_stage or "analyze").strip().lower()
-    if stop_stage not in {"local_processing", "prepare", "dimensions", "dimension_review", "analyze"}:
-        raise HTTPException(400, "stop_stage: local_processing|dimension_review|analyze")
+    stop_stage = (body.stop_stage or "dimension_review").strip().lower()
+    if stop_stage not in {"local_processing", "prepare", "dimensions", "dimension_review"}:
+        raise HTTPException(400, "stop_stage: local_processing|dimension_review")
     if stop_stage in {"prepare", "dimensions"}:
         stop_stage = "local_processing"
+    provider = (body.provider or ENV.get("AI_PROVIDER", "deepseek") or "deepseek").strip().lower()
+    if provider not in {"deepseek", "codex_cli"}:
+        raise HTTPException(400, "provider: deepseek|codex_cli")
     run_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     kind, kind_label = RUN_KIND_BY_STAGE.get(stop_stage, (stop_stage, stop_stage))
     excluded_pages = set()
@@ -510,7 +578,8 @@ def create_run(body: AnalyzeBody) -> dict[str, Any]:
         created_at=now(),
         kind=kind,
         kind_label=kind_label,
-        model=ENV.get("DEEPSEEK_MODEL", "deepseek-flash"),
+        model=ENV.get("CODEX_CLI_MODEL", "codex_cli_default") if provider == "codex_cli" else ENV.get("DEEPSEEK_MODEL", "deepseek-flash"),
+        provider=provider,
     )
     for line_id in body.line_ids:
         group = _group(document, line_id)
@@ -524,12 +593,13 @@ def create_run(body: AnalyzeBody) -> dict[str, Any]:
     run_db.save_run(run_dict(run))
     context = {
         "api_key": ENV.get("DEEPSEEK_API_KEY", ""),
-        "model": ENV.get("DEEPSEEK_MODEL", "deepseek-flash"),
+        "model": run.model,
+        "provider": provider,
         "document": document,
         "run": run,
     }
     threading.Thread(target=_run_pipeline, args=(run_id, context), daemon=True).start()
-    return {"run_id": run_id, "status": "running", "stop_stage": stop_stage, "line_ids": body.line_ids}
+    return {"run_id": run_id, "status": "running", "stop_stage": stop_stage, "line_ids": body.line_ids, "provider": provider}
 
 
 def _persist(run: RunState) -> None:
@@ -541,6 +611,7 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
     document = context["document"]
     api_key = context["api_key"]
     model = context["model"]
+    provider = context.get("provider", "deepseek")
     stop_stage = run.stop_stage
     pdf_path = document["pdf_path"]
     max_workers = max(1, int(os.getenv("PIPELINE_WORKERS", "4")))
@@ -647,6 +718,7 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                         model,
                         pdf_path=review_pdf_path,
                         page_number=page_run.page_number,
+                        provider=provider,
                     )
                     review = review_trace["answer"]
                     page_run.analysis["dimension_review"] = {
@@ -661,9 +733,19 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                         "response_raw": review_trace["response_raw"],
                         "answer": review,
                         "model": review_trace["model"],
+                        "provider": review_trace.get("provider", provider),
                         "prompt_name": "dimension_review",
+                        "prompt_version": review_trace["prompt_version"],
+                        "prompt_sha256": review_trace["prompt_sha256"],
+                        "prompt_source": review_trace["prompt_source"],
                     }
-                    eval_result = evaluate_line_for_prompt(line.line_id, "dimension_review", review)
+                    page_run.prompt_revision = {
+                        "name": "dimension_review",
+                        "version": review_trace["prompt_version"],
+                        "sha256": review_trace["prompt_sha256"],
+                        "source": review_trace["prompt_source"],
+                    }
+                    eval_result = evaluate_line_for_prompt(line.line_id, "dimension_review", review, sheet=page_run.page_number)
                     if eval_result:
                         page_run.analysis["dimension_review"]["eval"] = aggregate_eval_results([
                             result for group_result in eval_result.values() for result in [group_result]
@@ -676,43 +758,7 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                 _persist(run)
                 return
 
-            page_run.stage = "analyze"
-            page_run.status = "running"
-            page_run.events.append({"time": now(), "stage": "analyze", "message": "запрос к анализатору"})
-            _persist(run)
-            if not api_key:
-                raise RuntimeError("DEEPSEEK_API_KEY не задан в .env")
-            trace = call_distance_ai_trace(
-                api_key=api_key,
-                model=model,
-                vertices=prepare.vertices,
-                numbers=prepare.numbers,
-                coordinates=prepare.coordinates,
-                event_callback=lambda name, payload: page_run.events.append({"time": now(), "stage": "analyze", "message": f"{name}: {payload}"}),
-            )
-            page_run.analysis = trace["answer"]
-            page_run.provider_trace = {
-                "prompt": trace["prompt"],
-                "payload": trace["payload"],
-                "response_raw": trace["response_raw"],
-                "status_code": trace["status_code"],
-                "elapsed_seconds": trace["elapsed_seconds"],
-                "model": trace["model"],
-                "prompt_name": trace.get("prompt_name", "analyze"),
-                "prompt_version": trace.get("prompt_version", "default"),
-                "prompt_source": trace.get("prompt_source", "default"),
-                "prompt_sha256": trace.get("prompt_sha256", ""),
-            }
-            page_run.prompt_revision = {
-                "name": trace.get("prompt_name", "analyze"),
-                "version": trace.get("prompt_version", "default"),
-                "source": trace.get("prompt_source", "default"),
-                "sha256": trace.get("prompt_sha256", ""),
-            }
-            page_run.stage = "done"
-            page_run.status = "complete"
-            page_run.events.append({"time": now(), "stage": "done", "message": f"main_chain: {(trace['answer'].get('main_chain') or {}).get('path')}"})
-            _persist(run)
+            raise RuntimeError(f"Неизвестный этап анализа: {stop_stage}")
         except Exception as error:  # noqa: BLE001
             page_run.status = "error"
             page_run.error = str(error)
@@ -749,18 +795,21 @@ def _eval_history_rows() -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for run in run_db.list_runs():
         for line in run.get("lines", []):
+            line_id = str(line.get("line_id") or "")
             for page in line.get("page_results", []):
                 review = (page.get("analysis") or {}).get("dimension_review")
                 if not isinstance(review, dict):
                     continue
-                eval_summary = review.get("eval")
-                if not isinstance(eval_summary, dict):
+                answer = review.get("answer")
+                if not isinstance(answer, dict):
                     continue
-                for group_id, stats in eval_summary.items():
-                    if not isinstance(stats, dict):
-                        continue
-                    row = {"group_id": group_id, "prompt_name": stats.get("prompt_name") or "dimension_review", **stats}
-                    rows.append(row)
+                eval_result = evaluate_line_for_prompt(
+                    line_id,
+                    "dimension_review",
+                    answer,
+                    sheet=page.get("page_number"),
+                )
+                rows.extend(eval_result.values())
     return rows
 
 
@@ -817,11 +866,30 @@ def list_runs() -> list[dict[str, Any]]:
 def get_run(run_id: str) -> dict[str, Any]:
     run = STATE["runs"].get(run_id)
     if run:
-        return run_dict(run)
+        return _with_current_eval(run_dict(run))
     persisted = run_db.load_run(run_id)
     if not persisted:
         raise HTTPException(404, "Прогон не найден")
-    return persisted
+    return _with_current_eval(persisted)
+
+
+def _with_current_eval(run: dict[str, Any]) -> dict[str, Any]:
+    for line in run.get("lines", []):
+        line_id = str(line.get("line_id") or "")
+        for page in line.get("page_results", []):
+            review = ((page.get("analysis") or {}).get("dimension_review") or {})
+            answer = review.get("answer")
+            if not isinstance(answer, dict):
+                continue
+            eval_result = evaluate_line_for_prompt(
+                line_id,
+                "dimension_review",
+                answer,
+                sheet=page.get("page_number"),
+            )
+            if eval_result:
+                review["eval"] = aggregate_eval_results(list(eval_result.values()))
+    return run
 
 
 def _run_export_rows(run: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
@@ -896,6 +964,7 @@ def export_run_excel(run_id: str) -> StreamingResponse:
             "source_name": run.get("source_name"),
             "status": run.get("status"),
             "created_at": run.get("created_at"),
+            "provider": run.get("provider"),
             "model": run.get("model"),
             "stop_stage": run.get("stop_stage"),
         }]).to_excel(writer, sheet_name="Сводка", index=False)
@@ -903,6 +972,74 @@ def export_run_excel(run_id: str) -> StreamingResponse:
             pd.DataFrame(rows or [{"status": "Нет данных"}]).to_excel(writer, sheet_name=sheet, index=False)
     output.seek(0)
     return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f'attachment; filename="{run_id}.xlsx"'})
+
+
+@app.get("/api/runs/{run_id}/export/review-data")
+def export_review_data(run_id: str) -> StreamingResponse:
+    run = get_run(run_id)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for line in run.get("lines", []):
+            line_id = str(line.get("line_id") or "line")
+            for page in line.get("page_results", []):
+                page_number = page.get("page_number") or "page"
+                prefix = "_".join([
+                    _safe_export_part(line_id),
+                    f"лист{_safe_export_part(page_number)}",
+                ])
+                files = page.get("files") or {}
+                markup_name = files.get("clean_local_markup_pdf")
+                markup_path = ARTIFACTS_DIR / run_id / line_id / markup_name if markup_name else None
+                if markup_path and markup_path.exists():
+                    images = pdf_pages_to_png(markup_path, max_pages=1, zoom=1.6)
+                    if images:
+                        archive.writestr(f"{prefix}_локальная-разметка_{timestamp}.png", images[0])
+                    else:
+                        archive.writestr(f"{prefix}_локальная-разметка-missing_{timestamp}.txt", "Не удалось отрисовать PDF разметки в PNG.")
+                else:
+                    archive.writestr(f"{prefix}_локальная-разметка-missing_{timestamp}.txt", "Файл локальной разметки не найден.")
+
+                review = ((page.get("analysis") or {}).get("dimension_review") or {})
+                trace = page.get("provider_trace") or {}
+                answer_payload = {
+                    "run_id": run_id,
+                    "group": line_id,
+                    "page_number": page_number,
+                    "prompt_revision": page.get("prompt_revision"),
+                    "model": trace.get("model") or review.get("model"),
+                    "answer": review.get("answer"),
+                    "lengths": review.get("lengths"),
+                    "eval": review.get("eval"),
+                    "response_raw": trace.get("response_raw"),
+                }
+                archive.writestr(
+                    f"{prefix}_ответ-провайдера_{timestamp}.json",
+                    json.dumps(answer_payload, ensure_ascii=False, indent=2),
+                )
+                payload_data = {
+                    "run_id": run_id,
+                    "group": line_id,
+                    "page_number": page_number,
+                    "payload": trace.get("payload"),
+                }
+                archive.writestr(
+                    f"{prefix}_payload_{timestamp}.json",
+                    json.dumps(payload_data, ensure_ascii=False, indent=2),
+                )
+    output.seek(0)
+    filename = f"{run_id}_review_data_{timestamp}.zip"
+    return StreamingResponse(
+        output,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+def _safe_export_part(value: Any) -> str:
+    text = str(value or "").strip()
+    safe = "".join(char if char.isalnum() or char in {"_", "-"} else "_" for char in text)
+    return safe.strip("_") or "item"
 
 
 def run_dict(run: RunState) -> dict[str, Any]:
@@ -913,6 +1050,7 @@ def run_dict(run: RunState) -> dict[str, Any]:
         "kind": run.kind,
         "kind_label": run.kind_label,
         "model": run.model,
+        "provider": run.provider,
         "status": run.status,
         "source_name": run.source_name,
         "line_ids": run.line_ids,

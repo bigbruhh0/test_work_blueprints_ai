@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import re
 import time
 from dataclasses import fields
 from abc import ABC, abstractmethod
@@ -32,7 +33,7 @@ from .models import (
     Uncertainty,
     VertexMark,
 )
-from .dimension_mapping import _handwheel_details
+from .dimension_mapping import _connection_rows_from_page, _handwheel_details
 from .route_reconstruction import extract_local_vertices
 
 
@@ -71,6 +72,101 @@ def _candidate_center(candidate: Candidate) -> tuple[float, float]:
         (candidate.bbox[0] + candidate.bbox[2]) / 2.0,
         (candidate.bbox[1] + candidate.bbox[3]) / 2.0,
     )
+
+
+def _extract_sheet_number(text: str) -> str | None:
+    if not text:
+        return None
+    patterns = (
+        r"(?:ЛИСТ|SHEET)\s*[:№]?\s*(\d+)",
+        r"(?:SEE\s+SHEET|CONTINUATION)\s*(?:[A-Z0-9\-_/]+\s+)?(\d+)",
+        r"(?:ЛИСТ|SHEET)\s*[:№]?\s*(?:№\s*)?(\d+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE | re.UNICODE)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _connection_classify(text: str) -> tuple[str, str | None, bool]:
+    normalized = (text or "").strip()
+    if not normalized:
+        return "other", None, False
+    upper = normalized.upper()
+    tie_in_keywords = (
+        "ПОДКЛЮЧЕНИЕ",
+        "ПОДСОЕДИНЕНИЕ",
+        "ВРЕЗКА",
+        "TIE-IN",
+        "TIE IN",
+        "CONNECTION",
+    )
+    if any(keyword in upper for keyword in tie_in_keywords):
+        return "tie_in", None, False
+    sheet_number = _extract_sheet_number(normalized)
+    if sheet_number is not None:
+        return "continuation", sheet_number, True
+    continuation_keywords = (
+        "СМ.",
+        "СМ ",
+        "SEE SHEET",
+        "SEE SHEET ",
+        "CONTINUATION",
+        "ЛИСТ",
+        "SHEET",
+    )
+    has_sheet_hint = any(keyword in upper for keyword in continuation_keywords)
+    if has_sheet_hint:
+        return "other", None, True
+    return "other", None, False
+
+
+def _find_connection_rows(
+    candidates: list[Candidate],
+    vertices: list[VertexMark],
+) -> list[dict[str, Any]]:
+    """Найти метки вида 'ПОДКЛЮЧЕНИЕ ...' и 'СМ. ... ЛИСТ N'."""
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate.zone != "drawing":
+            continue
+        label = (candidate.text or "").strip()
+        if not label:
+            continue
+        connection_type, target_sheet, has_sheet_hint = _connection_classify(label)
+        if connection_type == "other" and not has_sheet_hint and not any(
+            keyword in (label or "").upper() for keyword in ("ПОДКЛЮЧЕНИЕ", "ВРЕЗКА", "TIE-IN", "TIE IN", "СМ.", "SEE SHEET", "CONTINUATION", "ЛИСТ", "SHEET")
+        ):
+            continue
+        cx, cy = _candidate_center(candidate)
+        nearest_vertex = None
+        nearest_distance = None
+        for vertex in vertices:
+            if vertex.page != candidate.page:
+                continue
+            dist = ((vertex.x - cx) ** 2 + (vertex.y - cy) ** 2) ** 0.5
+            if nearest_distance is None or dist < nearest_distance:
+                nearest_distance = dist
+                nearest_vertex = vertex
+        row = {
+            "id": f"CN-{candidate.id}",
+            "page": candidate.page,
+            "label": label,
+            "bbox": [round(value, 2) for value in candidate.bbox],
+            "center": [round(cx, 2), round(cy, 2)],
+            "connection_type": connection_type,
+            "vertex_id": nearest_vertex.id if nearest_vertex is not None else None,
+            "target_sheet": target_sheet,
+            "text_has_sheet_ref": has_sheet_hint,
+        }
+        row_id = f"{candidate.page}:{candidate.id}"
+        if row_id in seen:
+            continue
+        seen.add(row_id)
+        rows.append(row)
+    return rows
 
 
 def _handwheel_row_from_candidate(
@@ -833,6 +929,36 @@ class DeepSeekAIClient(AIClient):
         ]
         known_vertex_rows = self._known_vertex_rows_for_group(group, candidates)
         handwheel_rows = self._handwheel_payload_rows(group, candidates)
+        connection_rows = []
+        if self.pdf_path:
+            try:
+                vertices_by_page: dict[int, list[dict[str, Any]]] = {}
+                for vertex in known_vertex_rows:
+                    vertices_by_page.setdefault(int(vertex["page"]), []).append(vertex)
+                with pymupdf.open(str(self.pdf_path)) as document:
+                    for page_info in group.pages:
+                        connection_rows.extend(
+                            _connection_rows_from_page(
+                                document[page_info.page_number - 1],
+                                page_info.page_number,
+                                vertices_by_page.get(page_info.page_number, []),
+                            )
+                        )
+            except (OSError, IndexError, ValueError):
+                connection_rows = []
+        if not connection_rows:
+            connection_rows = _find_connection_rows(candidates, [
+                VertexMark(
+                    id=item["id"],
+                    line_id=group.line_id,
+                    page=item["page"],
+                    label=item["label"],
+                    role="unknown",
+                    x=item["x"],
+                    y=item["y"],
+                )
+                for item in known_vertex_rows
+            ])
         return f"""
 Ты анализируешь один или несколько листов изометрического чертежа трубопровода.
 
@@ -902,6 +1028,9 @@ class DeepSeekAIClient(AIClient):
 
 Подтвержденные штурвалы/рукоятки/маховики, найденные по ключевым словам и привязке к ближайшей вершине/оси:
 {json.dumps(handwheel_rows, ensure_ascii=False, indent=2)}
+
+Подтвержденные метки подключения/продолжения, найденные на рендере и привязанные к ближайшей вершине:
+{json.dumps(connection_rows, ensure_ascii=False, indent=2)}
 
 Для каждого штурвала отдельно учитывай поля стрелки:
 - arrow_found=true означает, что найден векторный сегмент, один конец которого ближайший к bbox надписи;

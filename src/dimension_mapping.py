@@ -83,6 +83,142 @@ def _dimension_hints_from_text(text: str) -> set[str]:
     return hints
 
 
+def _extract_sheet_number(text: str) -> str | None:
+    if not text:
+        return None
+    patterns = (
+        r"(?:ЛИСТ|SHEET)\s*[:№]?\s*(?:№\s*)?(\d+)",
+        r"(?:SEE\s+SHEET|CONTINUATION)\s*(?:[A-Z0-9\-_/]+\s+)?(\d+)",
+        r"(?:СМ\.?\s*(?:ЛИСТ|SHEET)\s*[:№]?\s*(?:№\s*)?(\d+))",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE | re.UNICODE)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _connection_classify(text: str) -> tuple[str, str | None, bool]:
+    normalized = (text or "").strip()
+    if not normalized:
+        return "other", None, False
+    upper = normalized.upper()
+    tie_in_keywords = (
+        "ПОДКЛЮЧЕНИЕ",
+        "ПОДСОЕДИНЕНИЕ",
+        "ВРЕЗКА",
+        "TIE-IN",
+        "TIE IN",
+        "CONNECTION",
+    )
+    if any(keyword in upper for keyword in tie_in_keywords):
+        return "tie_in", None, False
+    sheet_number = _extract_sheet_number(normalized)
+    if sheet_number is not None:
+        return "continuation", sheet_number, True
+    continuation_keywords = (
+        "СМ.",
+        "СМ ",
+        "SEE SHEET",
+        "CONTINUATION",
+        "ЛИСТ",
+        "SHEET",
+    )
+    has_sheet_hint = any(keyword in upper for keyword in continuation_keywords)
+    if has_sheet_hint:
+        return "other", None, True
+    return "other", None, False
+
+
+def _connection_rows_from_page(
+    page: Any,
+    page_number: int,
+    vertices: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Найти только основные connection-метки: подключение/см. лист/continuation."""
+    words = page.get_text("words") or []
+    if not words:
+        return []
+    lines: list[list[tuple[float, float, float, float, str]]] = []
+    current: list[tuple[float, float, float, float, str]] = []
+    last_y: float | None = None
+    for item in words:
+        if len(item) < 5:
+            continue
+        text = str(item[4]).strip()
+        if not text:
+            continue
+        x0, y0, x1, y1 = float(item[0]), float(item[1]), float(item[2]), float(item[3])
+        if current and (last_y is not None) and abs(y0 - last_y) > 8:
+            lines.append(current)
+            current = []
+        current.append((x0, y0, x1, y1, text))
+        last_y = (y0 + y1) / 2.0
+    if current:
+        lines.append(current)
+
+    rows: list[dict[str, Any]] = []
+    drawings = page.get_drawings()
+    rectangles = mark_pipeline.find_rectangles(page, page.rect)
+    known_vertices = vertices or []
+    for index, line in enumerate(lines, start=1):
+        label = " ".join(part[4] for part in sorted(line, key=lambda item: item[0]))
+        upper = label.upper()
+        if not any(keyword in upper for keyword in ("ПОДКЛЮЧЕНИЕ", "TIE-IN", "TIE IN", "СМ.", "SEE SHEET", "CONTINUATION", "ЛИСТ", "SHEET")):
+            continue
+        connection_type, target_sheet, has_sheet_hint = _connection_classify(label)
+        if connection_type == "other" and not has_sheet_hint and not any(
+            keyword in upper for keyword in ("ПОДКЛЮЧЕНИЕ", "TIE-IN", "TIE IN", "СМ.", "SEE SHEET", "CONTINUATION", "ЛИСТ", "SHEET")
+        ):
+            continue
+        x0 = min(item[0] for item in line)
+        y0 = min(item[1] for item in line)
+        x1 = max(item[2] for item in line)
+        y1 = max(item[3] for item in line)
+        cx = (x0 + x1) / 2.0
+        cy = (y0 + y1) / 2.0
+        text_rect = fitz.Rect(x0, y0, x1, y1)
+        arrow_paths = _handwheel_arrow_paths([text_rect], drawings, rectangles)
+        arrow_path = arrow_paths[0] if arrow_paths and arrow_paths[0] else []
+        arrow_start = arrow_path[0][0] if arrow_path else None
+        arrow_end = arrow_path[-1][1] if arrow_path else None
+        nearest_vertex = None
+        if arrow_end is not None:
+            nearest_vertex = min(
+                known_vertices,
+                key=lambda vertex: math.hypot(
+                    float(vertex["x"]) - arrow_end[0],
+                    float(vertex["y"]) - arrow_end[1],
+                ),
+                default=None,
+            )
+        rows.append(
+            {
+                "id": f"CN-{page_number}-{index:03d}",
+                "page": page_number,
+                "label": label,
+                "bbox": [round(x0, 2), round(y0, 2), round(x1, 2), round(y1, 2)],
+                "center": [round(cx, 2), round(cy, 2)],
+                "connection_type": connection_type,
+                "vertex_id": nearest_vertex.get("id") if nearest_vertex else None,
+                "target_point": [round(arrow_end[0], 2), round(arrow_end[1], 2)] if arrow_end else None,
+                "target_sheet": target_sheet,
+                "text_has_sheet_ref": has_sheet_hint,
+                "arrow_found": bool(arrow_path),
+                "arrow_start": [round(arrow_start[0], 2), round(arrow_start[1], 2)] if arrow_start else None,
+                "arrow_end": [round(arrow_end[0], 2), round(arrow_end[1], 2)] if arrow_end else None,
+                "arrow_segments": [
+                    {
+                        "start": [round(segment[0][0], 2), round(segment[0][1], 2)],
+                        "end": [round(segment[1][0], 2), round(segment[1][1], 2)],
+                    }
+                    for segment in arrow_path
+                ],
+            }
+        )
+    return rows
+
+
 def _same_directed_contour(first: dict[str, Any], second: dict[str, Any], edge_by_id: dict[str, dict[str, Any]]) -> bool:
     first_edge = edge_by_id.get(first.get("edge_id"))
     second_edge = edge_by_id.get(second.get("edge_id"))
@@ -328,130 +464,132 @@ def map_dimensions(pdf_path: str | Path, page_number: int) -> dict[str, Any]:
         drawing_area, _format = mark_pipeline.get_drawing_area(page)
         dimensions, _rectangles, discarded = mark_pipeline.extract_dimension_numbers(page, drawing_area)
 
-    edges = _stroke_graph(pdf_path, page_number)
-    vertices = _vertex_rows(pdf_path, page_number)
-    dimension_candidates = [
-        Candidate(
-            id=f"D{index:03d}",
-            line_id="dimension-mapping",
-            page=page_number,
-            kind="dimension",
-            text=text,
-            zone="drawing",
-            bbox=(rect.x0, rect.y0, rect.x1, rect.y1),
-        )
-        for index, (text, rect) in enumerate(dimensions, start=1)
-    ]
-    vector_graph = extract_axis_graph(pdf_path, page_number, dimension_candidates)
-    attached_strokes = {
-        candidate_id: vector_graph.strokes[stroke_index]
-        for candidate_id, stroke_index in vector_graph.attached.items()
-        if 0 <= stroke_index < len(vector_graph.strokes)
-    }
-    mapped = []
-    for index, (text, rect) in enumerate(dimensions, start=1):
-        center = ((rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2)
-        candidates = []
-        for edge in edges:
-            distance, position, projection = _distance_to_segment(
-                center,
-                tuple(edge["start"]),
-                tuple(edge["end"]),
+        edges = _stroke_graph(pdf_path, page_number)
+        vertices = _vertex_rows(pdf_path, page_number)
+        dimension_candidates = [
+            Candidate(
+                id=f"D{index:03d}",
+                line_id="dimension-mapping",
+                page=page_number,
+                kind="dimension",
+                text=text,
+                zone="drawing",
+                bbox=(rect.x0, rect.y0, rect.x1, rect.y1),
             )
-            candidates.append((distance, position, projection, edge))
-        candidates.sort(key=lambda item: item[0])
-        hints = _dimension_hints_from_text(text)
-        if candidates and candidates[0][0] <= MAX_GAP_PX:
-            distance, position, projection, edge = candidates[0]
-            edge_dx = edge["end"][0] - edge["start"][0]
-            edge_dy = edge["end"][1] - edge["start"][1]
-            edge_length = math.hypot(edge_dx, edge_dy) or 1.0
-            offset_px = (edge_dx * (center[1] - projection[1]) - edge_dy * (center[0] - projection[0])) / edge_length
-            mapped.append(
-                {
-                    "id": f"D{index:03d}",
-                    "value": float(text.replace(",", ".")),
-                    "text": text,
-                    "hints": sorted(hints),
-                    "label_center": [round(center[0], 2), round(center[1], 2)],
-                    "edge_id": edge["id"],
-                    "position": round(position, 4),
-                    "projection": [round(projection[0], 2), round(projection[1], 2)],
-                    "gap_px": round(distance, 2),
-                    "offset_px": round(offset_px, 2),
-                    "status": "projected" if distance > 1.0 else "exact",
-                }
-            )
-        else:
-            mapped.append(
-                {
-                    "id": f"D{index:03d}",
-                    "value": float(text.replace(",", ".")),
-                    "text": text,
-                    "hints": sorted(hints),
-                    "label_center": [round(center[0], 2), round(center[1], 2)],
-                    "edge_id": None,
-                    "position": None,
-                    "projection": None,
-                    "gap_px": round(candidates[0][0], 2) if candidates else None,
-                    "offset_px": None,
-                    "status": "unresolved",
-                    "reason": "no_pipe_edge_within_tolerance",
-                }
-            )
-        if "cross_sheet_reference" in mapped[-1]["hints"]:
-            mapped[-1]["status"] = "cross_sheet_reference"
-            mapped[-1]["valid"] = False
-        if "handwheel" in mapped[-1]["hints"]:
-            mapped[-1]["status"] = "handwheel"
-            mapped[-1]["valid"] = False
-        mapped[-1]["dimension_stroke"] = None
-        attached = attached_strokes.get(mapped[-1]["id"])
-        if attached is not None:
-            initial_stroke = _merge_dimension_stroke(attached, vector_graph.strokes)
-            mapped[-1]["dimension_stroke"] = initial_stroke
-            mapped[-1]["leader_stroke"] = None
-            pipe_edge = next((item for item in edges if item["id"] == mapped[-1].get("edge_id")), None)
-            if pipe_edge is not None and not _stroke_angle_matches_edge(attached, pipe_edge):
-                target = _resolve_leader_target(attached, pipe_edge, vector_graph.strokes)
-                if target is not None:
-                    mapped[-1]["leader_stroke"] = initial_stroke
-                    mapped[-1]["dimension_stroke"] = _merge_dimension_stroke(target, vector_graph.strokes)
-                    mapped[-1]["leader_attached"] = True
-                    mapped[-1]["attachment_kind"] = "leader_to_dimension_arrow"
+            for index, (text, rect) in enumerate(dimensions, start=1)
+        ]
+        vector_graph = extract_axis_graph(pdf_path, page_number, dimension_candidates)
+        attached_strokes = {
+            candidate_id: vector_graph.strokes[stroke_index]
+            for candidate_id, stroke_index in vector_graph.attached.items()
+            if 0 <= stroke_index < len(vector_graph.strokes)
+        }
+        mapped = []
+        for index, (text, rect) in enumerate(dimensions, start=1):
+            center = ((rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2)
+            candidates = []
+            for edge in edges:
+                distance, position, projection = _distance_to_segment(
+                    center,
+                    tuple(edge["start"]),
+                    tuple(edge["end"]),
+                )
+                candidates.append((distance, position, projection, edge))
+            candidates.sort(key=lambda item: item[0])
+            hints = _dimension_hints_from_text(text)
+            if candidates and candidates[0][0] <= MAX_GAP_PX:
+                distance, position, projection, edge = candidates[0]
+                edge_dx = edge["end"][0] - edge["start"][0]
+                edge_dy = edge["end"][1] - edge["start"][1]
+                edge_length = math.hypot(edge_dx, edge_dy) or 1.0
+                offset_px = (edge_dx * (center[1] - projection[1]) - edge_dy * (center[0] - projection[0])) / edge_length
+                mapped.append(
+                    {
+                        "id": f"D{index:03d}",
+                        "value": float(text.replace(",", ".")),
+                        "text": text,
+                        "hints": sorted(hints),
+                        "label_center": [round(center[0], 2), round(center[1], 2)],
+                        "edge_id": edge["id"],
+                        "position": round(position, 4),
+                        "projection": [round(projection[0], 2), round(projection[1], 2)],
+                        "gap_px": round(distance, 2),
+                        "offset_px": round(offset_px, 2),
+                        "status": "projected" if distance > 1.0 else "exact",
+                    }
+                )
             else:
-                mapped[-1]["attachment_kind"] = "direct_dimension_arrow"
-            _add_pipe_anchor(mapped[-1], edges)
-            mapped[-1]["extension_strokes"] = _find_extension_strokes(
-                mapped[-1],
-                next((item for item in edges if item["id"] == mapped[-1].get("edge_id")), None),
-                vector_graph.strokes,
-            )
-            mapped[-1]["leader_attached"] = True
-            if mapped[-1]["edge_id"] is None:
-                edge, edge_gap, edge_projection = _nearest_edge_for_stroke(mapped[-1]["dimension_stroke"], edges)
-                if edge is not None:
-                    mapped[-1]["edge_id"] = edge["id"]
-                    mapped[-1]["edge_gap_px"] = round(edge_gap, 2)
-                    mapped[-1]["projection"] = [round(edge_projection[0], 2), round(edge_projection[1], 2)]
-            if mapped[-1]["status"] == "unresolved":
-                mapped[-1]["status"] = "leader_attached"
-                mapped[-1]["reason"] = "number_attached_to_dimension_arrow"
-        else:
-            mapped[-1]["leader_attached"] = False
+                mapped.append(
+                    {
+                        "id": f"D{index:03d}",
+                        "value": float(text.replace(",", ".")),
+                        "text": text,
+                        "hints": sorted(hints),
+                        "label_center": [round(center[0], 2), round(center[1], 2)],
+                        "edge_id": None,
+                        "position": None,
+                        "projection": None,
+                        "gap_px": round(candidates[0][0], 2) if candidates else None,
+                        "offset_px": None,
+                        "status": "unresolved",
+                        "reason": "no_pipe_edge_within_tolerance",
+                    }
+                )
+            if "cross_sheet_reference" in mapped[-1]["hints"]:
+                mapped[-1]["status"] = "cross_sheet_reference"
+                mapped[-1]["valid"] = False
+            if "handwheel" in mapped[-1]["hints"]:
+                mapped[-1]["status"] = "handwheel"
+                mapped[-1]["valid"] = False
+            mapped[-1]["dimension_stroke"] = None
+            attached = attached_strokes.get(mapped[-1]["id"])
+            if attached is not None:
+                initial_stroke = _merge_dimension_stroke(attached, vector_graph.strokes)
+                mapped[-1]["dimension_stroke"] = initial_stroke
+                mapped[-1]["leader_stroke"] = None
+                pipe_edge = next((item for item in edges if item["id"] == mapped[-1].get("edge_id")), None)
+                if pipe_edge is not None and not _stroke_angle_matches_edge(attached, pipe_edge):
+                    target = _resolve_leader_target(attached, pipe_edge, vector_graph.strokes)
+                    if target is not None:
+                        mapped[-1]["leader_stroke"] = initial_stroke
+                        mapped[-1]["dimension_stroke"] = _merge_dimension_stroke(target, vector_graph.strokes)
+                        mapped[-1]["leader_attached"] = True
+                        mapped[-1]["attachment_kind"] = "leader_to_dimension_arrow"
+                else:
+                    mapped[-1]["attachment_kind"] = "direct_dimension_arrow"
+                _add_pipe_anchor(mapped[-1], edges)
+                mapped[-1]["extension_strokes"] = _find_extension_strokes(
+                    mapped[-1],
+                    next((item for item in edges if item["id"] == mapped[-1].get("edge_id")), None),
+                    vector_graph.strokes,
+                )
+                mapped[-1]["leader_attached"] = True
+                if mapped[-1]["edge_id"] is None:
+                    edge, edge_gap, edge_projection = _nearest_edge_for_stroke(mapped[-1]["dimension_stroke"], edges)
+                    if edge is not None:
+                        mapped[-1]["edge_id"] = edge["id"]
+                        mapped[-1]["edge_gap_px"] = round(edge_gap, 2)
+                        mapped[-1]["projection"] = [round(edge_projection[0], 2), round(edge_projection[1], 2)]
+                if mapped[-1]["status"] == "unresolved":
+                    mapped[-1]["status"] = "leader_attached"
+                    mapped[-1]["reason"] = "number_attached_to_dimension_arrow"
+            else:
+                mapped[-1]["leader_attached"] = False
 
-    _mark_overlapping_dimensions(mapped, edges)
-    return {
-        "page_number": page_number,
-        "vertices": vertices,
-        "edges": edges,
-        "dimensions": mapped,
-        "discarded_numbers": [
-            {"text": text, "reason": reason}
-            for text, _rect, reason in discarded
-        ],
-        "tolerance_px": MAX_GAP_PX,
-    }
+        _mark_overlapping_dimensions(mapped, edges)
+        connections = _connection_rows_from_page(page, page_number, vertices)
+        return {
+            "page_number": page_number,
+            "vertices": vertices,
+            "edges": edges,
+            "dimensions": mapped,
+            "connections": connections,
+            "discarded_numbers": [
+                {"text": text, "reason": reason}
+                for text, _rect, reason in discarded
+            ],
+            "tolerance_px": MAX_GAP_PX,
+        }
 
 
 def save_dimension_mapping_pdf(
@@ -838,6 +976,21 @@ def save_clean_local_markup_pdf(
             center = fitz.Point(*label_center)
             rect = fitz.Rect(center.x - 20, center.y - 12, center.x + 24, center.y + 12)
             marked.draw_rect(rect, color=color, fill=None, width=1.2)
+
+        connection_color = (0.78, 0.30, 0.67)
+        for connection in mapping.get("connections", []):
+            bbox = connection.get("bbox")
+            if not bbox or len(bbox) < 4:
+                continue
+            marked.draw_rect(
+                fitz.Rect(float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])),
+                color=connection_color,
+                fill=None,
+                width=1.4,
+            )
+            label = connection.get("label") or connection.get("connection_type") or "connection"
+            center = fitz.Point((float(bbox[0]) + float(bbox[2])) / 2.0, float(bbox[1]) - 8)
+            marked.insert_text(center, str(label)[:30], fontsize=7, fontname="helv", color=connection_color)
 
         output.save(str(output_pdf))
         output.close()
