@@ -534,14 +534,65 @@ def save_preprocess_annotation_pdf(
             label_center = dimension.get("label_center")
             if not label_center:
                 continue
-            if dimension.get("status") in {"cross_sheet_reference", "handwheel", "unresolved", "invalid_overlap"}:
+            status = dimension.get("status")
+            if status in {"cross_sheet_reference", "unresolved", "invalid_overlap"}:
                 continue
+            color = (0.0, 0.55, 0.15)
+            if status == "handwheel":
+                color = (0.14, 0.39, 0.92)
             center = fitz.Point(*label_center)
             rect = fitz.Rect(center.x - 18, center.y - 10, center.x + 22, center.y + 10)
-            marked.draw_rect(rect, color=(0.0, 0.55, 0.15), fill=None, width=1.2)
+            marked.draw_rect(rect, color=color, fill=None, width=1.2)
 
         output.save(str(output_pdf))
         output.close()
+
+
+def _handwheel_text_rects(words: list[tuple[Any, ...]]) -> list[fitz.Rect]:
+    return [
+        fitz.Rect(word[0], word[1], word[2], word[3])
+        for word in words
+        if "штурвал" in str(word[4] or "").strip().casefold()
+    ]
+
+
+def _distance_to_rect(point: tuple[float, float], rect: fitz.Rect) -> float:
+    dx = max(rect.x0 - point[0], 0.0, point[0] - rect.x1)
+    dy = max(rect.y0 - point[1], 0.0, point[1] - rect.y1)
+    return math.hypot(dx, dy)
+
+
+def _handwheel_arrow_segments(
+    text_rects: list[fitz.Rect],
+    drawings: list[dict[str, Any]],
+) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+    segments: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    for drawing in drawings:
+        for item in drawing.get("items", []):
+            if not item or item[0] != "l":
+                continue
+            start, end = item[1], item[2]
+            first = (float(start.x), float(start.y))
+            second = (float(end.x), float(end.y))
+            if math.hypot(second[0] - first[0], second[1] - first[1]) >= 6.0:
+                segments.append((first, second))
+
+    selected: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    for text_rect in text_rects:
+        candidates = []
+        for start, end in segments:
+            start_gap = _distance_to_rect(start, text_rect)
+            end_gap = _distance_to_rect(end, text_rect)
+            nearest_gap = min(start_gap, end_gap)
+            if nearest_gap > 32.0:
+                continue
+            if end_gap < start_gap:
+                start, end = end, start
+            candidates.append((nearest_gap, -(math.hypot(end[0] - start[0], end[1] - start[1])), start, end))
+        if candidates:
+            _gap, _negative_length, start, end = min(candidates, key=lambda item: (item[0], item[1]))
+            selected.append((start, end))
+    return selected
 
 
 def save_clean_local_markup_pdf(
@@ -557,6 +608,26 @@ def save_clean_local_markup_pdf(
         marked = output.new_page(width=page.rect.width, height=page.rect.height)
         marked.show_pdf_page(marked.rect, document, page_number - 1)
 
+        handwheel_color = (0.14, 0.39, 0.92)
+        handwheel_rects = _handwheel_text_rects(page.get_text("words"))
+        for rect in handwheel_rects:
+            marked.draw_rect(
+                rect,
+                color=handwheel_color,
+                fill=None,
+                width=1.6,
+            )
+        for start, end in _handwheel_arrow_segments(
+            handwheel_rects,
+            page.get_drawings(),
+        ):
+            marked.draw_line(
+                fitz.Point(*start),
+                fitz.Point(*end),
+                color=handwheel_color,
+                width=1.6,
+            )
+
         for vertex in mapping.get("vertices", []):
             color = mark_pipeline.VERTEX_ROLE_COLORS.get(vertex.get("role"), (0, 0, 0))
             center = fitz.Point(vertex["x"], vertex["y"])
@@ -567,13 +638,17 @@ def save_clean_local_markup_pdf(
             label_center = dimension.get("label_center")
             if not label_center:
                 continue
-            if dimension.get("status") in {"cross_sheet_reference", "handwheel", "unresolved", "invalid_overlap"}:
+            status = dimension.get("status")
+            if status in {"cross_sheet_reference", "unresolved", "invalid_overlap"}:
                 continue
-            if not dimension.get("valid", True):
+            if status != "handwheel" and not dimension.get("valid", True):
                 continue
+            color = (0.0, 0.55, 0.15)
+            if status == "handwheel":
+                color = (0.14, 0.39, 0.92)
             center = fitz.Point(*label_center)
             rect = fitz.Rect(center.x - 20, center.y - 12, center.x + 24, center.y + 12)
-            marked.draw_rect(rect, color=(0.0, 0.55, 0.15), fill=None, width=1.2)
+            marked.draw_rect(rect, color=color, fill=None, width=1.2)
 
         output.save(str(output_pdf))
         output.close()

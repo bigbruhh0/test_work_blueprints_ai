@@ -28,6 +28,7 @@ from src.dimension_mapping import (
 )
 from src.distance_ai import call_distance_ai_trace
 from src.dimension_review import build_map_text, calculate_lengths, review_map_with_provider
+from src.eval_data import aggregate_eval_results, evaluate_line_for_prompt, list_eval_groups, summarize_prompt_eval_rows
 from src.prepare_stage import run_prepare
 from scripts.build_dimension_map import build_map as build_dimension_map, render_pdf as render_dimension_map
 
@@ -431,6 +432,11 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                         "model": review_trace["model"],
                         "prompt_name": "dimension_review",
                     }
+                    eval_result = evaluate_line_for_prompt(line.line_id, "dimension_review", review)
+                    if eval_result:
+                        page_run.analysis["dimension_review"]["eval"] = aggregate_eval_results([
+                            result for group_result in eval_result.values() for result in [group_result]
+                        ])
                     page_run.files["dimension_map_txt"] = dimension_map_txt.name
                     page_run.files["dimension_review_json"] = review_json.name
                 page_run.stage = "done"
@@ -506,6 +512,69 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
     statuses = {line.status for line in run.lines.values()}
     run.status = "error" if "error" in statuses else "complete"
     _persist(run)
+
+
+def _eval_history_rows() -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for run in run_db.list_runs():
+        for line in run.get("lines", []):
+            for page in line.get("page_results", []):
+                review = (page.get("analysis") or {}).get("dimension_review")
+                if not isinstance(review, dict):
+                    continue
+                eval_summary = review.get("eval")
+                if not isinstance(eval_summary, dict):
+                    continue
+                for group_id, stats in eval_summary.items():
+                    if not isinstance(stats, dict):
+                        continue
+                    row = {"group_id": group_id, "prompt_name": stats.get("prompt_name") or "dimension_review", **stats}
+                    rows.append(row)
+    return rows
+
+
+@app.get("/api/eval")
+def list_eval_summary() -> dict[str, Any]:
+    from src import prompts
+
+    prompt_versions: list[dict[str, Any]] = []
+    for prompt_name in sorted(prompts.PROMPT_REGISTRY):
+        history_rows = [row for row in _eval_history_rows() if row.get("prompt_name") == prompt_name]
+        if not history_rows:
+            continue
+
+        versions = prompts.list_versions(prompt_name)
+        if not versions:
+            revision = prompts.load_prompt_revision(prompt_name)
+            versions = [{
+                "version": revision.get("version", "default"),
+                "sha256": revision.get("sha256", ""),
+                "source": revision.get("source", "default"),
+                "created_at": "",
+                "length": len(str(revision.get("text", ""))),
+                "preview": str(revision.get("text", ""))[:80],
+            }]
+
+        for version in versions:
+            stats = summarize_prompt_eval_rows(history_rows, prompt_name)
+            if not stats or int(stats.get("total_candidates") or 0) <= 0:
+                continue
+            prompt_versions.append({
+                "prompt_name": prompt_name,
+                "title": prompts.PROMPT_REGISTRY[prompt_name].get("title", prompt_name),
+                "version": version.get("version", "default"),
+                "sha256": version.get("sha256", ""),
+                "source": version.get("source", "default"),
+                "created_at": version.get("created_at", ""),
+                "length": version.get("length", 0),
+                "stats": stats,
+            })
+
+    return {
+        "groups": sorted(list_eval_groups(), key=lambda value: str(value)),
+        "prompt_versions": prompt_versions,
+        "total_versions": len(prompt_versions),
+    }
 
 
 @app.get("/api/runs")

@@ -5,7 +5,7 @@ from unittest import mock
 
 import fitz
 
-from src.dimension_mapping import _dimension_hints_from_text, _same_directed_contour, save_clean_local_markup_pdf, save_preprocess_annotation_pdf
+from src.dimension_mapping import _dimension_hints_from_text, _handwheel_arrow_segments, _handwheel_text_rects, _same_directed_contour, save_clean_local_markup_pdf, save_preprocess_annotation_pdf
 
 
 class DimensionRuleTests(unittest.TestCase):
@@ -142,7 +142,14 @@ class DimensionRuleTests(unittest.TestCase):
                         "status": "mapped",
                         "label_center": [90, 70],
                         "valid": True,
-                    }
+                    },
+                    {
+                        "id": "D002",
+                        "text": "Штурвал",
+                        "status": "handwheel",
+                        "label_center": [120, 60],
+                        "valid": False,
+                    },
                 ],
             }
 
@@ -150,6 +157,24 @@ class DimensionRuleTests(unittest.TestCase):
 
             self.assertTrue(output_pdf.exists())
             self.assertGreater(output_pdf.stat().st_size, 0)
+            with fitz.open(str(output_pdf)) as doc:
+                page = doc[0]
+                self.assertGreater(len(page.get_drawings()), 0)
+
+    def test_clean_local_markup_pdf_marks_shtrval_text_found_on_page(self) -> None:
+        rects = _handwheel_text_rects([
+            (40, 60, 100, 80, "ШТУРВАЛ", 0, 0, 0),
+            (10, 10, 20, 20, "3100", 0, 0, 1),
+        ])
+        self.assertEqual(rects, [fitz.Rect(40, 60, 100, 80)])
+
+    def test_handwheel_arrow_segment_starts_near_label(self) -> None:
+        rects = [fitz.Rect(40, 60, 100, 80)]
+        drawings = [{"items": [("l", fitz.Point(150, 100), fitz.Point(100, 70))]}]
+
+        segments = _handwheel_arrow_segments(rects, drawings)
+
+        self.assertEqual(segments, [((100.0, 70.0), (150.0, 100.0))])
 
     def test_review_map_with_provider_accepts_single_page_markup_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

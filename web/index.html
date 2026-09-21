@@ -19,7 +19,7 @@
 <body>
   <header class="topbar">
     <div class="brand"><span class="brand-mark">∠</span><span>Изометрии<span class="brand-muted"> / mark pipeline</span></span></div>
-    <div class="top-status"><span class="status-dot" id="api-dot"></span><span id="api-status">API подключение</span><button class="ghost-button" id="history-button">История</button><button class="ghost-button" id="prompts-button">Промпты</button></div>
+    <div class="top-status"><span class="status-dot" id="api-dot"></span><span id="api-status">API подключение</span><button class="ghost-button" id="history-button">История</button><button class="ghost-button" id="prompts-button">Промпты</button><button class="ghost-button" id="eval-button">Eval</button></div>
   </header>
 
   <main id="app" class="app-shell">
@@ -92,6 +92,11 @@
         <b>История версий</b>
         <div id="prompt-versions"></div>
       </div>
+    </section>
+
+    <section class="analysis-page" id="eval-section" hidden>
+      <div class="panel-title"><span>EVAL</span><h2>Сводка по версиям промптов</h2></div>
+      <div id="eval-body" class="row"></div>
     </section>
   </main>
   <div id="image-lightbox" class="image-lightbox" hidden title="Нажмите, чтобы закрыть">

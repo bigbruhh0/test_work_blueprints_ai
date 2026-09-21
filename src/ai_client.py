@@ -37,6 +37,194 @@ from .route_reconstruction import extract_local_vertices
 
 EventCallback = Callable[[str, dict[str, Any]], None]
 
+# Расширенный список ключевых слов для поиска штурвалов/арматуры.
+# Включает как русские, так и английские варианты, а также "вентиль" и "valve".
+VALVE_KEYWORDS = (
+    "штурвал",
+    "рукоятка",
+    "рукоять",
+    "ручка",
+    "маховик",
+    "колесо",
+    "рычаг",
+    "трос",
+    "вентиль",
+    "задвижка",
+    "клапан",
+    "handwheel",
+    "wheel",
+    "handle",
+    "lever",
+    "crank",
+    "valve",
+)
+
+
+def _looks_like_valve_label(text: str) -> bool:
+    normalized = (text or "").lower()
+    return any(keyword in normalized for keyword in VALVE_KEYWORDS)
+
+
+def _candidate_center(candidate: Candidate) -> tuple[float, float]:
+    return (
+        (candidate.bbox[0] + candidate.bbox[2]) / 2.0,
+        (candidate.bbox[1] + candidate.bbox[3]) / 2.0,
+    )
+
+
+def _handwheel_row_from_candidate(
+    candidate: Candidate,
+    vertices: list[VertexMark],
+    confidence: float,
+    reason: str,
+) -> dict[str, Any]:
+    cx, cy = _candidate_center(candidate)
+    nearest_vertex = None
+    nearest_distance = None
+    for vertex in vertices:
+        if vertex.page != candidate.page:
+            continue
+        dist = ((vertex.x - cx) ** 2 + (vertex.y - cy) ** 2) ** 0.5
+        if nearest_distance is None or dist < nearest_distance:
+            nearest_distance = dist
+            nearest_vertex = vertex
+
+    target_vertex_id = nearest_vertex.id if nearest_vertex else None
+    target_point = None
+    if nearest_vertex is not None:
+        target_point = [round(nearest_vertex.x, 2), round(nearest_vertex.y, 2)]
+
+    direction = "unknown"
+    if nearest_vertex is not None:
+        dx = nearest_vertex.x - cx
+        dy = nearest_vertex.y - cy
+        if abs(dx) > abs(dy):
+            direction = "horizontal"
+        elif abs(dy) > abs(dx):
+            direction = "vertical"
+
+    return {
+        "id": f"HW-{candidate.id}",
+        "page": candidate.page,
+        "label": (candidate.text or "").strip() or "штурвал",
+        "bbox": [round(value, 2) for value in candidate.bbox],
+        "target_vertex_id": target_vertex_id,
+        "target_point": target_point,
+        "arrow_direction": direction,
+        "confidence": confidence,
+        "reason": reason,
+    }
+
+
+def _find_handwheel_rows(
+    candidates: list[Candidate],
+    vertices: list[VertexMark],
+) -> list[dict[str, Any]]:
+    """Найти штурвалы/рукоятки/маховики.
+
+    Три прохода, от самого строгого к самому мягкому:
+    1. Прямой: candidates с kind in {text, numeric, dimension}, text похож на штурвал.
+    2. Запасной: ЛЮБЫЕ candidates (без фильтра по kind), text похож на штурвал.
+    3. Геометрический: кандидаты рядом с DN-подписями в зоне drawing,
+       если ни прямой, ни запасной путь не дал результата.
+    """
+    rows: list[dict[str, Any]] = []
+    if not candidates:
+        return rows
+
+    seen_ids: set[str] = set()
+
+    # --- Проход 1: прямой, как было ---
+    for candidate in candidates:
+        if candidate.id in seen_ids:
+            continue
+        if candidate.kind not in {"text", "numeric", "dimension"}:
+            continue
+        if not _looks_like_valve_label(candidate.text):
+            continue
+        rows.append(
+            _handwheel_row_from_candidate(
+                candidate,
+                vertices,
+                confidence=0.75,
+                reason="Найдено по ключевому слову штурвал/рукоятка, привязка проверена по ближайшей вершине/оси.",
+            )
+        )
+        seen_ids.add(candidate.id)
+
+    if rows:
+        return rows
+
+    # --- Проход 2: запасной, без фильтра по kind ---
+    # Иногда extractor помечает подпись «ШТУРВАЛ» как kind="unknown" или
+    # вообще не относит её к dimension. Здесь принимаем ЛЮБОЙ kind.
+    for candidate in candidates:
+        if candidate.id in seen_ids:
+            continue
+        if candidate.zone != "drawing":
+            continue
+        if not _looks_like_valve_label(candidate.text):
+            continue
+        rows.append(
+            _handwheel_row_from_candidate(
+                candidate,
+                vertices,
+                confidence=0.6,
+                reason="Запасной путь: подпись найдена среди всех кандидатов страницы (kind не важен).",
+            )
+        )
+        seen_ids.add(candidate.id)
+
+    if rows:
+        return rows
+
+    # --- Проход 3: геометрический, по близости к DN-подписям ---
+    # На листах вроде CO_0031 (стр. 216) штурвалы физически стоят рядом
+    # с подписями DN100X25 / DN100. Если текстовая подпись «ШТУРВАЛ» не
+    # извлеклась как кандидат, но есть DN-подпись и рядом с ней есть
+    # любой текстовый кандидат — помечаем его как штурвал с низкой уверенностью.
+    dn_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.zone == "drawing"
+        and candidate.kind == "dn"
+        and candidate.text
+    ]
+    if dn_candidates:
+        used_dn: set[str] = set()
+        for dn in dn_candidates:
+            dn_cx, dn_cy = _candidate_center(dn)
+            # Ищем любого текстового кандидата в радиусе 120 px от DN-подписи,
+            # который ещё не помечен как штурвал.
+            for candidate in candidates:
+                if candidate.id in seen_ids or candidate.id == dn.id:
+                    continue
+                if candidate.zone != "drawing":
+                    continue
+                if candidate.kind not in {"text", "numeric", "dimension", "unknown", "label"}:
+                    continue
+                if not (candidate.text or "").strip():
+                    continue
+                cx, cy = _candidate_center(candidate)
+                if ((cx - dn_cx) ** 2 + (cy - dn_cy) ** 2) ** 0.5 > 120.0:
+                    continue
+                rows.append(
+                    _handwheel_row_from_candidate(
+                        candidate,
+                        vertices,
+                        confidence=0.4,
+                        reason=(
+                            f"Геометрический запасной путь: кандидат рядом с DN-подписью "
+                            f"{dn.text} (в радиусе 120 px)."
+                        ),
+                    )
+                )
+                seen_ids.add(candidate.id)
+                used_dn.add(dn.id)
+                break  # один штурвал на одну DN-подпись
+
+    return rows
+
 
 class AIClient(ABC):
     mode: str
@@ -518,6 +706,49 @@ class DeepSeekAIClient(AIClient):
             "temperature": 0.0,
         }
 
+    def _known_vertex_rows_for_group(self, group: LineGroup, candidates: list[Candidate]) -> list[dict[str, Any]]:
+        if not self.pdf_path:
+            return []
+        rows: list[dict[str, Any]] = []
+        seen: set[tuple[int, str, float, float]] = set()
+        for page in group.pages:
+            for vertex in extract_local_vertices(self.pdf_path, page.page_number, group.line_id, candidates):
+                key = (vertex.page, vertex.label, round(vertex.x, 2), round(vertex.y, 2))
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append(
+                    {
+                        "id": vertex.id,
+                        "page": vertex.page,
+                        "label": vertex.label,
+                        "role": vertex.role,
+                        "x": round(vertex.x, 2),
+                        "y": round(vertex.y, 2),
+                    }
+                )
+        return rows
+
+    def _handwheel_rows_for_group(self, group: LineGroup, candidates: list[Candidate]) -> list[dict[str, Any]]:
+        """Собрать штурвалы для всех страниц группы.
+
+        Раньше здесь были только вершины текущей страницы, теперь — вершины
+        всех страниц группы, а поиск идёт по расширенному алгоритму
+        `_find_handwheel_rows` (3 прохода).
+        """
+        vertices: list[VertexMark] = []
+        if self.pdf_path:
+            for page in group.pages:
+                vertices.extend(
+                    extract_local_vertices(
+                        self.pdf_path,
+                        page.page_number,
+                        group.line_id,
+                        candidates,
+                    )
+                )
+        return _find_handwheel_rows(candidates, vertices)
+
     def _graph_prompt_for_group(
         self,
         group: LineGroup,
@@ -548,6 +779,8 @@ class DeepSeekAIClient(AIClient):
             }
             for item in classifications[:220]
         ]
+        known_vertex_rows = self._known_vertex_rows_for_group(group, candidates)
+        handwheel_rows = self._handwheel_rows_for_group(group, candidates)
         return f"""
 Ты анализируешь один или несколько листов изометрического чертежа трубопровода.
 
@@ -611,6 +844,12 @@ class DeepSeekAIClient(AIClient):
 
 Классификация кандидатов:
 {json.dumps(classification_rows, ensure_ascii=False, indent=2)}
+
+Известные координаты вершин (PDF point, уже полученные из геометрии чертежа):
+{json.dumps(known_vertex_rows, ensure_ascii=False, indent=2)}
+
+Подтвержденные штурвалы/рукоятки/маховики, найденные по ключевым словам и привязке к ближайшей вершине/оси:
+{json.dumps(handwheel_rows, ensure_ascii=False, indent=2)}
 
 Извлеченный текст страниц:
 {chr(10).join(pages_text)}
@@ -677,7 +916,28 @@ class DeepSeekAIClient(AIClient):
                     "elapsed_seconds": round(time.perf_counter() - started_at, 2),
                 },
             )
-            return self._parse_result(group, content)
+            result = self._parse_result(group, content)
+            # Добавляем найденные штурвалы в аннотации результата, чтобы UI
+            # на вкладке «Разметка» их отрисовал (render_page_with_annotations
+            # уже умеет рисовать kind != "vertex_*" как прямоугольники).
+            handwheel_rows = self._handwheel_rows_for_group(
+                group, self.candidates_by_line.get(group.line_id, [])
+            )
+            for row in handwheel_rows:
+                bbox = row.get("bbox")
+                if not bbox or len(bbox) < 4:
+                    continue
+                result.annotations.append(
+                    Annotation(
+                        id=row.get("id") or f"HW-{len(result.annotations) + 1}",
+                        page=int(row.get("page") or 1),
+                        label=str(row.get("label") or "штурвал"),
+                        kind="valve",
+                        bbox=tuple(float(value) for value in bbox[:4]),
+                        color="#2563eb",
+                    )
+                )
+            return result
         except Exception as error:
             self._emit(
                 "deepseek.error",
@@ -689,22 +949,68 @@ class DeepSeekAIClient(AIClient):
             return self._failed(group, f"DeepSeek API error: {error}")
 
     def _build_payload(self, group: LineGroup) -> dict[str, Any]:
+        candidates = self.candidates_by_line.get(group.line_id, [])
         content: list[dict[str, Any]] = [{"type": "text", "text": self._prompt_for_group(group)}]
+
+        # Заранее считаем штурвалы для всей группы — они понадобятся и для картинки,
+        # и для события в UI, и для аннотаций результата.
+        handwheel_rows = self._handwheel_rows_for_group(group, candidates)
+        if handwheel_rows:
+            self._emit(
+                "deepseek.handwheels.found",
+                {
+                    "line_id": group.line_id,
+                    "count": len(handwheel_rows),
+                    "handwheels": [
+                        {
+                            "id": row.get("id"),
+                            "page": row.get("page"),
+                            "label": row.get("label"),
+                            "bbox": row.get("bbox"),
+                            "target_vertex_id": row.get("target_vertex_id"),
+                            "confidence": row.get("confidence"),
+                            "reason": row.get("reason"),
+                        }
+                        for row in handwheel_rows
+                    ],
+                },
+            )
+
         if self.include_images and self.pdf_path:
             for page_number in [page.page_number for page in group.pages[: self.max_image_pages]]:
                 local_vertices = extract_local_vertices(
                     self.pdf_path,
                     page_number,
                     group.line_id,
-                    self.candidates_by_line.get(group.line_id, []),
+                    candidates,
                 )
-                image_data = self._render_page_data_url(page_number, vertices=local_vertices)
+                handwheel_boxes = []
+                for row in handwheel_rows:
+                    if row.get("page") != page_number:
+                        continue
+                    bbox = row.get("bbox")
+                    if not bbox or len(bbox) < 4:
+                        continue
+                    try:
+                        handwheel_boxes.append({
+                            "bbox": [float(value) for value in bbox[:4]],
+                            "label": row.get("label"),
+                            "target_vertex_id": row.get("target_vertex_id"),
+                        })
+                    except (TypeError, ValueError):
+                        continue
+                image_data = self._render_page_data_url(
+                    page_number,
+                    vertices=local_vertices,
+                    handwheels=handwheel_boxes,
+                )
                 if image_data:
                     self._emit(
                         "deepseek.image.ready",
                         {
                             "page": page_number,
                             "image_kb": round(len(image_data.encode("utf-8")) / 1024, 1),
+                            "handwheel_count": len(handwheel_boxes),
                         },
                     )
                     content.append({"type": "image_url", "image_url": {"url": image_data}})
@@ -755,25 +1061,7 @@ class DeepSeekAIClient(AIClient):
             }
             for item in classifications[:220]
         ]
-        local_vertex_rows = []
-        for page in group.pages:
-            local_vertices = extract_local_vertices(
-                self.pdf_path,
-                page.page_number,
-                group.line_id,
-                candidates,
-            ) if self.pdf_path else []
-            local_vertex_rows.extend(
-                {
-                    "id": vertex.id,
-                    "page": vertex.page,
-                    "label": vertex.label,
-                    "role": vertex.role,
-                    "x": vertex.x,
-                    "y": vertex.y,
-                }
-                for vertex in local_vertices
-            )
+        local_vertex_rows = self._known_vertex_rows_for_group(group, candidates)
         drawing_dimensions = [
             {
                 "id": candidate.id,
@@ -1028,6 +1316,7 @@ PDF-кандидаты:
         page_number: int,
         zoom: float = 1.0,
         vertices: list[VertexMark] | None = None,
+        handwheels: list[dict[str, Any]] | None = None,
     ) -> str | None:
         if not self.pdf_path:
             return None
@@ -1038,7 +1327,7 @@ PDF-кандидаты:
             image_bytes = pixmap.tobytes("jpeg", jpg_quality=75)
         finally:
             document.close()
-        if vertices:
+        if vertices or handwheels:
             from PIL import Image, ImageDraw, ImageFont
 
             image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -1047,23 +1336,51 @@ PDF-кандидаты:
                 font = ImageFont.truetype("arial.ttf", size=max(9, int(9 * zoom)))
             except Exception:
                 font = ImageFont.load_default()
-            for vertex in vertices:
-                x = vertex.x * zoom
-                y = vertex.y * zoom
-                draw.ellipse(
-                    (x - 6, y - 6, x + 6, y + 6),
-                    fill=(220, 38, 38, 255),
-                    outline=(255, 255, 255, 255),
-                    width=2,
-                )
-                draw.text(
-                    (x + 8, y - 14),
-                    vertex.label,
-                    fill=(220, 38, 38, 255),
-                    font=font,
-                    stroke_width=1,
-                    stroke_fill=(255, 255, 255, 220),
-                )
+            if vertices:
+                for vertex in vertices:
+                    x = vertex.x * zoom
+                    y = vertex.y * zoom
+                    draw.ellipse(
+                        (x - 6, y - 6, x + 6, y + 6),
+                        fill=(220, 38, 38, 255),
+                        outline=(255, 255, 255, 255),
+                        width=2,
+                    )
+                    draw.text(
+                        (x + 8, y - 14),
+                        vertex.label,
+                        fill=(220, 38, 38, 255),
+                        font=font,
+                        stroke_width=1,
+                        stroke_fill=(255, 255, 255, 220),
+                    )
+            if handwheels:
+                for item in handwheels:
+                    bbox = item.get("bbox") or []
+                    if len(bbox) < 4:
+                        continue
+                    try:
+                        x0, y0, x1, y1 = [float(value) * zoom for value in bbox[:4]]
+                    except (TypeError, ValueError):
+                        continue
+                    try:
+                        draw.rectangle((x0, y0, x1, y1), outline=(37, 99, 235, 255), width=3)
+                        label = str(item.get("label") or "штурвал")[:28]
+                        # Небольшой фон под подписью, чтобы читалось поверх чертежа.
+                        text_y = max(0.0, y0 - 16)
+                        draw.rectangle(
+                            (x0 + 2, text_y, x0 + 8 + len(label) * 7, text_y + 14),
+                            fill=(255, 255, 255, 220),
+                        )
+                        draw.text(
+                            (x0 + 4, text_y + 1),
+                            label,
+                            fill=(37, 99, 235, 255),
+                            font=font,
+                        )
+                    except Exception:
+                        # Никогда не падаем из-за одной битой аннотации.
+                        continue
             output = io.BytesIO()
             image.save(output, format="JPEG", quality=85)
             image_bytes = output.getvalue()

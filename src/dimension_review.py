@@ -184,10 +184,20 @@ def calculate_lengths(mapping: dict[str, Any], review: dict[str, Any]) -> dict[s
             edge_ids = [row["edge_id"]]
         include_rows.append((len(edge_ids), float(dimensions[candidate_id].get("value_mm", 0)), candidate_id, edge_ids))
     for _coverage_count, _value, candidate_id, edge_ids in sorted(include_rows, reverse=True):
-        if edge_ids and covered_edges.intersection(edge_ids):
+        primary_edge_ids = []
+        row = decision_rows.get(candidate_id, {})
+        if row.get("edge_id"):
+            primary_edge_ids = [row["edge_id"]]
+        elif edge_ids:
+            primary_edge_ids = [edge_ids[0]]
+
+        if primary_edge_ids and covered_edges.intersection(primary_edge_ids):
             duplicate_candidate_ids.append(candidate_id)
             continue
-        covered_edges.update(edge_ids)
+        if primary_edge_ids:
+            covered_edges.update(primary_edge_ids)
+        elif edge_ids:
+            covered_edges.update(edge_ids)
         counted_candidate_ids.append(candidate_id)
     clean = sum(
         float(dimensions[candidate_id].get("value_mm", 0))

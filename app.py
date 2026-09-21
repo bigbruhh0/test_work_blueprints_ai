@@ -338,6 +338,22 @@ def show_dataframe(title: str, data: pd.DataFrame) -> None:
         st.dataframe(data, width="stretch", hide_index=True)
 
 
+def is_handwheel_like(text: str) -> bool:
+    normalized = (text or "").lower()
+    keywords = (
+        "штурвал",
+        "рукоятка",
+        "рукоять",
+        "маховик",
+        "wheel",
+        "handwheel",
+        "handle",
+        "lever",
+        "crank",
+    )
+    return any(keyword in normalized for keyword in keywords)
+
+
 def result_dataframe(result, field_name: str) -> pd.DataFrame:
     return dataframe_for(getattr(result, field_name, []))
 
@@ -448,6 +464,9 @@ def event_message(event: str, payload: dict) -> str:
         return f"{line_id}: JSON ответа разобран ({payload.get('content_chars')} символов)"
     if event.startswith("deepseek.") and "error" in payload:
         return f"{line_id or 'provider'}: {payload.get('error')}"
+    if event == "deepseek.handwheels.found":
+        pages = [hw.get("page") for hw in payload.get("handwheels", [])]
+        return f"{line_id}: найдено штурвалов {payload.get('count')} (стр. {pages})"
     return event
 
 
@@ -1784,20 +1803,70 @@ with tabs[6]:
 
 with tabs[7]:
     st.subheader("Разметка")
-    if annotations_df.empty:
+    available_pages = sorted({item.page for item in project.result.annotations}) or sorted({candidate.page for candidate in project.result.candidates})
+    if not available_pages:
         st.info("Разметка пока отсутствует.")
     else:
-        available_pages = sorted({item.page for item in project.result.annotations})
         selected_page = st.selectbox("Страница", available_pages)
+
         page_annotations = annotations_for_page(project.result.annotations, selected_page)
+        page_candidates = [candidate for candidate in project.result.candidates if candidate.page == selected_page]
+        page_handwheels = [
+            annotation
+            for annotation in page_annotations
+            if annotation.kind == "valve" or is_handwheel_like(annotation.label)
+        ]
+        if not page_handwheels:
+            page_handwheels = [
+                annotation
+                for annotation in page_annotations
+                if is_handwheel_like((annotation.label or ""))
+            ]
+
         skipped_annotations = len(page_annotations) - len(drawable_annotations(page_annotations))
         if skipped_annotations:
             st.caption(f"Аннотаций без bbox не отрисовано: {skipped_annotations}")
         try:
             image_bytes = render_page_with_annotations(st.session_state["pdf_path"], selected_page, page_annotations)
-            st.image(image_bytes, caption=f"Страница {selected_page}: MVP-разметка", width="stretch")
+            st.image(image_bytes, caption=f"Страница {selected_page}: локальная разметка", width="stretch")
         except Exception as error:
             st.error(f"Не удалось отрисовать страницу: {error}")
+
+        if page_candidates:
+            local_candidates_df = pd.DataFrame(
+                [
+                    {
+                        "id": candidate.id,
+                        "page": candidate.page,
+                        "kind": candidate.kind,
+                        "text": candidate.text,
+                        "zone": candidate.zone,
+                        "bbox": list(candidate.bbox),
+                        "confidence": round(candidate.confidence, 3),
+                    }
+                    for candidate in page_candidates
+                ]
+            )
+            st.subheader("Локальные кандидаты страницы")
+            st.dataframe(local_candidates_df, width="stretch", hide_index=True)
+
+        if page_handwheels:
+            handwheel_df = pd.DataFrame(
+                [
+                    {
+                        "id": annotation.id,
+                        "page": annotation.page,
+                        "label": annotation.label,
+                        "kind": annotation.kind,
+                        "bbox": list(annotation.bbox) if annotation.bbox else None,
+                        "color": annotation.color,
+                    }
+                    for annotation in page_handwheels
+                ]
+            )
+            st.subheader("Штурвалы / рукоятки / маховики")
+            st.dataframe(handwheel_df, width="stretch", hide_index=True)
+
         show_dataframe("Объекты разметки", annotations_df)
 
 with tabs[8]:

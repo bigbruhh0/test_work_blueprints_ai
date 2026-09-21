@@ -856,7 +856,35 @@ function pageDetailHtml(lineId, pr) {
     const mapping = analysis.dimension_mapping;
     const dimensions = mapping.dimensions || [];
     const review = analysis.dimension_review;
-    const lengths = review && review.lengths;
+    const localCandidates = dimensions.map(function (item, index) {
+      return {
+        id: item.id || ('D' + (index + 1)),
+        text: item.text || '—',
+        kind: item.kind || item.status || 'dimension',
+        status: item.status || 'mapped',
+        hints: Array.isArray(item.hints) ? item.hints : [],
+        edge_id: item.edge_id || '—',
+        gap_px: item.gap_px ?? '—',
+        leader_attached: !!item.leader_attached,
+        conflict_with: item.conflict_with || '',
+        valid: item.valid !== false,
+      };
+    });
+    const localHandwheels = localCandidates.filter(function (item) {
+      return item.status === 'handwheel' || (item.hints || []).includes('handwheel');
+    });
+    const lengths = review && review.lengths ? review.lengths : {
+      clean_length_mm: 0,
+      dirty_length_mm: 0,
+      ambiguous_length_mm: 0,
+      included_candidate_ids: [],
+      excluded_candidate_ids: [],
+      ambiguous_candidate_ids: [],
+      duplicate_included_candidate_ids: [],
+      deterministically_invalid_candidate_ids: [],
+      main: { clean_length_mm: 0, dirty_length_mm: 0, ambiguous_length_mm: 0 },
+      branch: { clean_length_mm: 0, dirty_length_mm: 0, ambiguous_length_mm: 0 }
+    };
     const routeKpi = function (label, route) {
       if (!route) return '';
       return '<div class="route-kpi ' + (label === 'Ответвления' ? 'branch' : 'main') + '"><span>' + label + '</span><strong>чистая ' + esc(route.clean_length_mm) + ' мм</strong><small>грязная ' + esc(route.dirty_length_mm) + ' мм · сомнения ' + esc(route.ambiguous_length_mm) + ' мм</small></div>';
@@ -870,12 +898,32 @@ function pageDetailHtml(lineId, pr) {
     const invalidCandidates = (lengths.deterministically_invalid_candidate_ids || []).length
       ? '<div class="notes"><b>Предварительно невалидно</b><p><span class="badge err">не считается в длине</span> ' + esc((lengths.deterministically_invalid_candidate_ids || []).join(', ') || '—') + '</p></div>'
       : '';
-    const reviewBlock = review
-      ? '<div class="review-summary"><div class="kpi"><div><span class="kpi-label">Чистая длина</span><strong>' + esc(lengths.clean_length_mm) + ' мм</strong></div><div><span class="kpi-label">Грязная длина</span><strong>' + esc(lengths.dirty_length_mm) + ' мм</strong></div></div><div class="route-kpis">' + routeKpi('Основная линия', lengths.main) + routeKpi('Ответвления', lengths.branch) + '</div><div class="notes"><b>Проверка провайдером</b><p>Сомнения: <b>' + esc(lengths.ambiguous_length_mm) + ' мм</b> · дубли включённых: ' + esc((lengths.duplicate_included_candidate_ids || []).join(', ') || '—') + '</p>' + branchInfo + crossSheetInfo + '<p>include: ' + esc((lengths.included_candidate_ids || []).join(', ') || '—') + '<br>exclude: ' + esc((lengths.excluded_candidate_ids || []).join(', ') || '—') + '<br>ambiguous: ' + esc((lengths.ambiguous_candidate_ids || []).join(', ') || '—') + '</p></div>' + invalidCandidates + '</div>'
+    const evalStats = review && review.eval
+      ? '<div class="notes"><b>Eval по эталону</b>' + Object.entries(review.eval).map(function ([groupId, stats]) {
+          return '<p><span class="badge run">' + esc(groupId) + '</span> ' + esc(stats.accuracy) + '% (' + esc(stats.correct) + '/' + esc(stats.total_candidates) + ') — ' + esc(stats.incorrect) + ' ошибок</p>';
+        }).join('') + '</div>'
       : '';
+    const reviewBlock = review
+      ? '<div class="review-summary"><div class="kpi"><div><span class="kpi-label">Чистая длина</span><strong>' + esc(lengths.clean_length_mm) + ' мм</strong></div><div><span class="kpi-label">Грязная длина</span><strong>' + esc(lengths.dirty_length_mm) + ' мм</strong></div></div><div class="route-kpis">' + routeKpi('Основная линия', lengths.main) + routeKpi('Ответвления', lengths.branch) + '</div><div class="notes"><b>Проверка провайдером</b><p>Сомнения: <b>' + esc(lengths.ambiguous_length_mm) + ' мм</b> · дубли включённых: ' + esc((lengths.duplicate_included_candidate_ids || []).join(', ') || '—') + '</p>' + branchInfo + crossSheetInfo + '<p>include: ' + esc((lengths.included_candidate_ids || []).join(', ') || '—') + '<br>exclude: ' + esc((lengths.excluded_candidate_ids || []).join(', ') || '—') + '<br>ambiguous: ' + esc((lengths.ambiguous_candidate_ids || []).join(', ') || '—') + '</p></div>' + invalidCandidates + evalStats + '</div>'
+      : '';
+    const localCandidatesBlock = localCandidates.length
+      ? '<div class="notes"><b>Локальные кандидаты</b><table class="data-table"><thead><tr><th>ID</th><th>Текст</th><th>Ключ</th><th>Статус</th><th>Ребро</th></tr></thead><tbody>'
+        + localCandidates.map(function (item) {
+          return '<tr class="candidate-' + esc(item.status) + '"><td>' + esc(item.id) + '</td><td>' + esc(item.text) + '</td><td>' + esc((item.hints || []).join(', ') || item.kind) + '</td><td>' + esc(item.status) + '</td><td>' + esc(item.edge_id || '—') + '</td></tr>';
+        }).join('') + '</tbody></table></div>'
+      : '';
+    const handwheelBlock = localHandwheels.length
+      ? '<div class="notes"><b>Штурвалы / рукоятки / маховики</b><table class="data-table"><thead><tr><th>ID</th><th>Текст</th><th>Статус</th><th>Ребро</th></tr></thead><tbody>'
+        + localHandwheels.map(function (item) {
+          return '<tr class="candidate-handwheel"><td>' + esc(item.id) + '</td><td>' + esc(item.text) + '</td><td>' + esc(item.status) + '</td><td>' + esc(item.edge_id || '—') + '</td></tr>';
+        }).join('') + '</tbody></table></div>'
+      : '';
+
     return '<h4>Лист ' + pr.page_number + ' — привязка размеров</h4>'
       + '<p class="muted">Рёбер графа: ' + (mapping.edges || []).length + ' · размеров: ' + dimensions.length + '</p>'
       + reviewBlock
+      + localCandidatesBlock
+      + handwheelBlock
       + '<table class="data-table"><thead><tr><th>Размер</th><th>Отрезок</th><th>Зазор, px</th><th>Статус</th><th>Пояснение модели</th></tr></thead><tbody>'
       + (dimensions.map(function (item) {
         const reviewDecision = review && review.answer && (review.answer.candidate_decisions || []).find(function (row) { return row.candidate_id === item.id; });
@@ -1007,6 +1055,47 @@ function bindPageSelectors() {
   });
 }
 
+async function showEval() {
+  try {
+    const data = await api('/api/eval');
+    $('#eval-section').hidden = false;
+    $('#history-section').hidden = true;
+    $('#runs-section').hidden = true;
+    $('#result-section').hidden = true;
+    $('#prompt-section').hidden = true;
+    const body = $('#eval-body');
+    if (!data.prompt_versions || !data.prompt_versions.length) {
+      body.innerHTML = '<p class="muted">Нет данных eval для промптов.</p>';
+      $('#eval-section').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      return;
+    }
+    const tableRows = (data.prompt_versions || []).map(function (item) {
+      const stats = item.stats || {};
+      const groupsText = (stats.groups || []).length
+        ? (stats.groups || []).map(function (group) {
+            return esc(group.group_id) + ': ' + esc(group.accuracy) + '% (' + esc(group.correct) + '/' + esc(group.total_candidates) + ')';
+          }).join('<br>')
+        : '—';
+      return '<tr>'
+        + '<td>' + esc(item.title) + '</td>'
+        + '<td>' + esc(item.prompt_name) + '</td>'
+        + '<td>' + esc(item.version) + '</td>'
+        + '<td>' + esc(stats.accuracy) + '%</td>'
+        + '<td>' + esc(stats.correct) + '/' + esc(stats.total_candidates) + '</td>'
+        + '<td>' + groupsText + '</td>'
+        + '</tr>';
+    }).join('');
+
+    body.innerHTML = '<table class="data-table">'
+      + '<thead><tr><th>Промпт</th><th>Имя</th><th>Версия</th><th>Точность</th><th>Корректно/всего</th><th>Группы</th></tr></thead>'
+      + '<tbody>' + tableRows + '</tbody>'
+      + '</table>';
+    $('#eval-section').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } catch (error) {
+    $('#eval-body').innerHTML = '<div class="badge error">' + esc(error.message) + '</div>';
+  }
+}
+
 async function showHistory() {
   try {
     const runs = await api('/api/runs');
@@ -1014,6 +1103,7 @@ async function showHistory() {
     $('#runs-section').hidden = true;
     $('#result-section').hidden = true;
     $('#prompt-section').hidden = true;
+    $('#eval-section').hidden = true;
     const body = $('#history-body');
     if (!runs.length) {
       body.innerHTML = '<p class="muted">История пуста — запустите первый прогон.</p>';
@@ -1085,6 +1175,7 @@ document.addEventListener('DOMContentLoaded', function () {
   $('#start-analysis').addEventListener('click', startAnalysis);
   $('#history-button').addEventListener('click', showHistory);
   $('#prompts-button').addEventListener('click', showPrompts);
+  $('#eval-button').addEventListener('click', showEval);
   $('#save-prompt').addEventListener('click', saveCurrentPrompt);
   $('#reset-prompt').addEventListener('click', resetCurrentPrompt);
   $('#groups-search').addEventListener('input', function (event) {
