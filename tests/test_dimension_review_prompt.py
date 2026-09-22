@@ -8,7 +8,7 @@ import fitz
 
 from src.dimension_mapping import _dimension_hints_from_text, _first_arrow_third, _handwheel_arrow_segments, _handwheel_details, _handwheel_text_rects, _is_rectangle_side, _same_directed_contour, apply_local_dimension_filter, compute_endpoint_adjustments, compute_extension_vertices, save_clean_local_markup_pdf, save_local_dimension_filter_pdf, save_preprocess_annotation_pdf
 from src.dimension_mapping import _direct_dimension_stroke_from_label, _fallback_leader_stroke_from_label, _find_extension_strokes, _merge_dimension_stroke, _resolve_leader_target
-from src.dimension_mapping import _annotation_arrow_segments, _glyph_pipe_vertex_rows, _handwheel_glyph_parallelograms, _handwheel_glyph_rows, _reserved_annotation_strokes, annotate_valve_edges
+from src.dimension_mapping import _annotation_arrow_segments, _glyph_pipe_vertex_rows, _handwheel_glyph_parallelograms, _handwheel_glyph_rows, _reserved_annotation_strokes, annotate_valve_edges, compute_final_vertices, split_edges_by_final_vertices
 from src.dimension_review import build_review_payload
 
 
@@ -626,12 +626,23 @@ class DimensionRuleTests(unittest.TestCase):
         self.assertGreaterEqual(max_x, 140.0)
         self.assertLessEqual(min_y, 100.0)
         self.assertGreaterEqual(max_y, 160.0)
+        self.assertEqual(glyphs[0]["legs"], [
+            [[100.0, 100.0], [140.0, 160.0]],
+            [[100.0, 160.0], [140.0, 100.0]],
+        ])
 
     def test_glyph_pipe_vertices_span_glyph_along_edge(self) -> None:
         mapping = {
             "edges": [{"id": "E1", "start": [0.0, 100.0], "end": [200.0, 100.0]}],
             "handwheel_glyphs": [
-                {"id": "HG-01", "center": [50.0, 98.0], "corners": [[30.0, 88.0], [70.0, 88.0], [70.0, 108.0], [30.0, 108.0]]},
+                {
+                    "id": "HG-01",
+                    "center": [50.0, 98.0],
+                    "legs": [
+                        [[30.0, 88.0], [70.0, 88.0]],
+                        [[40.0, 108.0], [60.0, 108.0]],
+                    ],
+                },
             ],
         }
 
@@ -643,12 +654,64 @@ class DimensionRuleTests(unittest.TestCase):
         self.assertEqual(start["point"], [30.0, 100.0])
         self.assertEqual(end["point"], [70.0, 100.0])
         self.assertEqual(start["edge_id"], "E1")
+        self.assertEqual(start["source"], "handwheel_glyph_span")
+        self.assertEqual(start["symbol_points"], [[30.0, 88.0], [70.0, 88.0], [40.0, 108.0], [60.0, 108.0]])
+        self.assertEqual(len(rows[0]["symbol_points"]), 4)
 
-    def test_glyph_pipe_vertices_follow_glyph_beyond_edge_ends(self) -> None:
+    def test_glyph_pipe_vertices_vertical_diagonal_and_clamped(self) -> None:
+        mapping = {
+            "edges": [
+                {"id": "E_V", "start": [50.0, 0.0], "end": [50.0, 200.0]},
+                {"id": "E_D", "start": [0.0, 0.0], "end": [100.0, 100.0]},
+            ],
+            "handwheel_glyphs": [
+                {
+                    "id": "HG-V",
+                    "center": [50.0, 50.0],
+                    "legs": [
+                        [[48.0, 42.0], [52.0, 58.0]],
+                        [[52.0, 42.0], [48.0, 58.0]],
+                    ],
+                },
+                {
+                    "id": "HG-D",
+                    "center": [70.0, 70.0],
+                    "legs": [
+                        [[58.0, 62.0], [82.0, 78.0]],
+                        [[58.0, 78.0], [82.0, 62.0]],
+                    ],
+                },
+            ],
+        }
+
+        rows = _glyph_pipe_vertex_rows(mapping)
+
+        self.assertEqual([row["id"] for row in rows], ["HG-V-A", "HG-V-B", "HG-D-A", "HG-D-B"])
+        vertical = [row for row in rows if row["handwheel_id"] == "HG-V"]
+        diagonal = [row for row in rows if row["handwheel_id"] == "HG-D"]
+        start_vertical = next(row for row in vertical if row["role"] == "start")
+        end_vertical = next(row for row in vertical if row["role"] == "end")
+        self.assertEqual(start_vertical["point"], [50.0, 42.0])
+        self.assertEqual(end_vertical["point"], [50.0, 58.0])
+        start_diagonal = next(row for row in diagonal if row["role"] == "start")
+        end_diagonal = next(row for row in diagonal if row["role"] == "end")
+        self.assertAlmostEqual(start_diagonal["point"][0], 60.0, places=6)
+        self.assertAlmostEqual(start_diagonal["point"][1], 60.0, places=6)
+        self.assertAlmostEqual(end_diagonal["point"][0], 80.0, places=6)
+        self.assertAlmostEqual(end_diagonal["point"][1], 80.0, places=6)
+
+    def test_glyph_pipe_vertices_clamp_to_edge_bounds(self) -> None:
         mapping = {
             "edges": [{"id": "E1", "start": [40.0, 100.0], "end": [60.0, 100.0]}],
             "handwheel_glyphs": [
-                {"id": "HG-01", "center": [50.0, 98.0], "corners": [[30.0, 88.0], [70.0, 88.0], [70.0, 108.0], [30.0, 108.0]]},
+                {
+                    "id": "HG-01",
+                    "center": [50.0, 98.0],
+                    "legs": [
+                        [[30.0, 88.0], [70.0, 88.0]],
+                        [[40.0, 108.0], [60.0, 108.0]],
+                    ],
+                },
             ],
         }
 
@@ -656,18 +719,260 @@ class DimensionRuleTests(unittest.TestCase):
         start = next(row for row in rows if row["role"] == "start")
         end = next(row for row in rows if row["role"] == "end")
 
-        self.assertEqual(start["point"], [30.0, 100.0])
-        self.assertEqual(end["point"], [70.0, 100.0])
+        self.assertEqual(start["point"], [40.0, 100.0])
+        self.assertEqual(end["point"], [60.0, 100.0])
+        self.assertEqual(start["source_point"], [50.0, 100.0])
+
+    def test_glyph_pipe_vertices_gap_glyph_places_vertex_at_symbol_far_end(self) -> None:
+        mapping = {
+            "edges": [{"id": "E1", "start": [0.0, 100.0], "end": [40.0, 100.0]}],
+            "handwheel_glyphs": [
+                {
+                    "id": "HG-01",
+                    "center": [50.0, 98.0],
+                    "legs": [
+                        [[40.0, 92.0], [80.0, 92.0]],
+                        [[50.0, 108.0], [70.0, 108.0]],
+                    ],
+                },
+            ],
+        }
+
+        rows = _glyph_pipe_vertex_rows(mapping)
+        start = next(row for row in rows if row["role"] == "start")
+        end = next(row for row in rows if row["role"] == "end")
+
+        self.assertEqual(start["point"], [40.0, 100.0])
+        self.assertEqual(end["point"], [80.0, 100.0])
+        self.assertNotEqual(start["point"], end["point"])
 
     def test_glyph_pipe_vertices_skip_when_no_pipe_edge_nearby(self) -> None:
         mapping = {
             "edges": [{"id": "E9", "start": [500.0, 500.0], "end": [600.0, 500.0]}],
             "handwheel_glyphs": [
-                {"id": "HG-01", "center": [50.0, 50.0], "corners": [[40.0, 40.0], [60.0, 40.0], [60.0, 60.0], [40.0, 60.0]]},
+                {
+                    "id": "HG-01",
+                    "center": [50.0, 50.0],
+                    "legs": [
+                        [[40.0, 40.0], [60.0, 60.0]],
+                        [[40.0, 60.0], [60.0, 40.0]],
+                    ],
+                },
             ],
         }
 
         self.assertEqual(_glyph_pipe_vertex_rows(mapping), [])
+
+    def test_final_vertices_priority_leaves_only_handwheel_vertex(self) -> None:
+        mapping = {
+            "edges": [{"id": "E1", "start": [0.0, 100.0], "end": [200.0, 100.0]}],
+            "extension_vertices": [
+                {"id": "VE-01", "dimension_ids": ["D001"], "pipe_edge_id": "E1", "point": [31.0, 100.0]},
+                {"id": "VE-02", "dimension_ids": ["D002"], "pipe_edge_id": "E1", "point": [120.0, 99.0]},
+                {"id": "VE-03", "dimension_ids": ["D002"], "pipe_edge_id": "E1", "point": [150.0, 100.0]},
+            ],
+            "handwheel_glyphs": [
+                {
+                    "id": "HG-01",
+                    "center": [49.0, 96.0],
+                    "legs": [
+                        [[30.0, 88.0], [70.0, 88.0]],
+                        [[40.0, 108.0], [60.0, 108.0]],
+                    ],
+                },
+            ],
+        }
+
+        final = compute_final_vertices(mapping)
+
+        ids = [row["id"] for row in final]
+        self.assertIn("HG-01-A", ids)
+        self.assertIn("HG-01-B", ids)
+        self.assertIn("VE-02", ids)
+        self.assertIn("VE-03", ids)
+        self.assertNotIn("VE-01", ids)
+        handwheel_row = next(row for row in final if row["id"] == "HG-01-A")
+        self.assertEqual(handwheel_row["replaced_vertex_ids"], ["VE-01"])
+        self.assertEqual(handwheel_row["replace_reason"], "handwheel_priority")
+
+    def test_final_vertices_merge_along_pipe_axis_only(self) -> None:
+        mapping = {
+            "edges": [{"id": "E1", "start": [0.0, 100.0], "end": [200.0, 100.0]}],
+            "extension_vertices": [
+                {"id": "VE-01", "pipe_edge_id": "E1", "point": [42.0, 100.0]},
+                {"id": "VE-02", "pipe_edge_id": "E1", "point": [40.0, 130.0]},
+                {"id": "VE-03", "pipe_edge_id": "E_OTHER", "point": [44.0, 100.0]},
+            ],
+            "handwheel_glyphs": [
+                {
+                    "id": "HG-01",
+                    "center": [48.0, 96.0],
+                    "legs": [
+                        [[30.0, 88.0], [70.0, 88.0]],
+                        [[40.0, 108.0], [60.0, 108.0]],
+                    ],
+                },
+            ],
+        }
+
+        final = compute_final_vertices(mapping)
+        ids = [row["id"] for row in final]
+
+        self.assertNotIn("VE-01", ids)
+        self.assertEqual(next(row for row in final if row["id"] == "HG-01-A")["replaced_vertex_ids"], ["VE-01"])
+        self.assertIn("VE-02", ids, "поперечное смещение > 6 px не считается совпадением")
+        self.assertIn("VE-03", ids, "вершины с других рёбер не затрагиваются")
+
+    def test_final_vertices_keep_close_vertices_of_different_handwheels(self) -> None:
+        mapping = {
+            "edges": [{"id": "E1", "start": [0.0, 100.0], "end": [200.0, 100.0]}],
+            "extension_vertices": [],
+            "handwheel_glyphs": [
+                {
+                    "id": "HG-01",
+                    "center": [40.0, 98.0],
+                    "legs": [
+                        [[30.0, 92.0], [70.0, 92.0]],
+                        [[30.0, 104.0], [50.0, 104.0]],
+                    ],
+                },
+                {
+                    "id": "HG-02",
+                    "center": [45.0, 98.0],
+                    "legs": [
+                        [[35.0, 92.0], [75.0, 92.0]],
+                        [[35.0, 104.0], [55.0, 104.0]],
+                    ],
+                },
+            ],
+        }
+
+        final = compute_final_vertices(mapping)
+
+        handwheel_ids = list(dict.fromkeys(row["handwheel_id"] for row in final))
+        self.assertEqual(handwheel_ids, ["HG-01", "HG-02"])
+        for helper in ("HG-01-A", "HG-01-B", "HG-02-A", "HG-02-B"):
+            self.assertIn(helper, [row["id"] for row in final])
+
+    def test_split_edges_by_final_vertices_no_gaps(self) -> None:
+        mapping = {
+            "final_vertices": [
+                {"id": "VE-01", "point": [30.0, 100.0], "vertex_source": "extension"},
+                {"id": "VE-02", "point": [70.0, 100.0], "vertex_source": "extension"},
+            ],
+            "edges": [{"id": "E1", "start": [0.0, 100.0], "end": [100.0, 100.0], "pixel_length": 100.0, "from_node_id": "N1", "to_node_id": "N2"}],
+            "dimensions": [],
+        }
+
+        segments = split_edges_by_final_vertices(mapping)
+
+        self.assertEqual([segment["id"] for segment in segments], ["E1.01", "E1.02", "E1.03"])
+        self.assertEqual(segments[0]["parent_edge_id"], "E1")
+        self.assertEqual(segments[0]["from_vertex_id"], None)
+        self.assertEqual(segments[0]["to_vertex_id"], "VE-01")
+        self.assertEqual(segments[1]["from_vertex_id"], "VE-01")
+        self.assertEqual(segments[1]["to_vertex_id"], "VE-02")
+        self.assertEqual(segments[2]["to_vertex_id"], None)
+        total = sum(float(segment["pixel_length"]) for segment in segments)
+        self.assertEqual(total, 100.0)
+        self.assertEqual(mapping["parent_edges"][0]["id"], "E1")
+        self.assertEqual(mapping["edges"][0]["id"], "E1.01")
+        self.assertFalse(any(segment.get("is_handwheel_segment") for segment in segments))
+
+    def test_split_marks_handwheel_segments_as_valve(self) -> None:
+        mapping = {
+            "final_vertices": [
+                {"id": "HG-01-A", "handwheel_id": "HG-01", "point": [30.0, 100.0],
+                 "source": "handwheel_glyph_span", "symbol_span_px": [30.0, 47.5]},
+                {"id": "HG-01-B", "handwheel_id": "HG-01", "point": [47.5, 100.0],
+                 "source": "handwheel_glyph_span", "symbol_span_px": [30.0, 47.5]},
+            ],
+            "edges": [{"id": "E1", "start": [0.0, 100.0], "end": [100.0, 100.0], "element_type": "pipe", "is_valve_edge": False, "from_node_id": "N1", "to_node_id": "N2"}],
+            "dimensions": [],
+        }
+
+        split_edges_by_final_vertices(mapping)
+
+        acting = [segment for segment in mapping["edge_segments"] if segment.get("is_handwheel_segment")]
+        self.assertTrue(acting)
+        for segment in acting:
+            self.assertIn("HG-01", segment["handwheel_ids"])
+
+    def test_handwheel_in_gap_builds_own_valve_segment(self) -> None:
+        mapping = {
+            "handwheel_vertices": [
+                {
+                    "id": "HG-01-A",
+                    "handwheel_id": "HG-01",
+                    "edge_id": "E1",
+                    "point": [40.0, 100.0],
+                    "symbol_span_px": [40.0, 80.0],
+                    "source": "handwheel_glyph_span",
+                },
+                {
+                    "id": "HG-01-B",
+                    "handwheel_id": "HG-01",
+                    "edge_id": "E1",
+                    "point": [40.0, 100.0],
+                    "symbol_span_px": [40.0, 80.0],
+                    "source": "handwheel_glyph_span",
+                },
+            ],
+            "edges": [{"id": "E1", "start": [0.0, 100.0], "end": [40.0, 100.0], "element_type": "pipe", "from_node_id": "N1", "to_node_id": "N2"}],
+            "final_vertices": [],
+            "dimensions": [],
+        }
+
+        split_edges_by_final_vertices(mapping)
+
+        bridge = next(segment for segment in mapping["edge_segments"] if segment["id"] == "HG-01-SEG")
+        self.assertEqual(bridge["start"], [40.0, 100.0])
+        self.assertEqual(bridge["end"], [80.0, 100.0])
+        self.assertEqual(bridge["parent_edge_id"], "E1")
+        self.assertEqual(bridge["from_vertex_id"], "HG-01-A")
+        self.assertEqual(bridge["to_vertex_id"], "HG-01-B")
+        self.assertTrue(bridge["is_handwheel_segment"])
+        self.assertEqual(bridge["element_type"], "valve")
+        self.assertEqual(bridge["handwheel_ids"], ["HG-01"])
+        self.assertNotIn("HG-01", [handwheel_id for segment in mapping["edge_segments"] if segment["id"] == "E1.01" for handwheel_id in segment["handwheel_ids"]])
+
+    def test_dimension_remap_uses_new_edge_ids(self) -> None:
+        mapping = {
+            "final_vertices": [
+                {"id": "VE-01", "point": [30.0, 100.0], "vertex_source": "extension"},
+            ],
+            "edges": [{"id": "E1", "start": [0.0, 100.0], "end": [100.0, 100.0]}],
+            "dimensions": [
+                {
+                    "id": "D001",
+                    "edge_id": "E1",
+                    "dimension_stroke": {"start": [35.0, 96.0], "end": [45.0, 96.0], "merged_indices": [1]},
+                },
+                {
+                    "id": "D002",
+                    "edge_id": "E1",
+                    "dimension_stroke": {"start": [10.0, 96.0], "end": [40.0, 96.0], "merged_indices": [2]},
+                },
+            ],
+        }
+
+        split_edges_by_final_vertices(mapping)
+
+        first = mapping["dimensions"][0]
+        second = mapping["dimensions"][1]
+        self.assertEqual(first["edge_id"], "E1.02")
+        self.assertEqual(first["edge_segments_ids"], ["E1.02"])
+        self.assertEqual(second["edge_segments_ids"], ["E1.01", "E1.02"])
+        self.assertEqual(second["edge_id"], "E1")
+
+    def test_local_dimension_filter_does_not_render_legacy_vertices(self) -> None:
+        source = Path("src/dimension_mapping.py").read_text(encoding="utf-8")
+        filter_start = source.index("def save_local_dimension_filter_pdf")
+        filter_end = source.index("def save_clean_graph_pdf")
+        block = source[filter_start:filter_end]
+        self.assertNotIn('mapping.get("vertices", [])', block)
+        self.assertNotIn("mapping.get(\"vertices\")", block)
+        self.assertIn("final_vertices", block)
 
     def test_handwheel_glyph_ignores_t_cross_and_parallel_lines(self) -> None:
         drawings = [{"items": [

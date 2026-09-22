@@ -1862,7 +1862,8 @@ def map_dimensions(pdf_path: str | Path, page_number: int) -> dict[str, Any]:
         result["handwheels"] = _handwheel_details(page, result)
         annotate_valve_edges(result)
         result["handwheel_glyphs"] = _handwheel_glyph_rows(page)
-        result["handwheel_vertices"] = _glyph_pipe_vertex_rows(result)
+        compute_final_vertices(result)
+        split_edges_by_final_vertices(result)
         return result
 
 
@@ -2256,7 +2257,16 @@ def _handwheel_glyph_parallelograms(
                             round(cross[1] + sign_first * first_half * first_uy + sign_second * second_half * second_uy, 2),
                         ]
                     )
-            found.append({"center": [round(cross[0], 2), round(cross[1], 2)], "corners": corners})
+            found.append(
+                {
+                    "center": [round(cross[0], 2), round(cross[1], 2)],
+                    "corners": corners,
+                    "legs": [
+                        [[round(first_start[0], 2), round(first_start[1], 2)], [round(first_end[0], 2), round(first_end[1], 2)]],
+                        [[round(second_start[0], 2), round(second_start[1], 2)], [round(second_end[0], 2), round(second_end[1], 2)]],
+                    ],
+                }
+            )
     for index, glyph in enumerate(found, start=1):
         glyph["id"] = f"HG-{index:02d}"
     return found
@@ -2351,23 +2361,31 @@ HANDWHEEL_GLYPH_VERTEX_MAX_EDGE_GAP_PX = 45.0
 
 
 def _glyph_pipe_vertex_rows(mapping: dict[str, Any]) -> list[dict[str, Any]]:
-    """Две вершины на контуре трубы — начало и конец штурвала по его розовой метке."""
+    """Начало и конец штурвала на контуре трубы — по фактическим крайним точкам символа."""
     edges = mapping.get("edges") or []
     vertices: list[dict[str, Any]] = []
     for glyph in mapping.get("handwheel_glyphs") or []:
-        corners = glyph.get("corners") or []
+        legs = glyph.get("legs") or []
         center = glyph.get("center")
-        if not center or len(center) < 2 or len(corners) != 4:
+        if not center or len(center) < 2 or len(legs) != 2:
+            continue
+        symbol_points = [
+            [float(point[0]), float(point[1])]
+            for leg in legs
+            for point in leg
+            if isinstance(point, list) and len(point) >= 2
+        ]
+        if len(symbol_points) < 4:
             continue
         center_point = (float(center[0]), float(center[1]))
         best = None
         for edge in edges:
-            gap, _position, projection = _distance_to_segment(center_point, tuple(edge["start"]), tuple(edge["end"]))
+            gap, position, projection = _distance_to_segment(center_point, tuple(edge["start"]), tuple(edge["end"]))
             if best is None or gap < best[0]:
-                best = (gap, edge, projection)
+                best = (gap, edge, position, projection)
         if best is None or best[0] > HANDWHEEL_GLYPH_VERTEX_MAX_EDGE_GAP_PX:
             continue
-        _gap, edge, projection = best
+        _gap, edge, center_position, center_projection = best
         edge_start = edge["start"]
         edge_end = edge["end"]
         edge_length = _point_distance(tuple(edge_start), tuple(edge_end)) or 1.0
@@ -2377,8 +2395,19 @@ def _glyph_pipe_vertex_rows(mapping: dict[str, Any]) -> list[dict[str, Any]]:
         def offset_along(point: list[float]) -> float:
             return (point[0] - edge_start[0]) * unit_x + (point[1] - edge_start[1]) * unit_y
 
-        offsets = [offset_along(corner) for corner in corners]
-        for suffix, role, position in (("A", "start", min(offsets)), ("B", "end", max(offsets))):
+        symbol_offsets = [offset_along(point) for point in symbol_points]
+        raw_low, raw_high = min(symbol_offsets), max(symbol_offsets)
+        if min(raw_high, edge_length) - max(raw_low, 0.0) >= 1.0:
+            # штурвал на трубе: вершины зажимаются границами ребра
+            positions = [min(max(offset, 0.0), edge_length) for offset in symbol_offsets]
+            position_by_role = {"A": min(positions), "B": max(positions)}
+            clamped_template = True
+        else:
+            # штурвал в разрыве за концом ребра: вершины по фактическим крайним точкам символа
+            position_by_role = {"A": raw_low, "B": raw_high}
+            clamped_template = False
+        for suffix, role in (("A", "start"), ("B", "end")):
+            position = position_by_role[suffix]
             vertices.append(
                 {
                     "id": f"{glyph['id']}-{suffix}",
@@ -2386,10 +2415,263 @@ def _glyph_pipe_vertex_rows(mapping: dict[str, Any]) -> list[dict[str, Any]]:
                     "role": role,
                     "handwheel_id": glyph.get("id"),
                     "edge_id": edge.get("id"),
+                    "source_point": [round(center_projection[0], 2), round(center_projection[1], 2)],
+                    "symbol_points": [[round(point[0], 2), round(point[1], 2)] for point in symbol_points],
+                    "symbol_span_px": [round(raw_low, 2), round(raw_high, 2)],
                     "point": [round(edge_start[0] + position * unit_x, 2), round(edge_start[1] + position * unit_y, 2)],
                 }
             )
     return vertices
+
+
+FINAL_VERTEX_ALONG_PX = 17.0
+FINAL_VERTEX_PERPENDICULAR_PX = 6.0
+
+
+def compute_final_vertices(mapping: dict[str, Any]) -> list[dict[str, Any]]:
+    """Единый финальный набор вершин: выносные размеры (VE) + штурвальные (HG).
+
+    При совпадении остаётся HG-вершина, конфликтная VE-вершина удаляется
+    с фиксацией replaced_vertex_ids и причины handwheel_priority. Совпадением
+    считается близость ТОЛЬКО вдоль оси ребра, на котором стоят обе вершины:
+    вдоль трубы <= 17 px и поперёк <= 6 px. VE-вершины с других рёбер не затрагиваются.
+    """
+    handwheel_vertices = _glyph_pipe_vertex_rows(mapping)
+    edge_unit_by_id: dict[str, tuple[float, float]] = {}
+    for edge in mapping.get("edges") or []:
+        edge_length = _point_distance(tuple(edge["start"]), tuple(edge["end"])) or 1.0
+        edge_unit_by_id[edge.get("id")] = (
+            (edge["end"][0] - edge["start"][0]) / edge_length,
+            (edge["end"][1] - edge["start"][1]) / edge_length,
+        )
+    final: list[dict[str, Any]] = []
+    for row in handwheel_vertices:
+        final.append({**row, "vertex_source": "handwheel"})
+    for vertex in mapping.get("extension_vertices") or []:
+        point = vertex.get("point")
+        if not isinstance(point, list) or len(point) < 2:
+            continue
+
+        def find_conflict() -> dict[str, Any] | None:
+            unit = edge_unit_by_id.get(vertex.get("pipe_edge_id"))
+            if unit is None:
+                return None
+            for row in final:
+                if not row.get("handwheel_id"):
+                    continue
+                if row.get("edge_id") != vertex.get("pipe_edge_id"):
+                    continue
+                along = (point[0] - row["point"][0]) * unit[0] + (point[1] - row["point"][1]) * unit[1]
+                perpendicular = abs(
+                    (point[0] - row["point"][0]) * unit[1] - (point[1] - row["point"][1]) * unit[0]
+                )
+                if abs(along) <= FINAL_VERTEX_ALONG_PX and perpendicular <= FINAL_VERTEX_PERPENDICULAR_PX:
+                    return row
+            return None
+
+        conflict = find_conflict()
+        if conflict is not None:
+            ids = conflict.setdefault("replaced_vertex_ids", [])
+            if vertex.get("id") and vertex["id"] not in ids:
+                ids.append(vertex["id"])
+                conflict["replace_reason"] = "handwheel_priority"
+            continue
+        final.append(
+            {**vertex, "vertex_source": "extension", "edge_id": vertex.get("pipe_edge_id") or vertex.get("edge_id")}
+        )
+    mapping["handwheel_vertices"] = handwheel_vertices
+    mapping["final_vertices"] = final
+    return final
+
+
+EDGE_SPLIT_ON_EDGE_PX = 3.0
+EDGE_SPLIT_MIN_PART_PX = 2.0
+
+
+def split_edges_by_final_vertices(mapping: dict[str, Any]) -> list[dict[str, Any]]:
+    """Разделить каждое трубное ребро финальными вершинами на последовательные сегменты.
+
+    Возвращает новые сегменты (mapping["edges"] заменяется), исходные рёбра
+    сохраняются в mapping["parent_edges"]. Каждый сегмент наследует свойства
+    родительского ребра и помечает штурвальную зону признаком
+    is_handwheel_segment вместе со связанными handwheel_ids.
+    """
+    edges = mapping.get("edges") or []
+    final_vertices = [
+        vertex
+        for vertex in mapping.get("final_vertices") or []
+        if isinstance(vertex.get("point"), list) and len(vertex.get("point") or []) >= 2
+    ]
+    segments: list[dict[str, Any]] = []
+    for edge in edges:
+        edge_start = edge["start"]
+        edge_end = edge["end"]
+        edge_length = _point_distance(tuple(edge_start), tuple(edge_end)) or 1.0
+        unit_x = (edge_end[0] - edge_start[0]) / edge_length
+        unit_y = (edge_end[1] - edge_start[1]) / edge_length
+
+        points: list[tuple[float, str | None]] = [(0.0, None), (edge_length, None)]
+        for vertex in final_vertices:
+            gap, position, _projection = _distance_to_segment(tuple(vertex["point"]), tuple(edge_start), tuple(edge_end))
+            if gap > EDGE_SPLIT_ON_EDGE_PX:
+                continue
+            position_px = position * edge_length
+            if 0.5 < position_px < edge_length - 0.5:
+                points.append((position_px, vertex.get("id")))
+        # зона штурвала: фактические крайние точки символа, спроецированные на ребро
+        handwheel_spans: dict[str, list[float]] = {}
+        for vertex in final_vertices:
+            if not vertex.get("handwheel_id"):
+                continue
+            if vertex.get("edge_id") and vertex.get("edge_id") != edge.get("id"):
+                continue
+            gap, position, _projection = _distance_to_segment(tuple(vertex["point"]), tuple(edge_start), tuple(edge_end))
+            if gap > EDGE_SPLIT_ON_EDGE_PX:
+                continue
+            span = vertex.get("symbol_span_px") or [position * edge_length, position * edge_length]
+            span_start = min(max(float(span[0]), 0.0), edge_length)
+            span_end = min(max(float(span[1]), 0.0), edge_length)
+            entry = handwheel_spans.setdefault(str(vertex["handwheel_id"]), [span_start, span_end])
+            entry[0] = min(entry[0], span_start)
+            entry[1] = max(entry[1], span_end)
+
+        points.sort(key=lambda item: item[0])
+        merged: list[tuple[float, str | None]] = []
+        for position_px, vertex_id in points:
+            if merged and position_px - merged[-1][0] < EDGE_SPLIT_MIN_PART_PX:
+                if merged[-1][1] is None and vertex_id is not None:
+                    merged[-1] = (merged[-1][0], vertex_id)
+                continue
+            merged.append((position_px, vertex_id))
+        if merged[-1][0] < edge_length:
+            merged.append((edge_length, None))
+
+        for index in range(len(merged) - 1):
+            start_position, from_vertex = merged[index]
+            end_position, to_vertex = merged[index + 1]
+            if end_position - start_position <= 0.0:
+                continue
+            inside_handwheel = sorted(
+                handwheel_id
+                for handwheel_id, span in handwheel_spans.items()
+                if min(end_position, span[1]) - max(start_position, span[0]) >= 1.0
+            )
+            segments.append(
+                {
+                    **edge,
+                    "id": f"{edge['id']}.{index + 1:02d}",
+                    "start": [round(edge_start[0] + start_position * unit_x, 2), round(edge_start[1] + start_position * unit_y, 2)],
+                    "end": [round(edge_start[0] + end_position * unit_x, 2), round(edge_start[1] + end_position * unit_y, 2)],
+                    "pixel_length": round(end_position - start_position, 2),
+                    "parent_edge_id": edge.get("id"),
+                    "from_vertex_id": from_vertex,
+                    "to_vertex_id": to_vertex,
+                    "from_position_px": round(start_position, 2),
+                    "to_position_px": round(end_position, 2),
+                    "is_handwheel_segment": bool(inside_handwheel),
+                    "handwheel_ids": inside_handwheel,
+                }
+            )
+    _append_handwheel_gap_segments(mapping, edges, segments)
+    mapping["parent_edges"] = edges
+    mapping["edge_segments"] = segments
+    mapping["edges"] = segments
+    _remap_dimensions_to_edge_segments(mapping)
+    return segments
+
+
+def _append_handwheel_gap_segments(
+    mapping: dict[str, Any],
+    edges: list[dict[str, Any]],
+    segments: list[dict[str, Any]],
+) -> None:
+    """Штурвалы, стоящие в разрыве между рёбрами, получают собственный сегмент-мост.
+
+    Такое ребро покрывает фактический span символа и сразу помечается как зона
+    арматуры (element_type valve), а не до-приписывается к чужому сегменту.
+    """
+    edge_by_id = {edge.get("id"): edge for edge in edges if edge.get("id")}
+    for row in mapping.get("handwheel_vertices") or []:
+        glyph_id = row.get("handwheel_id")
+        span = row.get("symbol_span_px")
+        edge = edge_by_id.get(row.get("edge_id"))
+        if not glyph_id or not span or edge is None:
+            continue
+        if any(glyph_id in (segment.get("handwheel_ids") or []) for segment in segments):
+            continue
+        span_start = float(span[0])
+        span_end = float(span[1])
+        edge_start = edge["start"]
+        edge_end = edge["end"]
+        edge_length = _point_distance(tuple(edge_start), tuple(edge_end)) or 1.0
+        if min(span_end, edge_length) - max(span_start, 0.0) >= 1.0:
+            continue
+        low, high = sorted((span_start, span_end))
+        unit_x = (edge_end[0] - edge_start[0]) / edge_length
+        unit_y = (edge_end[1] - edge_start[1]) / edge_length
+        segments.append(
+            {
+                **edge,
+                "id": f"{glyph_id}-SEG",
+                "start": [round(edge_start[0] + low * unit_x, 2), round(edge_start[1] + low * unit_y, 2)],
+                "end": [round(edge_start[0] + high * unit_x, 2), round(edge_start[1] + high * unit_y, 2)],
+                "pixel_length": round(high - low, 2),
+                "parent_edge_id": edge.get("id"),
+                "from_vertex_id": f"{glyph_id}-A",
+                "to_vertex_id": f"{glyph_id}-B",
+                "from_position_px": round(low, 2),
+                "to_position_px": round(high, 2),
+                "element_type": "valve",
+                "is_valve_edge": True,
+                "valve_source": "handwheel_glyph",
+                "is_handwheel_segment": True,
+                "handwheel_ids": [str(glyph_id)],
+            }
+        )
+
+
+def _remap_dimensions_to_edge_segments(mapping: dict[str, Any]) -> None:
+    parent_by_id = {edge.get("id"): edge for edge in mapping.get("parent_edges") or [] if edge.get("id")}
+    segments_by_parent: dict[str, list[dict[str, Any]]] = {}
+    for segment in mapping.get("edge_segments") or []:
+        segments_by_parent.setdefault(segment.get("parent_edge_id"), []).append(segment)
+    for dimension in mapping.get("dimensions") or []:
+        parent_id = dimension.get("edge_id")
+        stroke = dimension.get("dimension_stroke")
+        if not parent_id or not isinstance(stroke, dict):
+            continue
+        parent = parent_by_id.get(parent_id)
+        if parent is None:
+            continue
+        edge_start = parent["start"]
+        edge_end = parent["end"]
+        length = _point_distance(tuple(edge_start), tuple(edge_end)) or 1.0
+        unit_x = (edge_end[0] - edge_start[0]) / length
+        unit_y = (edge_end[1] - edge_start[1]) / length
+
+        def offset_along(point: list[float]) -> float:
+            return (point[0] - edge_start[0]) * unit_x + (point[1] - edge_start[1]) * unit_y
+
+        start_offset = offset_along(tuple(stroke["start"]) if len(stroke["start"]) >= 2 else (0.0, 0.0))
+        end_offset = offset_along(tuple(stroke["end"]) if len(stroke["end"]) >= 2 else (0.0, 0.0))
+        low, high = sorted((min(max(start_offset, 0.0), length), min(max(end_offset, 0.0), length)))
+        covered = [
+            segment
+            for segment in segments_by_parent.get(parent_id, [])
+            if segment.get("to_position_px", 0.0) > low + 0.5 and segment.get("from_position_px", 0.0) < high - 0.5
+        ]
+        if not covered and low == high and dimension.get("position") is not None:
+            covered = [
+                segment
+                for segment in segments_by_parent.get(parent_id, [])
+                if segment.get("from_position_px", 0.0) <= low <= segment.get("to_position_px", 0.0)
+            ]
+        if not covered:
+            continue
+        covered.sort(key=lambda segment: segment.get("from_position_px", 0.0))
+        dimension["edge_segments_ids"] = [segment["id"] for segment in covered]
+        if len(covered) == 1:
+            dimension["edge_id"] = covered[0]["id"]
 
 
 def save_clean_local_markup_pdf(
@@ -2557,85 +2839,54 @@ def save_local_dimension_filter_pdf(
             points.append(points[0])
             marked.draw_polyline(points, color=glyph_color, width=1.5)
 
-        extension_vertex_color = (0.45, 0.05, 0.75)
-        handwheel_vertices = mapping.get("handwheel_vertices") or []
-        handwheel_points = [
-            tuple(vertex["point"])
-            for vertex in handwheel_vertices
-            if isinstance(vertex.get("point"), list) and len(vertex.get("point") or []) >= 2
-        ]
-        for vertex in mapping.get("extension_vertices", []):
+        valve_segment_color = (0.95, 0.15, 0.55)
+        for segment in mapping.get("edge_segments") or []:
+            if not segment.get("is_handwheel_segment"):
+                continue
+            start = segment.get("start")
+            end = segment.get("end")
+            if not start or not end or len(start) < 2 or len(end) < 2:
+                continue
+            segment_start = fitz.Point(float(start[0]), float(start[1]))
+            segment_end = fitz.Point(float(end[0]), float(end[1]))
+            marked.draw_line(segment_start, segment_end, color=valve_segment_color, width=4.0)
+
+        def draw_vertex(vertex: dict[str, Any], color: tuple[float, float, float]) -> None:
             point = vertex.get("point")
             ray_start = vertex.get("ray_start")
-            if not point or len(point) < 2 or not ray_start or len(ray_start) < 2:
-                continue
-            if any(_point_distance((float(point[0]), float(point[1])), handwheel_point) <= 8.0 for handwheel_point in handwheel_points):
-                continue
-            from_point = fitz.Point(float(ray_start[0]), float(ray_start[1]))
+            if not point or len(point) < 2:
+                return
             center = fitz.Point(float(point[0]), float(point[1]))
-            marked.draw_line(
-                from_point,
-                center,
-                color=extension_vertex_color,
-                width=0.8,
-                dashes="[2 2] 0",
-            )
-            marked.draw_circle(center, 9.0, color=(1.0, 1.0, 1.0), fill=(1.0, 1.0, 1.0), fill_opacity=0.72, width=0.8)
-            marked.draw_circle(center, 6.5, color=extension_vertex_color, fill=None, width=2.2)
-            marked.draw_line(center + (-4.5, 0), center + (4.5, 0), color=extension_vertex_color, width=1.6)
-            marked.draw_line(center + (0, -4.5), center + (0, 4.5), color=extension_vertex_color, width=1.6)
-            label = str(vertex.get("id") or "VE?")
-            dimensions_label = ",".join(str(item) for item in (vertex.get("dimension_ids") or []) if item)
-            if dimensions_label:
-                label = f"{label}/{dimensions_label}"
+            if ray_start and len(ray_start) >= 2:
+                from_point = fitz.Point(float(ray_start[0]), float(ray_start[1]))
+                marked.draw_line(
+                    from_point,
+                    center,
+                    color=extension_vertex_color,
+                    width=0.8,
+                    dashes="[2 2] 0",
+                )
+            marked.draw_circle(center, 10.5, color=(1.0, 1.0, 1.0), fill=(1.0, 1.0, 1.0), fill_opacity=0.75, width=0.8)
+            marked.draw_circle(center, 6.5, color=color, fill=None, width=2.2)
+            marked.draw_line(center + (-4.5, 0), center + (4.5, 0), color=color, width=1.6)
+            marked.draw_line(center + (0, -4.5), center + (0, 4.5), color=color, width=1.6)
             label_point = center + (11, -11)
-            label_rect = fitz.Rect(label_point.x - 2, label_point.y - 9, label_point.x + 66, label_point.y + 4)
+            label_rect = fitz.Rect(label_point.x - 2, label_point.y - 9, label_point.x + 44, label_point.y + 4)
             marked.draw_rect(label_rect, color=(1.0, 1.0, 1.0), fill=(1.0, 1.0, 1.0), fill_opacity=0.85, width=0)
-            marked.insert_text(label_point, label, fontsize=8, fontname="helv", color=extension_vertex_color)
+            label = str(vertex.get("id") or "VX?")
+            marked.insert_text(label_point, label, fontsize=8, fontname="helv", color=color)
+
+        extension_vertex_color = (0.45, 0.05, 0.75)
+        final_vertices = mapping.get("final_vertices") or []
+        for vertex in final_vertices:
+            if vertex.get("vertex_source") == "extension":
+                draw_vertex(vertex, extension_vertex_color)
 
         handwheel_vertex_color = (0.14, 0.39, 0.92)
-        for vertex in handwheel_vertices:
-            point = vertex.get("point")
-            if not point or len(point) < 2:
-                continue
-            center = fitz.Point(float(point[0]), float(point[1]))
-            marked.draw_circle(center, 11.0, color=(1.0, 1.0, 1.0), fill=(1.0, 1.0, 1.0), fill_opacity=0.82, width=0.8)
-            marked.draw_circle(center, 7.8, color=handwheel_vertex_color, fill=None, width=2.8)
-            marked.draw_line(center + (-5.8, -5.8), center + (5.8, 5.8), color=handwheel_vertex_color, width=2.0)
-            marked.draw_line(center + (-5.8, 5.8), center + (5.8, -5.8), color=handwheel_vertex_color, width=2.0)
-            label = str(vertex.get("id") or "VH?")
-            detail = str(vertex.get("handwheel_id") or "HW?")
-            if vertex.get("dimension_id"):
-                detail = f"{detail} / {vertex['dimension_id']}"
-            elif vertex.get("edge_id"):
-                detail = f"{detail} / {vertex['edge_id']}"
-            if vertex.get("point_source"):
-                detail = f"{detail} / {vertex['point_source']}"
-            label_point = center + (13, -13)
-            label_rect = fitz.Rect(label_point.x - 2, label_point.y - 21, label_point.x + 160, label_point.y + 8)
-            marked.draw_rect(label_rect, color=(1.0, 1.0, 1.0), fill=(1.0, 1.0, 1.0), fill_opacity=0.92, width=0)
-            marked.insert_text(label_point, label, fontsize=11, fontname="helv", color=handwheel_vertex_color)
-            marked.insert_text(label_point + (0, 12), detail, fontsize=8.5, fontname="helv", color=handwheel_vertex_color)
+        for vertex in final_vertices:
+            if vertex.get("vertex_source") == "handwheel":
+                draw_vertex(vertex, handwheel_vertex_color)
 
-        for item in mapping.get("handwheels") or _handwheel_details(page, mapping):
-            arrow_end = item.get("arrow_end")
-            if not arrow_end or len(arrow_end) < 2:
-                continue
-            center = fitz.Point(float(arrow_end[0]), float(arrow_end[1]))
-            marked.draw_circle(center, 4.2, color=handwheel_vertex_color, fill=handwheel_vertex_color, fill_opacity=0.88, width=1.0)
-            lead_label = f"{item.get('id', 'HW?')} lead -> {item.get('edge_id') or '?'}"
-            label_point = center + (7, 7)
-            label_rect = fitz.Rect(label_point.x - 2, label_point.y - 9, label_point.x + 92, label_point.y + 4)
-            marked.draw_rect(label_rect, color=(1.0, 1.0, 1.0), fill=(1.0, 1.0, 1.0), fill_opacity=0.88, width=0)
-            marked.insert_text(label_point, lead_label, fontsize=7.5, fontname="helv", color=handwheel_vertex_color)
-
-        marked.insert_text(
-            fitz.Point(24, 28),
-            "LOCAL DIMENSION FILTER: green include, red exclude; violet new vertices on extension-to-pipe projection",
-            fontsize=9,
-            fontname="helv",
-            color=(0.05, 0.18, 0.14),
-        )
         output.save(str(output_pdf))
         output.close()
 
@@ -2825,6 +3076,8 @@ __all__ = [
     "run_dimension_mapping",
     "compute_endpoint_adjustments",
     "compute_extension_vertices",
+    "compute_final_vertices",
+    "split_edges_by_final_vertices",
     "annotate_valve_edges",
     "apply_local_dimension_filter",
     "save_dimension_mapping_pdf",

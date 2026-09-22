@@ -323,6 +323,13 @@ def _stroke_index_for_source_edge(source_edge: dict[str, Any], strokes: list[Any
     return index if distance <= GEOMETRY_CONFIG["stroke_match_gap_px"] else None
 
 
+def _parent_edge_id(edge_id: str | None) -> str:
+    """Сегментные рёбра вида E014.01 отсылают к исходному ребру-родителю."""
+    if isinstance(edge_id, str) and "." in edge_id and edge_id[-3] == ".":
+        return edge_id.rsplit(".", 1)[0]
+    return edge_id or ""
+
+
 def _map_dimensions(
     pdf_path: Path,
     page_number: int,
@@ -351,7 +358,7 @@ def _map_dimensions(
         center = [(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2]
         base = existing_dimensions.get(f"D{index:03d}", {})
         target_edge = None
-        source_edge = source_edges_by_id.get(base.get("edge_id"))
+        source_edge = source_edges_by_id.get(_parent_edge_id(base.get("edge_id")))
         if source_edge is not None:
             source_stroke_index = _stroke_index_for_source_edge(source_edge, graph["strokes"])
             if source_stroke_index is not None:
