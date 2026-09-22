@@ -8,6 +8,7 @@ import fitz
 
 from src.dimension_mapping import _dimension_hints_from_text, _first_arrow_third, _handwheel_arrow_segments, _handwheel_details, _handwheel_text_rects, _is_rectangle_side, _same_directed_contour, apply_local_dimension_filter, compute_endpoint_adjustments, save_clean_local_markup_pdf, save_local_dimension_filter_pdf, save_preprocess_annotation_pdf
 from src.dimension_mapping import _direct_dimension_stroke_from_label, _fallback_leader_stroke_from_label, _find_extension_strokes, _merge_dimension_stroke, _resolve_leader_target
+from src.dimension_mapping import _annotation_arrow_segments, _reserved_annotation_strokes
 from src.dimension_review import build_review_payload
 
 
@@ -149,6 +150,50 @@ class DimensionRuleTests(unittest.TestCase):
 
         start_extension = next(item for item in extensions if item["target_endpoint"] == "start")
         self.assertEqual(start_extension["index"], 3)
+
+    def test_reserved_annotation_strokes_ignore_crossing_dimension_lines(self) -> None:
+        segments = [((0.0, 0.0), (100.0, 0.0))]
+        strokes = [
+            SimpleNamespace(index=1, x0=10.0, y0=0.0, x1=40.0, y1=0.0),
+            SimpleNamespace(index=2, x0=0.0, y0=-20.0, x1=0.0, y1=20.0),
+            SimpleNamespace(index=3, x0=0.0, y0=2.0, x1=100.0, y1=2.0),
+        ]
+
+        self.assertEqual(_reserved_annotation_strokes(strokes, segments), {1, 3})
+
+    def test_annotation_arrow_segments_include_handwheel_and_connection_arrows(self) -> None:
+        page = SimpleNamespace(rect=fitz.Rect(0, 0, 400, 400))
+        handwheel_segment = ((10.0, 10.0), (40.0, 40.0))
+        connection_segment = ((100.0, 100.0), (140.0, 120.0))
+        connections = [
+            {"arrow_segments": [{"start": list(connection_segment[0]), "end": list(connection_segment[1])}]}
+        ]
+        page.get_text = lambda *args, **kwargs: []
+        page.get_drawings = lambda: []
+
+        with mock.patch("src.dimension_mapping.mark_pipeline.find_rectangles", return_value=[]), mock.patch(
+            "src.dimension_mapping._handwheel_text_rects",
+            return_value=[("ШТУРВАЛ", fitz.Rect(0, 0, 5, 5))],
+        ), mock.patch(
+            "src.dimension_mapping._handwheel_arrow_paths",
+            return_value=[[handwheel_segment]],
+        ):
+            segments = _annotation_arrow_segments(page, connections)
+
+        self.assertEqual(segments, [handwheel_segment, connection_segment])
+
+    def test_extension_strokes_skip_reserved_annotation_lines(self) -> None:
+        target = {"start": [0.0, 0.0], "end": [100.0, 0.0], "merged_indices": [1]}
+        edge = {"id": "E001", "start": [0.0, 30.0], "end": [100.0, 30.0]}
+        strokes = [
+            SimpleNamespace(index=1, x0=0.0, y0=0.0, x1=100.0, y1=0.0, length=100.0, kind="dimension"),
+            SimpleNamespace(index=2, x0=0.0, y0=0.0, x1=0.0, y1=30.0, length=30.0, kind="dimension"),
+            SimpleNamespace(index=3, x0=100.0, y0=0.0, x1=100.0, y1=30.0, length=30.0, kind="dimension"),
+        ]
+
+        extensions = _find_extension_strokes({"dimension_stroke": target}, edge, strokes, blocked_indices={2})
+
+        self.assertEqual({item["index"] for item in extensions}, {3})
 
     def test_endpoint_adjustment_uses_nearest_extension_contact(self) -> None:
         mapping = {

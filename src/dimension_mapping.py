@@ -1014,15 +1014,57 @@ def _add_pipe_anchor(dimension: dict[str, Any], edges: list[dict[str, Any]]) -> 
     }
 
 
+def _annotation_arrow_segments(
+    page: Any,
+    connections: list[dict[str, Any]] | None = None,
+) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+    """Collect arrow strokes that belong to handwheel labels and connection (СМ) marks.
+
+    These annotations own their leader arrows; the arrows must never be reused as
+    dimension strokes, extension lines or leaders of a real dimension.
+    """
+    drawings = page.get_drawings()
+    rectangles = mark_pipeline.find_rectangles(page, page.rect)
+    handwheel_rects = [rect for _label, rect in _handwheel_text_rects(page.get_text("words"))]
+    segments: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    for path in _handwheel_arrow_paths(handwheel_rects, drawings, rectangles):
+        segments.extend(path)
+    for row in connections or []:
+        for segment in row.get("arrow_segments") or []:
+            start = segment.get("start")
+            end = segment.get("end")
+            if start and end:
+                segments.append(((float(start[0]), float(start[1])), (float(end[0]), float(end[1]))))
+    return segments
+
+
+def _reserved_annotation_strokes(
+    strokes: list[Any],
+    segments: list[tuple[tuple[float, float], tuple[float, float]]],
+    tolerance: float = 3.0,
+) -> set[int]:
+    """Stroke indices that lie on an annotation arrow and are therefore not dimensions."""
+    reserved: set[int] = set()
+    for stroke in strokes:
+        endpoints = ((float(stroke.x0), float(stroke.y0)), (float(stroke.x1), float(stroke.y1)))
+        for start, end in segments:
+            if all(_distance_to_segment(point, start, end)[0] <= tolerance for point in endpoints):
+                reserved.add(stroke.index)
+                break
+    return reserved
+
+
 def _find_extension_strokes(
     dimension: dict[str, Any],
     edge: dict[str, Any] | None,
     strokes: list[Any],
     edges: list[dict[str, Any]] | None = None,
+    blocked_indices: set[int] | None = None,
 ) -> list[dict[str, Any]]:
     target = dimension.get("dimension_stroke")
     if not target:
         return []
+    blocked = blocked_indices or set()
     candidate_edges = list(edges or [])
     if edge is not None and all(item.get("id") != edge.get("id") for item in candidate_edges):
         candidate_edges.insert(0, edge)
@@ -1036,7 +1078,7 @@ def _find_extension_strokes(
     target_unit = (target_dx / target_length, target_dy / target_length)
     candidates_by_endpoint: dict[int, tuple[float, dict[str, Any]]] = {}
     for stroke in strokes:
-        if stroke.kind != "dimension" or stroke.index in target_indices:
+        if stroke.kind != "dimension" or stroke.index in target_indices or stroke.index in blocked:
             continue
         if stroke.length < 8.0:
             continue
@@ -1141,7 +1183,7 @@ def _find_extension_strokes(
             mirror_unit = (mirror_dx / mirror_length, mirror_dy / mirror_length)
             output: list[tuple[float, dict[str, Any]]] = []
             for stroke in strokes:
-                if stroke.kind != "dimension" or stroke.index in mirror_indices or stroke.index in selected_indices:
+                if stroke.kind != "dimension" or stroke.index in mirror_indices or stroke.index in selected_indices or stroke.index in blocked:
                     continue
                 if stroke.length < 8.0 or stroke.length > 110.0:
                     continue
@@ -1219,6 +1261,7 @@ def map_dimensions(pdf_path: str | Path, page_number: int) -> dict[str, Any]:
 
         edges = _stroke_graph(pdf_path, page_number)
         vertices = _vertex_rows(pdf_path, page_number)
+        connections = _connection_rows_from_page(page, page_number, vertices)
         dimension_candidates = [
             Candidate(
                 id=f"D{index:03d}",
@@ -1232,12 +1275,18 @@ def map_dimensions(pdf_path: str | Path, page_number: int) -> dict[str, Any]:
             for index, (text, rect) in enumerate(dimensions, start=1)
         ]
         vector_graph = extract_axis_graph(pdf_path, page_number, dimension_candidates)
+        reserved_annotation_indices = _reserved_annotation_strokes(
+            vector_graph.strokes,
+            _annotation_arrow_segments(page, connections),
+        )
         attached_strokes = {
             candidate_id: vector_graph.strokes[stroke_index]
             for candidate_id, stroke_index in vector_graph.attached.items()
             if 0 <= stroke_index < len(vector_graph.strokes)
+            and stroke_index not in reserved_annotation_indices
         }
         attached_indices = {stroke.index for stroke in attached_strokes.values()}
+        reserved_indices = attached_indices | reserved_annotation_indices
         mapped = []
         for index, (text, rect) in enumerate(dimensions, start=1):
             center = ((rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2)
@@ -1299,11 +1348,11 @@ def map_dimensions(pdf_path: str | Path, page_number: int) -> dict[str, Any]:
             attached = attached_strokes.get(mapped[-1]["id"])
             attached_source = "vector_attachment"
             if attached is None:
-                attached = _fallback_leader_stroke_from_label(center, vector_graph.strokes, attached_indices)
+                attached = _fallback_leader_stroke_from_label(center, vector_graph.strokes, reserved_indices)
                 if attached is not None:
                     attached_source = "fallback_nearest_label_leader"
             if attached is not None:
-                blocked_indices = attached_indices - {attached.index}
+                blocked_indices = reserved_indices - {attached.index}
                 initial_stroke = _merge_dimension_stroke(attached, vector_graph.strokes, blocked_indices)
                 mapped[-1]["dimension_stroke"] = initial_stroke
                 mapped[-1]["leader_stroke"] = None
@@ -1315,13 +1364,13 @@ def map_dimensions(pdf_path: str | Path, page_number: int) -> dict[str, Any]:
                         center,
                         pipe_edge,
                         vector_graph.strokes,
-                        attached_indices - {attached.index},
+                        reserved_indices - {attached.index},
                     )
                     if direct_stroke is not None:
                         mapped[-1]["dimension_stroke"] = _merge_dimension_stroke(
                             direct_stroke,
                             vector_graph.strokes,
-                            attached_indices - {direct_stroke.index},
+                            reserved_indices - {direct_stroke.index},
                         )
                         mapped[-1]["attachment_kind"] = "direct_dimension_arrow"
                         mapped[-1]["attachment_source"] = "near_label_direct_dimension"
@@ -1331,12 +1380,12 @@ def map_dimensions(pdf_path: str | Path, page_number: int) -> dict[str, Any]:
                             pipe_edge,
                             vector_graph.strokes,
                             center,
-                            {attached.index},
+                            {attached.index} | reserved_annotation_indices,
                         )
                         if resolved is not None:
                             target, leader_resolution = resolved
                             mapped[-1]["leader_stroke"] = initial_stroke
-                            mapped[-1]["dimension_stroke"] = _merge_dimension_stroke(target, vector_graph.strokes, attached_indices - {target.index})
+                            mapped[-1]["dimension_stroke"] = _merge_dimension_stroke(target, vector_graph.strokes, reserved_indices - {target.index})
                             mapped[-1]["leader_attached"] = True
                             mapped[-1]["attachment_kind"] = "leader_to_dimension_arrow"
                             mapped[-1]["leader_resolution"] = leader_resolution
@@ -1350,6 +1399,7 @@ def map_dimensions(pdf_path: str | Path, page_number: int) -> dict[str, Any]:
                     next((item for item in edges if item["id"] == mapped[-1].get("edge_id")), None),
                     vector_graph.strokes,
                     edges,
+                    blocked_indices=reserved_annotation_indices,
                 )
                 mapped[-1]["leader_attached"] = True
                 if mapped[-1]["edge_id"] is None:
@@ -1365,7 +1415,6 @@ def map_dimensions(pdf_path: str | Path, page_number: int) -> dict[str, Any]:
                 mapped[-1]["leader_attached"] = False
 
         _mark_overlapping_dimensions(mapped, edges)
-        connections = _connection_rows_from_page(page, page_number, vertices)
         result = {
             "page_number": page_number,
             "vertices": vertices,
