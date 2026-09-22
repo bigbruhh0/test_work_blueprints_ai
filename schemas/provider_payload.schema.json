@@ -1,0 +1,350 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://test-chertezh.local/schemas/provider_payload.schema.json",
+  "title": "Isometry Provider Review Payload",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "page",
+    "vertices",
+    "uncertain_vertices",
+    "edges",
+    "dimensions",
+    "preliminary_decisions",
+    "edge_candidate_groups",
+    "handwheels",
+    "connections",
+    "map_text"
+  ],
+  "properties": {
+    "page": { "type": ["integer", "null"] },
+    "vertices": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/vertex" }
+    },
+    "uncertain_vertices": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/uncertain_vertex" }
+    },
+    "edges": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/edge" }
+    },
+    "dimensions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/dimension" }
+    },
+    "preliminary_decisions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/preliminary_decision_row" }
+    },
+    "edge_candidate_groups": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/edge_candidate_group" }
+    },
+    "handwheels": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/handwheel" }
+    },
+    "connections": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/connection" }
+    },
+    "map_text": { "type": "string" }
+  },
+  "$defs": {
+    "point": {
+      "type": "array",
+      "prefixItems": [{ "type": "number" }, { "type": "number" }],
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "bbox": {
+      "type": "array",
+      "prefixItems": [
+        { "type": "number" },
+        { "type": "number" },
+        { "type": "number" },
+        { "type": "number" }
+      ],
+      "minItems": 4,
+      "maxItems": 4
+    },
+    "stroke": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "index": { "type": "integer" },
+        "start": { "$ref": "#/$defs/point" },
+        "end": { "$ref": "#/$defs/point" },
+        "length_px": { "type": "number" },
+        "merged_indices": {
+          "type": "array",
+          "items": { "type": "integer" }
+        }
+      }
+    },
+    "vertex": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id", "role", "x", "y"],
+      "properties": {
+        "id": { "type": "string" },
+        "role": { "type": "string" },
+        "x": { "type": "number" },
+        "y": { "type": "number" },
+        "degree": { "type": ["integer", "null"] },
+        "confidence": { "type": ["number", "null"] },
+        "source": { "type": ["string", "null"] }
+      }
+    },
+    "uncertain_vertex": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id", "x", "y"],
+      "properties": {
+        "id": { "type": "string" },
+        "x": { "type": "number" },
+        "y": { "type": "number" },
+        "confidence": { "type": ["number", "null"] },
+        "source": { "type": ["string", "null"] }
+      }
+    },
+    "edge": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id", "status"],
+      "properties": {
+        "id": { "type": "string" },
+        "from_vertex": { "type": ["string", "null"] },
+        "to_vertex": { "type": ["string", "null"] },
+        "start": { "$ref": "#/$defs/point" },
+        "end": { "$ref": "#/$defs/point" },
+        "path_points": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/point" }
+        },
+        "pixel_length": { "type": ["number", "null"] },
+        "status": { "type": "string" },
+        "stroke_ids": {
+          "type": "array",
+          "items": { "type": "integer" }
+        }
+      }
+    },
+    "edge_candidate": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["edge_id"],
+      "properties": {
+        "edge_id": { "type": "string" },
+        "distance_px": { "type": ["number", "null"] },
+        "position": { "type": ["number", "null"] },
+        "parallel_score": { "type": ["number", "null"] },
+        "source": { "type": ["string", "null"] }
+      }
+    },
+    "preliminary_decision": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["decision", "reason", "source"],
+      "properties": {
+        "decision": { "enum": ["include", "exclude", "ambiguous"] },
+        "reason": { "type": "string" },
+        "conflict_with": { "type": ["string", "null"] },
+        "status": { "type": ["string", "null"] },
+        "valid": { "type": ["boolean", "null"] },
+        "source": { "type": "string" }
+      }
+    },
+    "preliminary_decision_row": {
+      "allOf": [
+        { "$ref": "#/$defs/preliminary_decision" },
+        {
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["candidate_id"],
+          "properties": {
+            "candidate_id": { "type": "string" },
+            "value_mm": { "type": ["number", "null"] },
+            "edge_id": { "type": ["string", "null"] }
+          }
+        }
+      ]
+    },
+    "existing_mapping": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "status": { "type": ["string", "null"] },
+        "valid": { "type": ["boolean", "null"] },
+        "hints": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "position": { "type": ["number", "null"] },
+        "projection": { "anyOf": [{ "$ref": "#/$defs/point" }, { "type": "null" }] },
+        "gap_px": { "type": ["number", "null"] },
+        "offset_px": { "type": ["number", "null"] },
+        "attachment_kind": { "type": ["string", "null"] },
+        "attachment_source": { "type": ["string", "null"] },
+        "dimension_stroke": { "anyOf": [{ "$ref": "#/$defs/stroke" }, { "type": "null" }] },
+        "leader_stroke": { "anyOf": [{ "$ref": "#/$defs/stroke" }, { "type": "null" }] },
+        "extension_strokes": {
+          "type": "array",
+          "items": {
+            "allOf": [
+              { "$ref": "#/$defs/stroke" },
+              {
+                "type": "object",
+                "properties": {
+                  "target_endpoint": { "type": ["string", "null"] },
+                  "target_gap_px": { "type": ["number", "null"] },
+                  "touch_endpoint_gap_px": { "type": ["number", "null"] },
+                  "pipe_gap_px": { "type": ["number", "null"] },
+                  "pipe_edge_id": { "type": ["string", "null"] },
+                  "parallel_score": { "type": ["number", "null"] }
+                }
+              }
+            ]
+          }
+        },
+        "pipe_anchor": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": true,
+              "properties": {
+                "edge_id": { "type": ["string", "null"] },
+                "position": { "type": ["number", "null"] },
+                "point": { "anyOf": [{ "$ref": "#/$defs/point" }, { "type": "null" }] },
+                "gap_px": { "type": ["number", "null"] }
+              }
+            },
+            { "type": "null" }
+          ]
+        },
+        "local_filter_decision": { "enum": ["include", "exclude", "ambiguous", null] },
+        "local_filter_reason": { "type": ["string", "null"] },
+        "local_filter_conflict_with": { "type": ["string", "null"] }
+      }
+    },
+    "dimension": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "id",
+        "page",
+        "value_mm",
+        "text",
+        "bbox",
+        "label_center",
+        "edge_candidates",
+        "selected_edge_id",
+        "status",
+        "existing_mapping",
+        "preliminary_decision"
+      ],
+      "properties": {
+        "id": { "type": "string" },
+        "page": { "type": "integer" },
+        "value_mm": { "type": "number" },
+        "text": { "type": "string" },
+        "bbox": { "$ref": "#/$defs/bbox" },
+        "label_center": { "$ref": "#/$defs/point" },
+        "edge_candidates": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/edge_candidate" }
+        },
+        "selected_edge_id": { "type": ["string", "null"] },
+        "status": { "type": "string" },
+        "source": { "type": ["string", "null"] },
+        "mapping_method": { "type": ["string", "null"] },
+        "existing_mapping": { "$ref": "#/$defs/existing_mapping" },
+        "preliminary_decision": { "$ref": "#/$defs/preliminary_decision" }
+      }
+    },
+    "edge_candidate_group": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["edge_ids", "candidate_ids", "candidate_values_mm", "status"],
+      "properties": {
+        "from_vertex": { "type": ["string", "null"] },
+        "to_vertex": { "type": ["string", "null"] },
+        "edge_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "candidate_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "candidate_values_mm": {
+          "type": "array",
+          "items": { "type": "number" }
+        },
+        "status": { "type": "string" }
+      }
+    },
+    "handwheel": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id", "label", "bbox", "arrow_found"],
+      "properties": {
+        "id": { "type": "string" },
+        "label": { "type": "string" },
+        "bbox": { "$ref": "#/$defs/bbox" },
+        "arrow_found": { "type": "boolean" },
+        "arrow_start": { "anyOf": [{ "$ref": "#/$defs/point" }, { "type": "null" }] },
+        "arrow_end": { "anyOf": [{ "$ref": "#/$defs/point" }, { "type": "null" }] },
+        "arrow_segments": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+              "start": { "$ref": "#/$defs/point" },
+              "end": { "$ref": "#/$defs/point" }
+            }
+          }
+        },
+        "edge_id": { "type": ["string", "null"] },
+        "edge_created": { "type": ["boolean", "null"] },
+        "edge_kind": { "type": ["string", "null"] },
+        "is_pipe_edge": { "type": ["boolean", "null"] },
+        "edge_distance_px": { "type": ["number", "null"] }
+      }
+    },
+    "connection": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id", "page", "label", "bbox", "center", "connection_type"],
+      "properties": {
+        "id": { "type": "string" },
+        "page": { "type": "integer" },
+        "label": { "type": "string" },
+        "bbox": { "$ref": "#/$defs/bbox" },
+        "center": { "$ref": "#/$defs/point" },
+        "connection_type": { "enum": ["tie_in", "continuation", "other"] },
+        "target_sheet": { "type": ["string", "null"] },
+        "text_has_sheet_ref": { "type": ["boolean", "null"] },
+        "vertex_id": { "type": ["string", "null"] },
+        "target_point": { "anyOf": [{ "$ref": "#/$defs/point" }, { "type": "null" }] },
+        "arrow_found": { "type": ["boolean", "null"] },
+        "arrow_start": { "anyOf": [{ "$ref": "#/$defs/point" }, { "type": "null" }] },
+        "arrow_end": { "anyOf": [{ "$ref": "#/$defs/point" }, { "type": "null" }] },
+        "arrow_segments": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+              "start": { "$ref": "#/$defs/point" },
+              "end": { "$ref": "#/$defs/point" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

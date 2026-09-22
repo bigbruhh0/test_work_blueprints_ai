@@ -14,36 +14,45 @@ import base64
 import fitz
 
 
-CODEX_REVIEW_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": True,
-    "properties": {
-        "candidate_decisions": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": True,
-                "required": ["candidate_id", "decision"],
-                "properties": {
-                    "candidate_id": {"type": "string"},
-                    "kind": {"type": "string"},
-                    "decision": {"type": "string", "enum": ["include", "exclude", "ambiguous"]},
-                    "reason": {"type": "string"},
-                    "edge_id": {"type": ["string", "null"]},
-                    "covered_edge_ids": {"type": "array", "items": {"type": "string"}},
-                    "route_type": {"type": ["string", "null"]},
+ROOT = Path(__file__).resolve().parents[1]
+PROVIDER_PAYLOAD_SCHEMA_PATH = ROOT / "schemas" / "provider_payload.schema.json"
+PROVIDER_RESPONSE_SCHEMA_PATH = ROOT / "schemas" / "provider_response.schema.json"
+
+
+def _load_json_schema(path: Path, fallback: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return fallback
+
+
+CODEX_REVIEW_SCHEMA: dict[str, Any] = _load_json_schema(
+    PROVIDER_RESPONSE_SCHEMA_PATH,
+    {
+        "type": "object",
+        "additionalProperties": True,
+        "properties": {
+            "candidate_decisions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "required": ["candidate_id", "decision"],
+                    "properties": {
+                        "candidate_id": {"type": "string"},
+                        "kind": {"type": "string"},
+                        "decision": {"type": "string", "enum": ["include", "exclude", "ambiguous"]},
+                        "reason": {"type": "string"},
+                        "edge_id": {"type": ["string", "null"]},
+                        "covered_edge_ids": {"type": "array", "items": {"type": "string"}},
+                        "route_type": {"type": ["string", "null"]},
+                    },
                 },
-            },
+            }
         },
-        "edge_decisions": {"type": "array"},
-        "main_route": {"type": "object"},
-        "branch_routes": {"type": "array"},
-        "cross_sheet_connections": {"type": "array"},
-        "valve_dimensions": {"type": "array"},
-        "cross_sheet_dimensions": {"type": "array"},
+        "required": ["candidate_decisions"],
     },
-    "required": ["candidate_decisions"],
-}
+)
 
 
 def _preliminary_decision_from_dimension(dimension: dict[str, Any]) -> dict[str, Any]:

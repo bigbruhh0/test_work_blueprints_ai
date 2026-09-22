@@ -446,6 +446,238 @@ def _short_endpoint_leader_overlap(dimension: dict[str, Any]) -> bool:
     )
 
 
+def _edge_point(edge: dict[str, Any], key: str) -> tuple[float, float] | None:
+    value = edge.get(key)
+    if not isinstance(value, list) or len(value) < 2:
+        return None
+    try:
+        return float(value[0]), float(value[1])
+    except (TypeError, ValueError):
+        return None
+
+
+def _segment_intersection(
+    first_start: tuple[float, float],
+    first_end: tuple[float, float],
+    second_start: tuple[float, float],
+    second_end: tuple[float, float],
+) -> tuple[float, tuple[float, float]] | None:
+    x1, y1 = first_start
+    x2, y2 = first_end
+    x3, y3 = second_start
+    x4, y4 = second_end
+    r_x = x2 - x1
+    r_y = y2 - y1
+    s_x = x4 - x3
+    s_y = y4 - y3
+    denominator = r_x * s_y - r_y * s_x
+    if abs(denominator) <= 1e-9:
+        return None
+    q_x = x3 - x1
+    q_y = y3 - y1
+    first_position = (q_x * s_y - q_y * s_x) / denominator
+    second_position = (q_x * r_y - q_y * r_x) / denominator
+    if -0.02 <= first_position <= 1.02 and -0.02 <= second_position <= 1.02:
+        clamped = max(0.0, min(1.0, first_position))
+        return clamped, (x1 + clamped * r_x, y1 + clamped * r_y)
+    return None
+
+
+def _line_intersection_on_first_segment(
+    segment_start: tuple[float, float],
+    segment_end: tuple[float, float],
+    line_start: tuple[float, float],
+    line_end: tuple[float, float],
+) -> tuple[float, tuple[float, float]] | None:
+    x1, y1 = segment_start
+    x2, y2 = segment_end
+    x3, y3 = line_start
+    x4, y4 = line_end
+    r_x = x2 - x1
+    r_y = y2 - y1
+    s_x = x4 - x3
+    s_y = y4 - y3
+    denominator = r_x * s_y - r_y * s_x
+    if abs(denominator) <= 1e-9:
+        return None
+    q_x = x3 - x1
+    q_y = y3 - y1
+    segment_position = (q_x * s_y - q_y * s_x) / denominator
+    if -0.03 <= segment_position <= 1.03:
+        clamped = max(0.0, min(1.0, segment_position))
+        return clamped, (x1 + clamped * r_x, y1 + clamped * r_y)
+    return None
+
+
+def _line_intersection(
+    first_start: tuple[float, float],
+    first_end: tuple[float, float],
+    second_start: tuple[float, float],
+    second_end: tuple[float, float],
+) -> tuple[float, tuple[float, float]] | None:
+    x1, y1 = first_start
+    x2, y2 = first_end
+    x3, y3 = second_start
+    x4, y4 = second_end
+    r_x = x2 - x1
+    r_y = y2 - y1
+    s_x = x4 - x3
+    s_y = y4 - y3
+    denominator = r_x * s_y - r_y * s_x
+    if abs(denominator) <= 1e-9:
+        return None
+    q_x = x3 - x1
+    q_y = y3 - y1
+    position = (q_x * s_y - q_y * s_x) / denominator
+    return position, (x1 + position * r_x, y1 + position * r_y)
+
+
+def _stroke_contact_on_edge(stroke: dict[str, Any], edge: dict[str, Any]) -> tuple[float, float, tuple[float, float]] | None:
+    start = _edge_point(stroke, "start")
+    end = _edge_point(stroke, "end")
+    edge_start = _edge_point(edge, "start")
+    edge_end = _edge_point(edge, "end")
+    if start is None or end is None or edge_start is None or edge_end is None:
+        return None
+    intersection = _segment_intersection(edge_start, edge_end, start, end)
+    if intersection is not None:
+        position, point = intersection
+        return 0.0, position, point
+    candidates = [
+        _distance_to_segment(start, edge_start, edge_end),
+        _distance_to_segment(end, edge_start, edge_end),
+    ]
+    gap, position, projection = min(candidates, key=lambda item: item[0])
+    return gap, position, projection
+
+
+def _nearest_pipe_endpoint_for_extension(
+    stroke: dict[str, Any],
+    edges: list[dict[str, Any]],
+) -> tuple[tuple[float, float], float, str | None] | None:
+    start = _edge_point(stroke, "start")
+    end = _edge_point(stroke, "end")
+    if start is None or end is None or not edges:
+        return None
+    best: tuple[float, tuple[float, float], str | None] | None = None
+    for point in (start, end):
+        for edge in edges:
+            edge_start = _edge_point(edge, "start")
+            edge_end = _edge_point(edge, "end")
+            if edge_start is None or edge_end is None:
+                continue
+            gap, _position, _projection = _distance_to_segment(point, edge_start, edge_end)
+            if best is None or gap < best[0]:
+                best = (gap, point, edge.get("id"))
+    if best is None:
+        return None
+    gap, point, edge_id = best
+    return point, gap, str(edge_id) if edge_id else None
+
+
+def compute_endpoint_adjustments(mapping: dict[str, Any]) -> list[dict[str, Any]]:
+    """Suggest endpoint positions from the nearest pipe-side extension endpoint."""
+    vertices = mapping.get("vertices") or []
+    edges = mapping.get("edges") or []
+    dimensions = mapping.get("dimensions") or []
+    endpoint_vertices = [vertex for vertex in vertices if vertex.get("role") == "endpoint"]
+    adjustments: list[dict[str, Any]] = []
+    if not endpoint_vertices or not edges or not dimensions:
+        mapping["endpoint_adjustments"] = adjustments
+        return adjustments
+
+    correct_endpoint_tolerance_px = 7.0
+    max_nearest_extension_endpoint_gap_px = 80.0
+    all_extensions: list[tuple[dict[str, Any], dict[str, Any], str | None, tuple[float, float], float, str | None]] = []
+    for dimension in dimensions:
+        for stroke in dimension.get("extension_strokes") or []:
+            if not isinstance(stroke, dict):
+                continue
+            edge_id = stroke.get("pipe_edge_id") or dimension.get("edge_id")
+            pipe_endpoint = _nearest_pipe_endpoint_for_extension(stroke, edges)
+            if pipe_endpoint is None:
+                continue
+            point, pipe_gap, nearest_edge_id = pipe_endpoint
+            all_extensions.append((dimension, stroke, str(edge_id) if edge_id else None, point, pipe_gap, nearest_edge_id))
+
+    for vertex in endpoint_vertices:
+        vertex_point = (float(vertex.get("x", 0.0)), float(vertex.get("y", 0.0)))
+        if not all_extensions:
+            continue
+        nearest_dimension, nearest_stroke, declared_edge_id, pipe_endpoint, pipe_gap, nearest_edge_id = min(
+            all_extensions,
+            key=lambda item: _point_distance(vertex_point, item[3]),
+        )
+        pipe_endpoint_gap = _point_distance(vertex_point, pipe_endpoint)
+        if pipe_endpoint_gap <= correct_endpoint_tolerance_px:
+            continue
+        if pipe_endpoint_gap > max_nearest_extension_endpoint_gap_px:
+            continue
+
+        candidates: list[tuple[float, float, float, dict[str, Any]]] = []
+        for edge in edges:
+            edge_id = edge.get("id")
+            if not edge_id:
+                continue
+            edge_start = _edge_point(edge, "start")
+            edge_end = _edge_point(edge, "end")
+            if edge_start is None or edge_end is None:
+                continue
+            edge_length = float(edge.get("pixel_length") or _point_distance(edge_start, edge_end) or 0.0)
+            start_gap = _point_distance(vertex_point, edge_start)
+            end_gap = _point_distance(vertex_point, edge_end)
+            if min(start_gap, end_gap) > 18.0:
+                continue
+            endpoint_at_start = start_gap <= end_gap
+            stroke_start = _edge_point(nearest_stroke, "start")
+            stroke_end = _edge_point(nearest_stroke, "end")
+            if stroke_start is None or stroke_end is None:
+                continue
+            intersection = _line_intersection(edge_start, edge_end, stroke_start, stroke_end)
+            if intersection is not None:
+                edge_position, projection = intersection
+                contact_gap = 0.0
+            else:
+                contact_gap, edge_position, projection = _distance_to_segment(pipe_endpoint, edge_start, edge_end)
+            raw_distance_from_endpoint = edge_position if endpoint_at_start else 1.0 - edge_position
+            distance_px = abs(raw_distance_from_endpoint) * edge_length
+            if distance_px <= correct_endpoint_tolerance_px:
+                continue
+            if distance_px > 180.0:
+                continue
+            candidates.append(
+                (
+                    min(start_gap, end_gap),
+                    0.0 if nearest_edge_id == str(edge_id) else 1.0,
+                    contact_gap,
+                    {
+                        "vertex_id": vertex.get("id"),
+                        "role": vertex.get("role"),
+                        "source": "nearest_extension_endpoint",
+                        "rule": "endpoint_to_nearest_extension_pipe_endpoint",
+                        "original": [round(vertex_point[0], 2), round(vertex_point[1], 2)],
+                        "adjusted": [round(projection[0], 2), round(projection[1], 2)],
+                        "edge_id": edge_id,
+                        "dimension_id": nearest_dimension.get("id"),
+                        "extension_index": nearest_stroke.get("index"),
+                        "pipe_endpoint": [round(pipe_endpoint[0], 2), round(pipe_endpoint[1], 2)],
+                        "pipe_endpoint_gap_px": round(pipe_endpoint_gap, 2),
+                        "pipe_gap_px": round(pipe_gap, 2),
+                        "distance_from_endpoint_px": round(distance_px, 2),
+                        "edge_position": round(edge_position, 4),
+                        "contact_gap_px": round(contact_gap, 2),
+                        "declared_pipe_edge_id": declared_edge_id,
+                        "nearest_pipe_edge_id": nearest_edge_id,
+                    },
+                )
+            )
+        if candidates:
+            _edge_gap, _edge_penalty, _contact_gap, adjustment = min(candidates, key=lambda item: (item[0], item[1], item[2]))
+            adjustments.append(adjustment)
+    mapping["endpoint_adjustments"] = adjustments
+    return adjustments
+
+
 def apply_local_dimension_filter(mapping: dict[str, Any]) -> dict[str, Any]:
     """Mark obvious local include/exclude decisions without provider input."""
     dimensions = mapping.get("dimensions") or []
@@ -801,6 +1033,7 @@ def _find_extension_strokes(
     target_dx = target_points[1][0] - target_points[0][0]
     target_dy = target_points[1][1] - target_points[0][1]
     target_length = math.hypot(target_dx, target_dy) or 1.0
+    target_unit = (target_dx / target_length, target_dy / target_length)
     candidates_by_endpoint: dict[int, tuple[float, dict[str, Any]]] = {}
     for stroke in strokes:
         if stroke.kind != "dimension" or stroke.index in target_indices:
@@ -827,13 +1060,22 @@ def _find_extension_strokes(
                     key=lambda item: item[1],
                 )
                 selected_bonus = 0.0 if edge is not None and nearest_edge.get("id") == edge.get("id") else 6.0
-                variants.append((target_gap * 3.0 + touch_endpoint_gap + pipe_gap + parallel_score * 8.0 + selected_bonus, endpoint_index, target_gap, touch_endpoint_gap, pipe_gap, nearest_edge.get("id")))
+                tight_endpoint_hit = target_gap <= 1.5 and touch_endpoint_gap <= 5.5
+                pipe_score = pipe_gap * (0.22 if tight_endpoint_hit else 1.0)
+                endpoint_bonus = -42.0 if tight_endpoint_hit else 0.0
+                tight_length_penalty = stroke.length * 0.55 if tight_endpoint_hit else 0.0
+                variants.append((target_gap * 3.0 + touch_endpoint_gap + pipe_score + parallel_score * 8.0 + selected_bonus + endpoint_bonus + tight_length_penalty, endpoint_index, target_gap, touch_endpoint_gap, pipe_gap, nearest_edge.get("id")))
         score, endpoint_index, target_gap, touch_endpoint_gap, pipe_gap, pipe_edge_id = min(variants, key=lambda item: item[0])
         short_stroke = stroke.length < 18.0
         target_limit = 5.0 if short_stroke else 9.0
         touch_endpoint_limit = 4.0 if short_stroke else 12.0
         pipe_limit = 12.0 if short_stroke else 36.0
-        if target_gap <= target_limit and touch_endpoint_gap <= touch_endpoint_limit and pipe_gap <= pipe_limit:
+        relaxed_target_limit = 8.0 if short_stroke else 18.0
+        relaxed_touch_endpoint_limit = 8.0 if short_stroke else 24.0
+        relaxed_pipe_limit = 16.0 if short_stroke else 48.0
+        tight_endpoint_hit = target_gap <= 1.5 and touch_endpoint_gap <= 5.5 and stroke.length <= max(42.0, target_length * 1.8)
+        effective_pipe_limit = max(pipe_limit, 70.0) if tight_endpoint_hit else pipe_limit
+        if target_gap <= target_limit and touch_endpoint_gap <= touch_endpoint_limit and pipe_gap <= effective_pipe_limit:
             row = {
                 "index": stroke.index,
                 "start": [round(stroke.x0, 2), round(stroke.y0, 2)],
@@ -849,6 +1091,122 @@ def _find_extension_strokes(
             previous = candidates_by_endpoint.get(endpoint_index)
             if previous is None or score < previous[0]:
                 candidates_by_endpoint[endpoint_index] = (score, row)
+        elif (
+            target_gap > target_limit
+            and target_gap <= relaxed_target_limit
+            and touch_endpoint_gap <= relaxed_touch_endpoint_limit
+            and pipe_gap <= relaxed_pipe_limit
+            and parallel_score < 0.82
+        ):
+            # Some PDFs split or trim extension lines so they stop a little before
+            # the dimension arrow endpoint. Keep these as lower-priority fallback
+            # candidates instead of letting a distant extension drive endpoint shifts.
+            row = {
+                "index": stroke.index,
+                "start": [round(stroke.x0, 2), round(stroke.y0, 2)],
+                "end": [round(stroke.x1, 2), round(stroke.y1, 2)],
+                "length_px": round(stroke.length, 2),
+                "target_endpoint": "start" if endpoint_index == 0 else "end",
+                "target_gap_px": round(target_gap, 2),
+                "touch_endpoint_gap_px": round(touch_endpoint_gap, 2),
+                "pipe_gap_px": round(pipe_gap, 2),
+                "pipe_edge_id": pipe_edge_id,
+                "parallel_score": round(parallel_score, 4),
+                "fallback": "relaxed_extension_endpoint",
+            }
+            previous = candidates_by_endpoint.get(endpoint_index)
+            relaxed_score = score + 18.0
+            if previous is None or relaxed_score < previous[0]:
+                candidates_by_endpoint[endpoint_index] = (relaxed_score, row)
+    if len(candidates_by_endpoint) == 1:
+        known_endpoint_index, (_known_score, known_row) = next(iter(candidates_by_endpoint.items()))
+        missing_endpoint_index = 1 - known_endpoint_index
+        known_start = tuple(known_row["start"])
+        known_end = tuple(known_row["end"])
+        known_center = ((known_start[0] + known_end[0]) / 2.0, (known_start[1] + known_end[1]) / 2.0)
+        known_dx = known_end[0] - known_start[0]
+        known_dy = known_end[1] - known_start[1]
+        known_length = math.hypot(known_dx, known_dy) or 1.0
+        expected_sign = 1.0 if missing_endpoint_index > known_endpoint_index else -1.0
+        selected_indices = {int(item[1]["index"]) for item in candidates_by_endpoint.values() if item[1].get("index") is not None}
+
+        def mirrored_candidates_for(
+            mirror_points: list[tuple[float, float]],
+            mirror_indices: set[int],
+            source: str,
+        ) -> list[tuple[float, dict[str, Any]]]:
+            mirror_dx = mirror_points[1][0] - mirror_points[0][0]
+            mirror_dy = mirror_points[1][1] - mirror_points[0][1]
+            mirror_length = math.hypot(mirror_dx, mirror_dy) or 1.0
+            mirror_unit = (mirror_dx / mirror_length, mirror_dy / mirror_length)
+            output: list[tuple[float, dict[str, Any]]] = []
+            for stroke in strokes:
+                if stroke.kind != "dimension" or stroke.index in mirror_indices or stroke.index in selected_indices:
+                    continue
+                if stroke.length < 8.0 or stroke.length > 110.0:
+                    continue
+                stroke_dx = stroke.x1 - stroke.x0
+                stroke_dy = stroke.y1 - stroke.y0
+                stroke_length = math.hypot(stroke_dx, stroke_dy) or 1.0
+                extension_parallel = abs((known_dx * stroke_dx + known_dy * stroke_dy) / (known_length * stroke_length))
+                if extension_parallel < 0.90:
+                    continue
+                stroke_center = ((stroke.x0 + stroke.x1) / 2.0, (stroke.y0 + stroke.y1) / 2.0)
+                center_delta = (stroke_center[0] - known_center[0], stroke_center[1] - known_center[1])
+                along = center_delta[0] * mirror_unit[0] + center_delta[1] * mirror_unit[1]
+                signed_along = along * expected_sign
+                perpendicular = abs(center_delta[0] * -mirror_unit[1] + center_delta[1] * mirror_unit[0])
+                distance_error = abs(signed_along - mirror_length)
+                if signed_along <= mirror_length * 0.55:
+                    continue
+                if distance_error > max(22.0, mirror_length * 0.24):
+                    continue
+                perpendicular_limit = max(24.0 if mirror_length < 40.0 else 18.0, mirror_length * 0.18)
+                if perpendicular > perpendicular_limit:
+                    continue
+                endpoints = [(stroke.x0, stroke.y0), (stroke.x1, stroke.y1)]
+                missing_target = mirror_points[missing_endpoint_index]
+                target_gap, _target_position, touch_point = _distance_to_segment(missing_target, endpoints[0], endpoints[1])
+                if target_gap > max(34.0, mirror_length * 0.34):
+                    continue
+                touch_endpoint_gap = min(math.hypot(touch_point[0] - point[0], touch_point[1] - point[1]) for point in endpoints)
+                nearest_edge, pipe_gap = min(
+                    (
+                        (candidate_edge, min(_distance_to_segment(point, tuple(candidate_edge["start"]), tuple(candidate_edge["end"]))[0] for point in endpoints))
+                        for candidate_edge in candidate_edges
+                    ),
+                    key=lambda item: item[1],
+                )
+                row = {
+                    "index": stroke.index,
+                    "start": [round(stroke.x0, 2), round(stroke.y0, 2)],
+                    "end": [round(stroke.x1, 2), round(stroke.y1, 2)],
+                    "length_px": round(stroke.length, 2),
+                    "target_endpoint": "start" if missing_endpoint_index == 0 else "end",
+                    "target_gap_px": round(target_gap, 2),
+                    "touch_endpoint_gap_px": round(touch_endpoint_gap, 2),
+                    "pipe_gap_px": round(pipe_gap, 2),
+                    "pipe_edge_id": nearest_edge.get("id"),
+                    "parallel_score": round(abs((mirror_dx * stroke_dx + mirror_dy * stroke_dy) / (mirror_length * stroke_length)), 4),
+                    "fallback": "mirrored_missing_extension",
+                    "mirrored_from_index": known_row.get("index"),
+                    "mirror_source": source,
+                    "mirror_distance_error_px": round(distance_error, 2),
+                    "mirror_perpendicular_gap_px": round(perpendicular, 2),
+                }
+                score = distance_error * 2.0 + perpendicular * 1.5 + target_gap * 0.5 + (1.0 - extension_parallel) * 35.0
+                output.append((score, row))
+            return output
+
+        mirrored_candidates = mirrored_candidates_for(target_points, target_indices, "merged_dimension_stroke")
+        if not mirrored_candidates and len(target_indices) > 1:
+            base_stroke = next((stroke for stroke in strokes if stroke.index == target.get("index")), None)
+            if base_stroke is not None:
+                base_points = [(float(base_stroke.x0), float(base_stroke.y0)), (float(base_stroke.x1), float(base_stroke.y1))]
+                mirrored_candidates = mirrored_candidates_for(base_points, {base_stroke.index}, "base_dimension_stroke")
+        if mirrored_candidates:
+            mirrored_candidates.sort(key=lambda item: item[0])
+            candidates_by_endpoint[missing_endpoint_index] = (mirrored_candidates[0][0] + 36.0, mirrored_candidates[0][1])
     return [item[1] for item in sorted(candidates_by_endpoint.values(), key=lambda item: item[0])][:2]
 
 
@@ -1020,6 +1378,7 @@ def map_dimensions(pdf_path: str | Path, page_number: int) -> dict[str, Any]:
             ],
             "tolerance_px": MAX_GAP_PX,
         }
+        compute_endpoint_adjustments(result)
         apply_local_dimension_filter(result)
         return result
 
@@ -1506,9 +1865,49 @@ def save_local_dimension_filter_pdf(
                 label = f"{label} -> {dimension['local_filter_conflict_with']}"
             marked.insert_text(center + (24, -10), label, fontsize=7, fontname="helv", color=color)
 
+        for vertex in mapping.get("vertices", []):
+            try:
+                center = fitz.Point(float(vertex["x"]), float(vertex["y"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            role = vertex.get("role")
+            color = mark_pipeline.VERTEX_ROLE_COLORS.get(role, (0.10, 0.10, 0.10))
+            radius = 6.0 if role == "endpoint" else 5.0
+            marked.draw_circle(center, radius + 1.8, color=(1.0, 1.0, 1.0), fill=(1.0, 1.0, 1.0), fill_opacity=0.72, width=0.8)
+            marked.draw_circle(center, radius, color=color, fill=color, fill_opacity=0.92, width=1.0)
+            label = str(vertex.get("id") or "V?")
+            label_point = center + (8, -8)
+            label_rect = fitz.Rect(label_point.x - 1, label_point.y - 8, label_point.x + 20, label_point.y + 3)
+            marked.draw_rect(label_rect, color=(1.0, 1.0, 1.0), fill=(1.0, 1.0, 1.0), fill_opacity=0.72, width=0)
+            marked.insert_text(label_point, label, fontsize=8, fontname="helv", color=color)
+
+        compute_endpoint_adjustments(mapping)
+        endpoint_color = (0.25, 0.05, 0.75)
+        original_color = (0.45, 0.45, 0.50)
+        for adjustment in mapping.get("endpoint_adjustments", []):
+            original = adjustment.get("original")
+            adjusted = adjustment.get("adjusted")
+            if not original or not adjusted:
+                continue
+            original_point = fitz.Point(float(original[0]), float(original[1]))
+            adjusted_point = fitz.Point(float(adjusted[0]), float(adjusted[1]))
+            marked.draw_line(original_point, adjusted_point, color=endpoint_color, width=2.2)
+            marked.draw_circle(original_point, 4.0, color=original_color, fill=(0.86, 0.86, 0.90), fill_opacity=0.82, width=1.0)
+            marked.draw_circle(adjusted_point, 9.0, color=(1.0, 1.0, 1.0), fill=(1.0, 1.0, 1.0), fill_opacity=0.72, width=0.8)
+            marked.draw_circle(adjusted_point, 7.0, color=endpoint_color, fill=None, width=2.4)
+            marked.draw_line(adjusted_point + (-8, 0), adjusted_point + (8, 0), color=endpoint_color, width=1.8)
+            marked.draw_line(adjusted_point + (0, -8), adjusted_point + (0, 8), color=endpoint_color, width=1.8)
+            label = f"{adjustment.get('vertex_id', 'V?')} -> {adjustment.get('vertex_id', 'V?')}*"
+            if adjustment.get("dimension_id"):
+                label = f"{label} / {adjustment['dimension_id']}"
+            label_point = adjusted_point + (12, -12)
+            label_rect = fitz.Rect(label_point.x - 2, label_point.y - 9, label_point.x + 68, label_point.y + 4)
+            marked.draw_rect(label_rect, color=(1.0, 1.0, 1.0), fill=(1.0, 1.0, 1.0), fill_opacity=0.78, width=0)
+            marked.insert_text(label_point, label, fontsize=8, fontname="helv", color=endpoint_color)
+
         marked.insert_text(
             fitz.Point(24, 28),
-            "LOCAL DIMENSION FILTER: green include, red excluded by larger covering dimension",
+            "LOCAL DIMENSION FILTER: green include, red exclude; violet endpoint shift by extension contact",
             fontsize=9,
             fontname="helv",
             color=(0.05, 0.18, 0.14),
@@ -1700,6 +2099,7 @@ def run_dimension_mapping(pdf_path: str | Path, page_number: int, output_pdf: st
 __all__ = [
     "map_dimensions",
     "run_dimension_mapping",
+    "compute_endpoint_adjustments",
     "apply_local_dimension_filter",
     "save_dimension_mapping_pdf",
     "save_preprocess_annotation_pdf",

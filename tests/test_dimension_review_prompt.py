@@ -6,7 +6,7 @@ from unittest import mock
 
 import fitz
 
-from src.dimension_mapping import _dimension_hints_from_text, _first_arrow_third, _handwheel_arrow_segments, _handwheel_details, _handwheel_text_rects, _is_rectangle_side, _same_directed_contour, apply_local_dimension_filter, save_clean_local_markup_pdf, save_local_dimension_filter_pdf, save_preprocess_annotation_pdf
+from src.dimension_mapping import _dimension_hints_from_text, _first_arrow_third, _handwheel_arrow_segments, _handwheel_details, _handwheel_text_rects, _is_rectangle_side, _same_directed_contour, apply_local_dimension_filter, compute_endpoint_adjustments, save_clean_local_markup_pdf, save_local_dimension_filter_pdf, save_preprocess_annotation_pdf
 from src.dimension_mapping import _direct_dimension_stroke_from_label, _fallback_leader_stroke_from_label, _find_extension_strokes, _merge_dimension_stroke, _resolve_leader_target
 from src.dimension_review import build_review_payload
 
@@ -74,6 +74,153 @@ class DimensionRuleTests(unittest.TestCase):
         extensions = _find_extension_strokes({"dimension_stroke": target}, edge, strokes)
 
         self.assertEqual(extensions, [])
+
+    def test_extension_stroke_relaxed_fallback_accepts_trimmed_line(self) -> None:
+        target = {"start": [0.0, 0.0], "end": [100.0, 0.0], "merged_indices": [1]}
+        edge = {"id": "E001", "start": [0.0, 34.0], "end": [100.0, 34.0]}
+        strokes = [
+            SimpleNamespace(index=1, x0=0.0, y0=0.0, x1=100.0, y1=0.0, length=100.0, kind="dimension"),
+            SimpleNamespace(index=2, x0=14.0, y0=4.0, x1=14.0, y1=34.0, length=30.0, kind="dimension"),
+        ]
+
+        extensions = _find_extension_strokes({"dimension_stroke": target}, edge, strokes)
+
+        self.assertEqual([item["index"] for item in extensions], [2])
+        self.assertEqual(extensions[0]["fallback"], "relaxed_extension_endpoint")
+
+    def test_extension_stroke_mirrors_missing_second_extension(self) -> None:
+        target = {"start": [0.0, 0.0], "end": [100.0, 0.0], "merged_indices": [1]}
+        edge = {"id": "E001", "start": [0.0, 30.0], "end": [12.0, 30.0]}
+        strokes = [
+            SimpleNamespace(index=1, x0=0.0, y0=0.0, x1=100.0, y1=0.0, length=100.0, kind="dimension"),
+            SimpleNamespace(index=2, x0=0.0, y0=0.0, x1=0.0, y1=30.0, length=30.0, kind="dimension"),
+            SimpleNamespace(index=3, x0=100.0, y0=0.0, x1=100.0, y1=30.0, length=30.0, kind="dimension"),
+        ]
+
+        extensions = _find_extension_strokes({"dimension_stroke": target}, edge, strokes)
+
+        self.assertEqual({item["index"] for item in extensions}, {2, 3})
+        mirrored = next(item for item in extensions if item["index"] == 3)
+        self.assertEqual(mirrored["fallback"], "mirrored_missing_extension")
+        self.assertEqual(mirrored["mirrored_from_index"], 2)
+
+    def test_extension_stroke_mirrors_from_base_stroke_when_merge_is_too_long(self) -> None:
+        target = {"index": 1, "start": [-100.0, 0.0], "end": [100.0, 0.0], "merged_indices": [1, 4]}
+        edge = {"id": "E001", "start": [100.0, 30.0], "end": [112.0, 30.0]}
+        strokes = [
+            SimpleNamespace(index=1, x0=0.0, y0=0.0, x1=100.0, y1=0.0, length=100.0, kind="dimension"),
+            SimpleNamespace(index=2, x0=100.0, y0=0.0, x1=100.0, y1=30.0, length=30.0, kind="dimension"),
+            SimpleNamespace(index=3, x0=0.0, y0=0.0, x1=0.0, y1=30.0, length=30.0, kind="dimension"),
+            SimpleNamespace(index=4, x0=-100.0, y0=0.0, x1=0.0, y1=0.0, length=100.0, kind="dimension"),
+        ]
+
+        extensions = _find_extension_strokes({"dimension_stroke": target}, edge, strokes)
+
+        self.assertEqual({item["index"] for item in extensions}, {2, 3})
+        mirrored = next(item for item in extensions if item["index"] == 3)
+        self.assertEqual(mirrored["fallback"], "mirrored_missing_extension")
+        self.assertEqual(mirrored["mirror_source"], "base_dimension_stroke")
+
+    def test_extension_stroke_mirrors_short_dimension_with_wider_perpendicular_gap(self) -> None:
+        target = {"index": 1, "start": [0.0, 25.0], "end": [0.0, 0.0], "merged_indices": [1]}
+        edge = {"id": "E001", "start": [24.0, 12.0], "end": [36.0, 12.0]}
+        strokes = [
+            SimpleNamespace(index=1, x0=0.0, y0=25.0, x1=0.0, y1=0.0, length=25.0, kind="dimension"),
+            SimpleNamespace(index=2, x0=0.0, y0=25.0, x1=27.0, y1=10.0, length=30.89, kind="dimension"),
+            SimpleNamespace(index=3, x0=-19.0, y0=15.0, x1=46.0, y1=-23.0, length=75.29, kind="dimension"),
+        ]
+
+        extensions = _find_extension_strokes({"dimension_stroke": target}, edge, strokes)
+
+        self.assertEqual({item["index"] for item in extensions}, {2, 3})
+        mirrored = next(item for item in extensions if item["index"] == 3)
+        self.assertEqual(mirrored["fallback"], "mirrored_missing_extension")
+
+    def test_extension_stroke_prefers_tight_endpoint_hit_over_pipe_gap(self) -> None:
+        target = {"index": 1, "start": [0.0, 25.0], "end": [0.0, 0.0], "merged_indices": [1]}
+        edge = {"id": "E001", "start": [-30.0, 0.0], "end": [-20.0, 0.0]}
+        strokes = [
+            SimpleNamespace(index=1, x0=0.0, y0=25.0, x1=0.0, y1=0.0, length=25.0, kind="dimension"),
+            SimpleNamespace(index=2, x0=-28.0, y0=26.0, x1=3.0, y1=-10.0, length=47.51, kind="dimension"),
+            SimpleNamespace(index=3, x0=3.0, y0=26.0, x1=-18.0, y1=10.0, length=26.4, kind="dimension"),
+        ]
+
+        extensions = _find_extension_strokes({"dimension_stroke": target}, edge, strokes)
+
+        start_extension = next(item for item in extensions if item["target_endpoint"] == "start")
+        self.assertEqual(start_extension["index"], 3)
+
+    def test_endpoint_adjustment_uses_nearest_extension_contact(self) -> None:
+        mapping = {
+            "vertices": [
+                {"id": "V01", "role": "endpoint", "x": 0.0, "y": 0.0},
+                {"id": "V02", "role": "endpoint", "x": 100.0, "y": 0.0},
+            ],
+            "edges": [
+                {"id": "E001", "start": [0.0, 0.0], "end": [100.0, 0.0], "pixel_length": 100.0},
+            ],
+            "dimensions": [
+                {
+                    "id": "D001",
+                    "edge_id": "E001",
+                    "extension_strokes": [
+                        {"index": 10, "start": [25.0, -20.0], "end": [25.0, 0.0], "pipe_edge_id": "E001"},
+                        {"index": 11, "start": [70.0, -20.0], "end": [70.0, 0.0], "pipe_edge_id": "E001"},
+                    ],
+                }
+            ],
+        }
+
+        adjustments = compute_endpoint_adjustments(mapping)
+
+        self.assertEqual(len(adjustments), 2)
+        by_vertex = {item["vertex_id"]: item for item in adjustments}
+        self.assertEqual(by_vertex["V01"]["adjusted"], [25.0, 0.0])
+        self.assertEqual(by_vertex["V01"]["dimension_id"], "D001")
+        self.assertEqual(by_vertex["V02"]["adjusted"], [70.0, 0.0])
+
+    def test_endpoint_adjustment_stays_empty_without_extension_contact(self) -> None:
+        mapping = {
+            "vertices": [{"id": "V01", "role": "endpoint", "x": 0.0, "y": 0.0}],
+            "edges": [{"id": "E001", "start": [0.0, 0.0], "end": [100.0, 0.0], "pixel_length": 100.0}],
+            "dimensions": [{"id": "D001", "edge_id": "E001", "extension_strokes": []}],
+        }
+
+        self.assertEqual(compute_endpoint_adjustments(mapping), [])
+
+    def test_endpoint_adjustment_ignores_distant_extension_endpoint(self) -> None:
+        mapping = {
+            "vertices": [{"id": "V01", "role": "endpoint", "x": 0.0, "y": 0.0}],
+            "edges": [{"id": "E001", "start": [0.0, 0.0], "end": [200.0, 0.0], "pixel_length": 200.0}],
+            "dimensions": [
+                {
+                    "id": "D001",
+                    "edge_id": "E001",
+                    "extension_strokes": [
+                        {"index": 10, "start": [120.0, -20.0], "end": [120.0, 0.0], "pipe_edge_id": "E001"},
+                    ],
+                }
+            ],
+        }
+
+        self.assertEqual(compute_endpoint_adjustments(mapping), [])
+
+    def test_endpoint_adjustment_keeps_endpoint_when_extension_is_already_close(self) -> None:
+        mapping = {
+            "vertices": [{"id": "V01", "role": "endpoint", "x": 0.0, "y": 0.0}],
+            "edges": [{"id": "E001", "start": [0.0, 0.0], "end": [100.0, 0.0], "pixel_length": 100.0}],
+            "dimensions": [
+                {
+                    "id": "D001",
+                    "edge_id": "E001",
+                    "extension_strokes": [
+                        {"index": 10, "start": [5.0, -20.0], "end": [5.0, 0.0], "pipe_edge_id": "E001"},
+                    ],
+                }
+            ],
+        }
+
+        self.assertEqual(compute_endpoint_adjustments(mapping), [])
 
     def test_leader_target_resolves_touched_dimension_line_without_edge_angle_match(self) -> None:
         leader = SimpleNamespace(index=1, x0=10.0, y0=10.0, x1=55.0, y1=45.0, length=57.0, kind="dimension")

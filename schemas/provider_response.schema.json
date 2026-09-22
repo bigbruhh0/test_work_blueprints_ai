@@ -1,0 +1,196 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://test-chertezh.local/schemas/provider_response.schema.json",
+  "title": "Isometry Provider Review Response",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["candidate_decisions"],
+  "properties": {
+    "candidate_decisions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/candidate_decision" }
+    },
+    "edge_decisions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/edge_decision" }
+    },
+    "edge_classifications": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/edge_decision" }
+    },
+    "main_route": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "endpoint_vertices": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "edge_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "reason": { "type": ["string", "null"] }
+      }
+    },
+    "branch_routes": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/branch_route" }
+    },
+    "cross_sheet_connections": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/cross_sheet_connection" }
+    },
+    "valve_dimensions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/valve_dimension" }
+    },
+    "cross_sheet_dimensions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/cross_sheet_dimension" }
+    },
+    "pipe_objects": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/pipe_object" }
+    },
+    "notes": {
+      "type": "array",
+      "items": { "type": ["string", "object"] }
+    }
+  },
+  "$defs": {
+    "decision": {
+      "enum": ["include", "exclude", "ambiguous"]
+    },
+    "kind": {
+      "enum": ["pipe_length", "valve_dimension", "cross_sheet_dimension", "other"]
+    },
+    "candidate_decision": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["candidate_id", "decision"],
+      "properties": {
+        "candidate_id": { "type": "string" },
+        "kind": { "$ref": "#/$defs/kind" },
+        "decision": { "$ref": "#/$defs/decision" },
+        "reason": { "type": ["string", "null"] },
+        "edge_id": { "type": ["string", "null"] },
+        "covered_edge_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "route_type": {
+          "enum": ["main", "branch", null]
+        }
+      }
+    },
+    "edge_decision": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "edge_id": { "type": "string" },
+        "vertex_pair": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "route_type": {
+          "enum": ["main", "branch", null]
+        },
+        "junction_vertex_id": { "type": ["string", "null"] },
+        "candidate_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "included_candidate_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "excluded_candidate_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "ambiguous_candidate_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "covered_by_candidate_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "reason": { "type": ["string", "null"] }
+      }
+    },
+    "branch_route": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "junction_vertex_id": { "type": ["string", "null"] },
+        "endpoint_vertex_id": { "type": ["string", "null"] },
+        "edge_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "candidate_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "reason": { "type": ["string", "null"] }
+      }
+    },
+    "cross_sheet_connection": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "vertex_id": { "type": ["string", "null"] },
+        "label": { "type": ["string", "null"] },
+        "target_sheet": { "type": ["string", "null"] },
+        "connection_type": {
+          "enum": ["continuation", "tie_in", "unknown", "other", null]
+        },
+        "reason": { "type": ["string", "null"] }
+      }
+    },
+    "valve_dimension": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "candidate_id": { "type": "string" },
+        "object_type": { "type": ["string", "null"] },
+        "value_mm": { "type": ["number", "null"] },
+        "from_vertex": { "type": ["string", "null"] },
+        "to_vertex": { "type": ["string", "null"] },
+        "edge_id": { "type": ["string", "null"] },
+        "handwheel_id": { "type": ["string", "null"] },
+        "arrow_found": { "type": ["boolean", "null"] },
+        "reason": { "type": ["string", "null"] }
+      }
+    },
+    "cross_sheet_dimension": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "candidate_id": { "type": "string" },
+        "value_mm": { "type": ["number", "null"] },
+        "from_vertex": { "type": ["string", "null"] },
+        "to_vertex": { "type": ["string", "null"] },
+        "edge_id": { "type": ["string", "null"] },
+        "target_sheet": { "type": ["string", "null"] },
+        "label": { "type": ["string", "null"] },
+        "reason": { "type": ["string", "null"] }
+      }
+    },
+    "pipe_object": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "type": { "type": ["string", "null"] },
+        "label": { "type": ["string", "null"] },
+        "edge_id": { "type": ["string", "null"] },
+        "handwheel_id": { "type": ["string", "null"] },
+        "reason": { "type": ["string", "null"] }
+      }
+    }
+  }
+}
