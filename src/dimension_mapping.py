@@ -297,6 +297,247 @@ def _mark_overlapping_dimensions(dimensions: list[dict[str, Any]], edges: list[d
             larger.setdefault("valid", True)
 
 
+def _stroke_axis_interval(
+    stroke: dict[str, Any],
+    axis_stroke: dict[str, Any],
+) -> tuple[float, float] | None:
+    start = stroke.get("start")
+    end = stroke.get("end")
+    axis_start = axis_stroke.get("start")
+    axis_end = axis_stroke.get("end")
+    if not start or not end or not axis_start or not axis_end:
+        return None
+    ax = float(axis_end[0]) - float(axis_start[0])
+    ay = float(axis_end[1]) - float(axis_start[1])
+    axis_length = math.hypot(ax, ay)
+    if axis_length <= 1e-6:
+        return None
+    unit_x = ax / axis_length
+    unit_y = ay / axis_length
+    origin_x = float(axis_start[0])
+    origin_y = float(axis_start[1])
+    values = []
+    for point in (start, end):
+        values.append((float(point[0]) - origin_x) * unit_x + (float(point[1]) - origin_y) * unit_y)
+    return min(values), max(values)
+
+
+def _dimension_contains_dimension(container: dict[str, Any], child: dict[str, Any]) -> bool:
+    container_stroke = container.get("dimension_stroke")
+    child_stroke = child.get("dimension_stroke")
+    if not isinstance(container_stroke, dict) or not isinstance(child_stroke, dict):
+        return False
+    container_interval = _stroke_axis_interval(container_stroke, container_stroke)
+    child_interval = _stroke_axis_interval(child_stroke, container_stroke)
+    if container_interval is None or child_interval is None:
+        return False
+    container_length = max(1.0, container_interval[1] - container_interval[0])
+    child_length = child_interval[1] - child_interval[0]
+    if child_length <= 0:
+        return False
+    overlap_start = max(container_interval[0], child_interval[0])
+    overlap_end = min(container_interval[1], child_interval[1])
+    overlap = max(0.0, overlap_end - overlap_start)
+    child_coverage = overlap / child_length
+    overshoot = max(container_interval[0] - child_interval[0], child_interval[1] - container_interval[1], 0.0)
+    return child_coverage >= 0.82 and overshoot <= max(8.0, 0.08 * container_length)
+
+
+def _parallel_nested_dimension_lines(container: dict[str, Any], child: dict[str, Any]) -> bool:
+    container_stroke = container.get("dimension_stroke")
+    child_stroke = child.get("dimension_stroke")
+    if not isinstance(container_stroke, dict) or not isinstance(child_stroke, dict):
+        return False
+    container_start = container_stroke.get("start")
+    container_end = container_stroke.get("end")
+    child_start = child_stroke.get("start")
+    child_end = child_stroke.get("end")
+    if not container_start or not container_end or not child_start or not child_end:
+        return False
+    cdx = float(container_end[0]) - float(container_start[0])
+    cdy = float(container_end[1]) - float(container_start[1])
+    sdx = float(child_end[0]) - float(child_start[0])
+    sdy = float(child_end[1]) - float(child_start[1])
+    container_length = math.hypot(cdx, cdy)
+    child_length = math.hypot(sdx, sdy)
+    if container_length <= 1e-6 or child_length <= 1e-6 or container_length < child_length * 1.08:
+        return False
+    direction_cosine = abs((cdx * sdx + cdy * sdy) / (container_length * child_length))
+    if direction_cosine < 0.965:
+        return False
+    if not _dimension_contains_dimension(container, child):
+        return False
+    gaps = [
+        _distance_to_segment(tuple(child_start), tuple(container_start), tuple(container_end))[0],
+        _distance_to_segment(tuple(child_end), tuple(container_start), tuple(container_end))[0],
+    ]
+    average_gap = sum(gaps) / len(gaps)
+    # A smaller line inside a larger parallel line is an obvious duplicate only when it
+    # is drawn as a separate offset dimension line. Same-line chains stay out of this rule.
+    return 6.0 <= average_gap <= 38.0
+
+
+def _nested_by_merged_dimension_indices(container: dict[str, Any], child: dict[str, Any]) -> bool:
+    container_stroke = container.get("dimension_stroke")
+    child_stroke = child.get("dimension_stroke")
+    if not isinstance(container_stroke, dict) or not isinstance(child_stroke, dict):
+        return False
+    container_indices = set(container_stroke.get("merged_indices") or [])
+    child_indices = set(child_stroke.get("merged_indices") or [])
+    if not container_indices or not child_indices or not child_indices < container_indices:
+        return False
+    container_length = float(container_stroke.get("length_px") or 0.0)
+    child_length = float(child_stroke.get("length_px") or 0.0)
+    if container_length <= child_length * 1.12:
+        return False
+    return _dimension_contains_dimension(container, child)
+
+
+def _extension_pipe_edges(dimension: dict[str, Any]) -> set[str]:
+    return {
+        str(stroke.get("pipe_edge_id"))
+        for stroke in (dimension.get("extension_strokes") or [])
+        if isinstance(stroke, dict) and stroke.get("pipe_edge_id")
+    }
+
+
+def _extension_indices(dimension: dict[str, Any]) -> set[int]:
+    indices: set[int] = set()
+    for stroke in dimension.get("extension_strokes") or []:
+        if not isinstance(stroke, dict):
+            continue
+        index = stroke.get("index")
+        if isinstance(index, int):
+            indices.add(index)
+    return indices
+
+
+def _dimension_stroke_indices(dimension: dict[str, Any]) -> set[int]:
+    stroke = dimension.get("dimension_stroke")
+    if not isinstance(stroke, dict):
+        return set()
+    return {
+        int(index)
+        for index in (stroke.get("merged_indices") or [])
+        if isinstance(index, int)
+    }
+
+
+def _short_endpoint_leader_overlap(dimension: dict[str, Any]) -> bool:
+    if dimension.get("attachment_kind") != "leader_to_dimension_arrow":
+        return False
+    if float(dimension.get("value") or 0.0) >= 250.0:
+        return False
+    stroke = dimension.get("dimension_stroke")
+    leader = dimension.get("leader_stroke")
+    resolution = dimension.get("leader_resolution") or {}
+    if not isinstance(stroke, dict) or not isinstance(leader, dict):
+        return False
+    target_position = resolution.get("target_position")
+    if target_position is None:
+        return False
+    # The leader hits the end of a very short dimension arrow: these are small local
+    # callouts inside a larger chain, not a standalone covered section. If the leader
+    # hits the middle, keep it green for now.
+    return (
+        float(stroke.get("length_px") or 0.0) <= 24.0
+        and float(leader.get("length_px") or 0.0) >= 55.0
+        and (float(target_position) <= 0.12 or float(target_position) >= 0.88)
+    )
+
+
+def apply_local_dimension_filter(mapping: dict[str, Any]) -> dict[str, Any]:
+    """Mark obvious local include/exclude decisions without provider input."""
+    dimensions = mapping.get("dimensions") or []
+    edges = mapping.get("edges") or []
+    edge_by_id = {edge.get("id"): edge for edge in edges if edge.get("id")}
+
+    for dimension in dimensions:
+        status = dimension.get("status")
+        valid = dimension.get("valid", True)
+        if status in {"cross_sheet_reference", "unresolved"} or valid is False:
+            if status == "invalid_overlap":
+                dimension["local_filter_decision"] = "exclude"
+                dimension["local_filter_reason"] = dimension.get("reason") or "overlaps_larger_dimension"
+            else:
+                dimension["local_filter_decision"] = "ambiguous"
+                dimension["local_filter_reason"] = dimension.get("reason") or status or "not_enough_geometry"
+            continue
+        if status == "handwheel":
+            dimension["local_filter_decision"] = "exclude"
+            dimension["local_filter_reason"] = "handwheel_dimension"
+            continue
+        dimension["local_filter_decision"] = "include"
+        dimension["local_filter_reason"] = "no_larger_covering_dimension_found"
+
+    comparable = [
+        item
+        for item in dimensions
+        if item.get("local_filter_decision") == "include"
+        and isinstance(item.get("dimension_stroke"), dict)
+        and item.get("value") is not None
+    ]
+    for index, first in enumerate(comparable):
+        for second in comparable[index + 1:]:
+            same_edge = first.get("edge_id") and first.get("edge_id") == second.get("edge_id")
+            same_contour = _same_directed_contour(first, second, edge_by_id)
+            if float(first["value"]) == float(second["value"]):
+                continue
+            smaller, larger = (first, second) if float(first["value"]) < float(second["value"]) else (second, first)
+            smaller_is_leader_callout = smaller.get("attachment_kind") == "leader_to_dimension_arrow"
+            shared_extension_reference = (
+                bool(_extension_indices(larger) & _extension_indices(smaller))
+                or bool(_extension_pipe_edges(larger) & _extension_pipe_edges(smaller))
+            )
+            value_ratio = float(smaller["value"]) / max(float(larger["value"]), 1.0)
+            substantial_nested_dimension = float(smaller["value"]) >= 500.0 and value_ratio >= 0.18
+            nested_on_section = (not smaller_is_leader_callout) and (same_edge or same_contour) and _dimension_contains_dimension(larger, smaller)
+            nested_parallel_line = (
+                (not smaller_is_leader_callout)
+                and (same_edge or same_contour or shared_extension_reference or substantial_nested_dimension)
+                and _parallel_nested_dimension_lines(larger, smaller)
+            )
+            short_endpoint_overlap = same_edge and _short_endpoint_leader_overlap(smaller)
+            large_leader_reference = smaller_is_leader_callout and float(smaller["value"]) >= 500.0 and shared_extension_reference
+            if not nested_on_section and not nested_parallel_line and not short_endpoint_overlap and not large_leader_reference:
+                continue
+            smaller["local_filter_decision"] = "exclude"
+            smaller["local_filter_reason"] = (
+                "covered_by_short_endpoint_leader_overlap"
+                if short_endpoint_overlap
+                else "covered_by_shared_extension_reference"
+                if large_leader_reference
+                else "covered_by_larger_dimension_on_same_section"
+            )
+            smaller["local_filter_conflict_with"] = larger.get("id")
+
+    excluded = [
+        item
+        for item in dimensions
+        if item.get("local_filter_decision") == "exclude"
+        and _dimension_stroke_indices(item)
+    ]
+    for dimension in dimensions:
+        if dimension.get("local_filter_decision") != "include":
+            continue
+        dimension_indices = _dimension_stroke_indices(dimension)
+        if not dimension_indices:
+            continue
+        for excluded_dimension in excluded:
+            excluded_indices = _dimension_stroke_indices(excluded_dimension)
+            same_stroke = dimension_indices == excluded_indices
+            subset_of_excluded = bool(dimension_indices < excluded_indices)
+            if not same_stroke and not subset_of_excluded:
+                continue
+            if dimension.get("attachment_kind") != "leader_to_dimension_arrow" and not same_stroke:
+                continue
+            dimension["local_filter_decision"] = "exclude"
+            dimension["local_filter_reason"] = "shares_excluded_dimension_stroke"
+            dimension["local_filter_conflict_with"] = excluded_dimension.get("id")
+            break
+    return mapping
+
+
 def _nearest_edge_for_stroke(stroke: dict[str, Any], edges: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, float, tuple[float, float] | None]:
     points = [tuple(stroke["start"]), tuple(stroke["end"])]
     best_edge = None
@@ -376,24 +617,142 @@ def _stroke_angle_matches_edge(stroke: Any, edge: dict[str, Any]) -> bool:
     return cosine >= 0.97
 
 
-def _resolve_leader_target(stroke: Any, edge: dict[str, Any], strokes: list[Any]) -> Any | None:
+def _point_distance(first: tuple[float, float], second: tuple[float, float]) -> float:
+    return math.hypot(first[0] - second[0], first[1] - second[1])
+
+
+def _stroke_endpoint_points(stroke: Any) -> list[tuple[float, float]]:
+    return [(float(stroke.x0), float(stroke.y0)), (float(stroke.x1), float(stroke.y1))]
+
+
+def _leader_target_endpoint(stroke: Any, label_center: tuple[float, float] | None = None) -> tuple[float, float]:
+    endpoints = _stroke_endpoint_points(stroke)
+    if label_center is None:
+        return endpoints[1]
+    label_gap_0 = _point_distance(endpoints[0], label_center)
+    label_gap_1 = _point_distance(endpoints[1], label_center)
+    return endpoints[1] if label_gap_0 <= label_gap_1 else endpoints[0]
+
+
+def _resolve_leader_target(
+    stroke: Any,
+    edge: dict[str, Any] | None,
+    strokes: list[Any],
+    label_center: tuple[float, float] | None = None,
+    blocked_indices: set[int] | None = None,
+) -> tuple[Any, dict[str, Any]] | None:
+    blocked = blocked_indices or set()
+    target_endpoint = _leader_target_endpoint(stroke, label_center)
     candidates = []
     for candidate in strokes:
-        if candidate.index == stroke.index or candidate.kind != "dimension":
+        if candidate.index == stroke.index or candidate.index in blocked or candidate.kind != "dimension":
             continue
-        if not _stroke_angle_matches_edge(candidate, edge):
-            continue
-        endpoint_distance = min(
-            _distance_to_segment((stroke.x0, stroke.y0), (candidate.x0, candidate.y0), (candidate.x1, candidate.y1))[0],
-            _distance_to_segment((stroke.x1, stroke.y1), (candidate.x0, candidate.y0), (candidate.x1, candidate.y1))[0],
+        target_gap, target_position, target_projection = _distance_to_segment(
+            target_endpoint,
+            (candidate.x0, candidate.y0),
+            (candidate.x1, candidate.y1),
         )
-        if endpoint_distance > 28.0:
-            continue
-        edge_distance = min(
-            _distance_to_segment((edge["start"][0], edge["start"][1]), (candidate.x0, candidate.y0), (candidate.x1, candidate.y1))[0],
-            _distance_to_segment((edge["end"][0], edge["end"][1]), (candidate.x0, candidate.y0), (candidate.x1, candidate.y1))[0],
+        endpoint_gap = min(
+            _point_distance(target_endpoint, endpoint)
+            for endpoint in _stroke_endpoint_points(candidate)
         )
-        candidates.append((endpoint_distance + edge_distance * 0.35, -candidate.length, candidate))
+        leader_endpoint_gap = min(
+            _distance_to_segment(endpoint, (candidate.x0, candidate.y0), (candidate.x1, candidate.y1))[0]
+            for endpoint in _stroke_endpoint_points(stroke)
+        )
+        if min(target_gap, leader_endpoint_gap) > 22.0:
+            continue
+        edge_distance = 0.0
+        angle_bonus = 0.0
+        if edge is not None:
+            edge_distance = min(
+                _distance_to_segment((edge["start"][0], edge["start"][1]), (candidate.x0, candidate.y0), (candidate.x1, candidate.y1))[0],
+                _distance_to_segment((edge["end"][0], edge["end"][1]), (candidate.x0, candidate.y0), (candidate.x1, candidate.y1))[0],
+            )
+            angle_bonus = -8.0 if _stroke_angle_matches_edge(candidate, edge) else 0.0
+        # Prefer the line actually touched by the leader endpoint. The old edge-angle
+        # preference is only a weak bonus because projected edge_id is often wrong for
+        # callout dimensions.
+        score = target_gap * 4.0 + endpoint_gap * 0.25 + edge_distance * 0.12 + angle_bonus - min(candidate.length, 120.0) * 0.02
+        candidates.append(
+            (
+                score,
+                target_gap,
+                -candidate.length,
+                candidate,
+                {
+                    "leader_target_point": [round(target_endpoint[0], 2), round(target_endpoint[1], 2)],
+                    "target_gap_px": round(target_gap, 2),
+                    "target_position": round(target_position, 4),
+                    "target_projection": [round(target_projection[0], 2), round(target_projection[1], 2)],
+                    "candidate_index": candidate.index,
+                    "candidate_length_px": round(candidate.length, 2),
+                    "edge_distance_px": round(edge_distance, 2) if edge is not None else None,
+                },
+            )
+        )
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+    return candidates[0][3], candidates[0][4]
+
+
+def _fallback_leader_stroke_from_label(
+    label_center: tuple[float, float],
+    strokes: list[Any],
+    blocked_indices: set[int] | None = None,
+) -> Any | None:
+    blocked = blocked_indices or set()
+    candidates = []
+    for stroke in strokes:
+        if stroke.index in blocked or stroke.kind != "dimension":
+            continue
+        if stroke.length < 10.0 or stroke.length > 85.0:
+            continue
+        segment_gap, position, projection = _distance_to_segment(
+            label_center,
+            (stroke.x0, stroke.y0),
+            (stroke.x1, stroke.y1),
+        )
+        endpoint_gap = min(_point_distance(label_center, endpoint) for endpoint in _stroke_endpoint_points(stroke))
+        if segment_gap > 14.0 and endpoint_gap > 18.0:
+            continue
+        # Prefer a line that starts/ends near the label. If the label projects into the
+        # middle of a long line, it is probably the actual dimension line, not a lead.
+        middle_penalty = 10.0 if 0.25 < position < 0.75 and endpoint_gap > 12.0 else 0.0
+        candidates.append((segment_gap * 2.0 + endpoint_gap + middle_penalty + stroke.length * 0.03, stroke))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0])
+    return candidates[0][1]
+
+
+def _direct_dimension_stroke_from_label(
+    label_center: tuple[float, float],
+    edge: dict[str, Any] | None,
+    strokes: list[Any],
+    blocked_indices: set[int] | None = None,
+) -> Any | None:
+    if edge is None:
+        return None
+    blocked = blocked_indices or set()
+    candidates = []
+    for stroke in strokes:
+        if stroke.index in blocked or stroke.kind != "dimension":
+            continue
+        if stroke.length < 18.0 or stroke.length > 180.0:
+            continue
+        if not _stroke_angle_matches_edge(stroke, edge):
+            continue
+        segment_gap, position, _projection = _distance_to_segment(
+            label_center,
+            (stroke.x0, stroke.y0),
+            (stroke.x1, stroke.y1),
+        )
+        if segment_gap > 8.0:
+            continue
+        endpoint_gap = min(_point_distance(label_center, endpoint) for endpoint in _stroke_endpoint_points(stroke))
+        candidates.append((segment_gap * 3.0 + endpoint_gap * 0.15 + abs(position - 0.5), -stroke.length, stroke))
     if not candidates:
         return None
     candidates.sort(key=lambda item: (item[0], item[1]))
@@ -580,19 +939,51 @@ def map_dimensions(pdf_path: str | Path, page_number: int) -> dict[str, Any]:
                 mapped[-1]["valid"] = False
             mapped[-1]["dimension_stroke"] = None
             attached = attached_strokes.get(mapped[-1]["id"])
+            attached_source = "vector_attachment"
+            if attached is None:
+                attached = _fallback_leader_stroke_from_label(center, vector_graph.strokes, attached_indices)
+                if attached is not None:
+                    attached_source = "fallback_nearest_label_leader"
             if attached is not None:
                 blocked_indices = attached_indices - {attached.index}
                 initial_stroke = _merge_dimension_stroke(attached, vector_graph.strokes, blocked_indices)
                 mapped[-1]["dimension_stroke"] = initial_stroke
                 mapped[-1]["leader_stroke"] = None
+                mapped[-1]["attachment_source"] = attached_source
                 pipe_edge = next((item for item in edges if item["id"] == mapped[-1].get("edge_id")), None)
-                if pipe_edge is not None and not _stroke_angle_matches_edge(attached, pipe_edge):
-                    target = _resolve_leader_target(attached, pipe_edge, vector_graph.strokes)
-                    if target is not None:
-                        mapped[-1]["leader_stroke"] = initial_stroke
-                        mapped[-1]["dimension_stroke"] = _merge_dimension_stroke(target, vector_graph.strokes, attached_indices - {target.index})
-                        mapped[-1]["leader_attached"] = True
-                        mapped[-1]["attachment_kind"] = "leader_to_dimension_arrow"
+                should_resolve_leader = pipe_edge is None or not _stroke_angle_matches_edge(attached, pipe_edge)
+                if should_resolve_leader:
+                    direct_stroke = _direct_dimension_stroke_from_label(
+                        center,
+                        pipe_edge,
+                        vector_graph.strokes,
+                        attached_indices - {attached.index},
+                    )
+                    if direct_stroke is not None:
+                        mapped[-1]["dimension_stroke"] = _merge_dimension_stroke(
+                            direct_stroke,
+                            vector_graph.strokes,
+                            attached_indices - {direct_stroke.index},
+                        )
+                        mapped[-1]["attachment_kind"] = "direct_dimension_arrow"
+                        mapped[-1]["attachment_source"] = "near_label_direct_dimension"
+                    else:
+                        resolved = _resolve_leader_target(
+                            attached,
+                            pipe_edge,
+                            vector_graph.strokes,
+                            center,
+                            {attached.index},
+                        )
+                        if resolved is not None:
+                            target, leader_resolution = resolved
+                            mapped[-1]["leader_stroke"] = initial_stroke
+                            mapped[-1]["dimension_stroke"] = _merge_dimension_stroke(target, vector_graph.strokes, attached_indices - {target.index})
+                            mapped[-1]["leader_attached"] = True
+                            mapped[-1]["attachment_kind"] = "leader_to_dimension_arrow"
+                            mapped[-1]["leader_resolution"] = leader_resolution
+                        else:
+                            mapped[-1]["attachment_kind"] = "leader_target_unresolved"
                 else:
                     mapped[-1]["attachment_kind"] = "direct_dimension_arrow"
                 _add_pipe_anchor(mapped[-1], edges)
@@ -617,7 +1008,7 @@ def map_dimensions(pdf_path: str | Path, page_number: int) -> dict[str, Any]:
 
         _mark_overlapping_dimensions(mapped, edges)
         connections = _connection_rows_from_page(page, page_number, vertices)
-        return {
+        result = {
             "page_number": page_number,
             "vertices": vertices,
             "edges": edges,
@@ -629,6 +1020,8 @@ def map_dimensions(pdf_path: str | Path, page_number: int) -> dict[str, Any]:
             ],
             "tolerance_px": MAX_GAP_PX,
         }
+        apply_local_dimension_filter(result)
+        return result
 
 
 def save_dimension_mapping_pdf(
@@ -963,7 +1356,7 @@ def save_clean_local_markup_pdf(
     output_pdf: str | Path,
     mapping: dict[str, Any],
 ) -> None:
-    """Pure QA overlay: vertices, dimension labels, and highlighted dimension geometry."""
+    """Pure QA overlay: vertices and source labels without dimension-stroke highlights."""
     with fitz.open(str(pdf_path)) as document:
         page = document[page_number - 1]
         output = fitz.open()
@@ -1000,51 +1393,6 @@ def save_clean_local_markup_pdf(
             marked.draw_circle(center, 6, color=color, fill=color, width=1.2)
             marked.insert_text(center + (8, -8), vertex.get("id", "V?"), fontsize=8, fontname="helv", color=color)
 
-        def _stroke_points(stroke: dict[str, Any]) -> tuple[fitz.Point, fitz.Point] | None:
-            start = stroke.get("start")
-            end = stroke.get("end")
-            if not start or not end or len(start) < 2 or len(end) < 2:
-                return None
-            return fitz.Point(float(start[0]), float(start[1])), fitz.Point(float(end[0]), float(end[1]))
-
-        def _stroke_key(stroke: dict[str, Any]) -> tuple[float, float, float, float] | None:
-            points = _stroke_points(stroke)
-            if points is None:
-                return None
-            start, end = points
-            first = (round(start.x, 2), round(start.y, 2))
-            second = (round(end.x, 2), round(end.y, 2))
-            ordered = sorted((first, second))
-            return (*ordered[0], *ordered[1])
-
-        highlighted_strokes: set[tuple[float, float, float, float]] = set()
-        dimension_line_color = (0.0, 0.72, 0.20)
-        extension_line_color = (0.0, 0.86, 0.28)
-        for dimension in mapping.get("dimensions", []):
-            status = dimension.get("status")
-            if status in {"cross_sheet_reference", "unresolved", "invalid_overlap"}:
-                continue
-            if status != "handwheel" and not dimension.get("valid", True):
-                continue
-            stroke_specs: list[tuple[dict[str, Any] | None, tuple[float, float, float], float]] = [
-                (dimension.get("dimension_stroke"), dimension_line_color, 2.2),
-                (dimension.get("leader_stroke"), extension_line_color, 1.7),
-            ]
-            stroke_specs.extend(
-                (stroke, extension_line_color, 1.7)
-                for stroke in (dimension.get("extension_strokes") or [])
-                if isinstance(stroke, dict)
-            )
-            for stroke, color, width in stroke_specs:
-                if not isinstance(stroke, dict):
-                    continue
-                key = _stroke_key(stroke)
-                points = _stroke_points(stroke)
-                if key is None or points is None or key in highlighted_strokes:
-                    continue
-                highlighted_strokes.add(key)
-                marked.draw_line(points[0], points[1], color=color, width=width)
-
         for dimension in mapping.get("dimensions", []):
             label_center = dimension.get("label_center")
             if not label_center:
@@ -1076,6 +1424,95 @@ def save_clean_local_markup_pdf(
             center = fitz.Point((float(bbox[0]) + float(bbox[2])) / 2.0, float(bbox[1]) - 8)
             marked.insert_text(center, str(label)[:30], fontsize=7, fontname="helv", color=connection_color)
 
+        output.save(str(output_pdf))
+        output.close()
+
+
+def _stroke_points(stroke: dict[str, Any]) -> tuple[fitz.Point, fitz.Point] | None:
+    start = stroke.get("start")
+    end = stroke.get("end")
+    if not start or not end or len(start) < 2 or len(end) < 2:
+        return None
+    return fitz.Point(float(start[0]), float(start[1])), fitz.Point(float(end[0]), float(end[1]))
+
+
+def _stroke_key(stroke: dict[str, Any]) -> tuple[float, float, float, float] | None:
+    points = _stroke_points(stroke)
+    if points is None:
+        return None
+    start, end = points
+    first = (round(start.x, 2), round(start.y, 2))
+    second = (round(end.x, 2), round(end.y, 2))
+    ordered = sorted((first, second))
+    return (*ordered[0], *ordered[1])
+
+
+def save_local_dimension_filter_pdf(
+    pdf_path: str | Path,
+    page_number: int,
+    output_pdf: str | Path,
+    mapping: dict[str, Any],
+) -> None:
+    """Overlay local include/exclude decisions before provider review."""
+    apply_local_dimension_filter(mapping)
+    with fitz.open(str(pdf_path)) as document:
+        page = document[page_number - 1]
+        output = fitz.open()
+        marked = output.new_page(width=page.rect.width, height=page.rect.height)
+        marked.show_pdf_page(marked.rect, document, page_number - 1)
+
+        rendered_strokes: set[tuple[float, float, float, float]] = set()
+        colors = {
+            "include": (0.0, 0.70, 0.20),
+            "exclude": (0.88, 0.06, 0.05),
+            "ambiguous": (0.95, 0.62, 0.05),
+        }
+        fill_colors = {
+            "include": (0.82, 1.0, 0.86),
+            "exclude": (1.0, 0.82, 0.80),
+            "ambiguous": (1.0, 0.94, 0.72),
+        }
+
+        for dimension in mapping.get("dimensions", []):
+            decision = dimension.get("local_filter_decision") or "ambiguous"
+            color = colors.get(decision, colors["ambiguous"])
+            stroke_specs: list[tuple[dict[str, Any] | None, float]] = [
+                (dimension.get("dimension_stroke"), 2.4),
+                (dimension.get("leader_stroke"), 1.6),
+            ]
+            stroke_specs.extend((stroke, 1.6) for stroke in dimension.get("extension_strokes", []) if isinstance(stroke, dict))
+            for stroke, width in stroke_specs:
+                if not isinstance(stroke, dict):
+                    continue
+                key = _stroke_key(stroke)
+                points = _stroke_points(stroke)
+                if key is None or points is None or key in rendered_strokes:
+                    continue
+                rendered_strokes.add(key)
+                marked.draw_line(points[0], points[1], color=color, width=width)
+
+        for dimension in mapping.get("dimensions", []):
+            label_center = dimension.get("label_center")
+            if not label_center:
+                continue
+            decision = dimension.get("local_filter_decision") or "ambiguous"
+            color = colors.get(decision, colors["ambiguous"])
+            fill = fill_colors.get(decision, fill_colors["ambiguous"])
+            center = fitz.Point(*label_center)
+            rect = fitz.Rect(center.x - 22, center.y - 13, center.x + 26, center.y + 13)
+            marked.draw_rect(rect, color=color, fill=fill, fill_opacity=0.24, width=1.5)
+            label = dimension.get("id", "D?")
+            if decision == "exclude" and dimension.get("local_filter_conflict_with"):
+                label = f"{label} -> {dimension['local_filter_conflict_with']}"
+            marked.insert_text(center + (24, -10), label, fontsize=7, fontname="helv", color=color)
+
+        marked.insert_text(
+            fitz.Point(24, 28),
+            "LOCAL DIMENSION FILTER: green include, red excluded by larger covering dimension",
+            fontsize=9,
+            fontname="helv",
+            color=(0.05, 0.18, 0.14),
+        )
         output.save(str(output_pdf))
         output.close()
 
@@ -1263,8 +1700,10 @@ def run_dimension_mapping(pdf_path: str | Path, page_number: int, output_pdf: st
 __all__ = [
     "map_dimensions",
     "run_dimension_mapping",
+    "apply_local_dimension_filter",
     "save_dimension_mapping_pdf",
     "save_preprocess_annotation_pdf",
+    "save_local_dimension_filter_pdf",
     "save_clean_graph_pdf",
     "save_skeleton_pdf",
 ]

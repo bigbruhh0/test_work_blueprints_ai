@@ -6,8 +6,9 @@ from unittest import mock
 
 import fitz
 
-from src.dimension_mapping import _dimension_hints_from_text, _first_arrow_third, _handwheel_arrow_segments, _handwheel_details, _handwheel_text_rects, _is_rectangle_side, _same_directed_contour, save_clean_local_markup_pdf, save_preprocess_annotation_pdf
-from src.dimension_mapping import _find_extension_strokes, _merge_dimension_stroke
+from src.dimension_mapping import _dimension_hints_from_text, _first_arrow_third, _handwheel_arrow_segments, _handwheel_details, _handwheel_text_rects, _is_rectangle_side, _same_directed_contour, apply_local_dimension_filter, save_clean_local_markup_pdf, save_local_dimension_filter_pdf, save_preprocess_annotation_pdf
+from src.dimension_mapping import _direct_dimension_stroke_from_label, _fallback_leader_stroke_from_label, _find_extension_strokes, _merge_dimension_stroke, _resolve_leader_target
+from src.dimension_review import build_review_payload
 
 
 class DimensionRuleTests(unittest.TestCase):
@@ -74,11 +75,264 @@ class DimensionRuleTests(unittest.TestCase):
 
         self.assertEqual(extensions, [])
 
+    def test_leader_target_resolves_touched_dimension_line_without_edge_angle_match(self) -> None:
+        leader = SimpleNamespace(index=1, x0=10.0, y0=10.0, x1=55.0, y1=45.0, length=57.0, kind="dimension")
+        target = SimpleNamespace(index=2, x0=50.0, y0=45.0, x1=90.0, y1=45.0, length=40.0, kind="dimension")
+        distant = SimpleNamespace(index=3, x0=55.0, y0=80.0, x1=95.0, y1=80.0, length=40.0, kind="dimension")
+        vertical_edge = {"id": "E1", "start": [60.0, 0.0], "end": [60.0, 100.0]}
+
+        resolved = _resolve_leader_target(
+            leader,
+            vertical_edge,
+            [leader, target, distant],
+            label_center=(10.0, 10.0),
+            blocked_indices={leader.index},
+        )
+
+        self.assertIsNotNone(resolved)
+        stroke, meta = resolved
+        self.assertEqual(stroke.index, target.index)
+        self.assertEqual(meta["leader_target_point"], [55.0, 45.0])
+
+    def test_fallback_leader_stroke_finds_short_line_near_label(self) -> None:
+        label_center = (219.5, 261.1)
+        distant = SimpleNamespace(index=1, x0=300.0, y0=260.0, x1=340.0, y1=280.0, length=44.7, kind="dimension")
+        leader = SimpleNamespace(index=2, x0=240.0, y0=240.9, x1=228.7, y1=261.3, length=23.3, kind="dimension")
+
+        stroke = _fallback_leader_stroke_from_label(label_center, [distant, leader])
+
+        self.assertIsNotNone(stroke)
+        self.assertEqual(stroke.index, leader.index)
+
+    def test_direct_dimension_stroke_wins_when_label_sits_on_dimension_line(self) -> None:
+        label_center = (308.1, 487.1)
+        pipe_edge = {"id": "E1", "start": [300.0, 540.0], "end": [300.0, 430.0]}
+        false_leader = SimpleNamespace(index=1, x0=323.3, y0=500.4, x1=252.0, y1=466.5, length=78.9, kind="dimension")
+        direct_dimension = SimpleNamespace(index=2, x0=313.9, y0=510.9, x1=313.9, y1=457.2, length=53.8, kind="dimension")
+
+        stroke = _direct_dimension_stroke_from_label(label_center, pipe_edge, [false_leader, direct_dimension])
+
+        self.assertIsNotNone(stroke)
+        self.assertEqual(stroke.index, direct_dimension.index)
+
+    def test_local_dimension_filter_excludes_smaller_covered_dimension(self) -> None:
+        mapping = {
+            "edges": [{"id": "E1", "from_node_id": "N1", "to_node_id": "N2", "start": [0, 20], "end": [120, 20]}],
+            "dimensions": [
+                {
+                    "id": "D001",
+                    "value": 1200,
+                    "edge_id": "E1",
+                    "status": "projected",
+                    "dimension_stroke": {"start": [0, 0], "end": [120, 0]},
+                },
+                {
+                    "id": "D002",
+                    "value": 300,
+                    "edge_id": "E1",
+                    "status": "projected",
+                    "dimension_stroke": {"start": [30, 0], "end": [70, 0]},
+                },
+            ],
+        }
+
+        apply_local_dimension_filter(mapping)
+
+        decisions = {item["id"]: item["local_filter_decision"] for item in mapping["dimensions"]}
+        self.assertEqual(decisions["D001"], "include")
+        self.assertEqual(decisions["D002"], "exclude")
+        self.assertEqual(mapping["dimensions"][1]["local_filter_conflict_with"], "D001")
+
+    def test_local_dimension_filter_excludes_offset_parallel_nested_dimension(self) -> None:
+        mapping = {
+            "edges": [
+                {"id": "E1", "from_node_id": "N1", "to_node_id": "N2", "start": [0, 20], "end": [60, 20]},
+                {"id": "E2", "from_node_id": "N2", "to_node_id": "N3", "start": [60, 20], "end": [120, 20]},
+            ],
+            "dimensions": [
+                {
+                    "id": "D001",
+                    "value": 4000,
+                    "edge_id": "E2",
+                    "status": "projected",
+                    "dimension_stroke": {"start": [0, 0], "end": [120, 0]},
+                },
+                {
+                    "id": "D002",
+                    "value": 1253,
+                    "edge_id": "E1",
+                    "status": "projected",
+                    "dimension_stroke": {"start": [20, 17], "end": [75, 17]},
+                },
+            ],
+        }
+
+        apply_local_dimension_filter(mapping)
+
+        self.assertEqual(mapping["dimensions"][1]["local_filter_decision"], "exclude")
+
+    def test_local_dimension_filter_keeps_parallel_dimension_without_shared_reference(self) -> None:
+        mapping = {
+            "edges": [
+                {"id": "E1", "from_node_id": "N1", "to_node_id": "N2", "start": [0, 20], "end": [120, 20]},
+                {"id": "E2", "from_node_id": "N3", "to_node_id": "N4", "start": [30, 44], "end": [90, 44]},
+            ],
+            "dimensions": [
+                {
+                    "id": "D001",
+                    "value": 5600,
+                    "edge_id": "E1",
+                    "status": "projected",
+                    "dimension_stroke": {"start": [0, 0], "end": [120, 0], "merged_indices": [1]},
+                    "extension_strokes": [{"index": 3, "pipe_edge_id": "E1"}],
+                },
+                {
+                    "id": "D002",
+                    "value": 281,
+                    "edge_id": "E2",
+                    "status": "projected",
+                    "dimension_stroke": {"start": [30, 18], "end": [90, 18], "merged_indices": [2]},
+                    "extension_strokes": [{"index": 4, "pipe_edge_id": "E2"}],
+                },
+            ],
+        }
+
+        apply_local_dimension_filter(mapping)
+
+        self.assertEqual(mapping["dimensions"][1]["local_filter_decision"], "include")
+
+    def test_local_dimension_filter_propagates_excluded_shared_dimension_stroke(self) -> None:
+        mapping = {
+            "edges": [{"id": "E1", "from_node_id": "N1", "to_node_id": "N2", "start": [0, 20], "end": [120, 20]}],
+            "dimensions": [
+                {
+                    "id": "D001",
+                    "value": 3000,
+                    "edge_id": "E1",
+                    "status": "projected",
+                    "attachment_kind": "leader_to_dimension_arrow",
+                    "dimension_stroke": {"start": [0, 0], "end": [60, 0], "length_px": 60, "merged_indices": [1, 2]},
+                    "leader_stroke": {"start": [-40, 20], "end": [0, 0], "length_px": 45, "merged_indices": [3]},
+                },
+                {
+                    "id": "D002",
+                    "value": 6000,
+                    "edge_id": "E1",
+                    "status": "invalid_overlap",
+                    "valid": False,
+                    "dimension_stroke": {"start": [0, 0], "end": [80, 0], "length_px": 80, "merged_indices": [1, 2, 4]},
+                    "reason": "overlaps_larger_dimension_on_same_directed_contour",
+                },
+            ],
+        }
+
+        apply_local_dimension_filter(mapping)
+
+        self.assertEqual(mapping["dimensions"][0]["local_filter_decision"], "exclude")
+        self.assertEqual(mapping["dimensions"][0]["local_filter_reason"], "shares_excluded_dimension_stroke")
+        self.assertEqual(mapping["dimensions"][0]["local_filter_conflict_with"], "D002")
+
+    def test_local_dimension_filter_excludes_short_endpoint_leader_overlap(self) -> None:
+        mapping = {
+            "edges": [
+                {"id": "E1", "from_node_id": "N1", "to_node_id": "N2", "start": [0, 0], "end": [0, 120]},
+                {"id": "E2", "from_node_id": "N2", "to_node_id": "N3", "start": [20, 0], "end": [20, 120]},
+            ],
+            "dimensions": [
+                {
+                    "id": "D001",
+                    "value": 303,
+                    "edge_id": "E2",
+                    "status": "projected",
+                    "dimension_stroke": {"start": [20, 100], "end": [20, 0], "length_px": 100, "merged_indices": [8]},
+                },
+                {
+                    "id": "D002",
+                    "value": 153,
+                    "edge_id": "E2",
+                    "status": "projected",
+                    "attachment_kind": "leader_to_dimension_arrow",
+                    "dimension_stroke": {"start": [20, 45], "end": [20, 25], "length_px": 20, "merged_indices": [7]},
+                    "leader_stroke": {"start": [80, 25], "end": [20, 25], "length_px": 60, "merged_indices": [9]},
+                    "leader_resolution": {"target_position": 1.0},
+                },
+            ],
+        }
+
+        apply_local_dimension_filter(mapping)
+
+        self.assertEqual(mapping["dimensions"][1]["local_filter_decision"], "exclude")
+        self.assertEqual(mapping["dimensions"][1]["local_filter_reason"], "covered_by_short_endpoint_leader_overlap")
+
+    def test_local_dimension_filter_keeps_middle_hit_leader_callout(self) -> None:
+        mapping = {
+            "edges": [{"id": "E1", "from_node_id": "N1", "to_node_id": "N2", "start": [20, 0], "end": [20, 120]}],
+            "dimensions": [
+                {
+                    "id": "D001",
+                    "value": 191,
+                    "edge_id": "E1",
+                    "status": "projected",
+                    "dimension_stroke": {"start": [20, 120], "end": [20, 0], "length_px": 120, "merged_indices": [7, 8]},
+                },
+                {
+                    "id": "D002",
+                    "value": 134,
+                    "edge_id": "E1",
+                    "status": "projected",
+                    "attachment_kind": "leader_to_dimension_arrow",
+                    "dimension_stroke": {"start": [20, 65], "end": [20, 43], "length_px": 22, "merged_indices": [8]},
+                    "leader_stroke": {"start": [80, 54], "end": [20, 54], "length_px": 60, "merged_indices": [9]},
+                    "leader_resolution": {"target_position": 0.5},
+                },
+            ],
+        }
+
+        apply_local_dimension_filter(mapping)
+
+        self.assertEqual(mapping["dimensions"][1]["local_filter_decision"], "include")
+
     def test_dimension_review_prompt_uses_deterministic_overlap_rules(self) -> None:
         text = Path("prompts/defaults/dimension_review.txt").read_text(encoding="utf-8")
         self.assertIn("existing_mapping.valid=false", text)
         self.assertIn("последовательно разделена стрелками", text.lower())
         self.assertIn("не считай соседние значения перекрытием", text.lower())
+        self.assertIn("preliminary_decision", text)
+        self.assertIn("не копируй preliminary_decision автоматически", text.lower())
+
+    def test_review_payload_exposes_preliminary_decisions(self) -> None:
+        mapping = {
+            "page": 1,
+            "connections": [
+                {
+                    "id": "CN-C1",
+                    "label": "СМ. ЛИСТ 2",
+                    "connection_type": "continuation",
+                    "target_sheet": "2",
+                    "text_has_sheet_ref": True,
+                }
+            ],
+            "dimensions": [
+                {
+                    "id": "D001",
+                    "value_mm": 300,
+                    "selected_edge_id": "E001",
+                    "existing_mapping": {
+                        "local_filter_decision": "exclude",
+                        "local_filter_reason": "shares_excluded_dimension_stroke",
+                        "local_filter_conflict_with": "D002",
+                    },
+                }
+            ],
+        }
+
+        payload = build_review_payload(mapping, "map")
+
+        self.assertEqual(payload["dimensions"][0]["preliminary_decision"]["decision"], "exclude")
+        self.assertEqual(payload["dimensions"][0]["preliminary_decision"]["reason"], "shares_excluded_dimension_stroke")
+        self.assertEqual(payload["preliminary_decisions"][0]["candidate_id"], "D001")
+        self.assertEqual(payload["preliminary_decisions"][0]["conflict_with"], "D002")
+        self.assertEqual(payload["connections"][0]["id"], "CN-C1")
 
     def test_dimension_review_prompt_covers_handwheel_and_cross_sheet(self) -> None:
         text = Path("prompts/defaults/dimension_review.txt").read_text(encoding="utf-8")

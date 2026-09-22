@@ -510,6 +510,7 @@ function renderRun(run) {
 
 const VIEWER_TABS = [
   { key: 'clean_local_markup_pdf', label: 'Локальная разметка' },
+  { key: 'local_dimension_filter_pdf', label: 'Локальная фильтрация размеров' },
   { key: 'numbers_pdf', label: 'Разметка чисел' },
   { key: 'vertices_pdf', label: 'Вершины' },
   { key: 'coordinates_pdf', label: 'Координаты' },
@@ -580,6 +581,7 @@ function viewerCard(lineId, pageResult, runId) {
 
 function bindViewer(card) {
   card.querySelectorAll('.viewer-tab').forEach(function (button) {
+    if (!button.dataset.tab) return;
     button.addEventListener('click', function () { showViewerTab(card, button.dataset.tab); });
   });
   const more = card.querySelector('[data-show-other-tabs]');
@@ -968,6 +970,10 @@ async function showViewerTab(card, tabKey) {
     return;
   }
   const filename = files[tabKey] || '';
+  if (!filename) {
+    wrap.innerHTML = '<p class="muted">Для этой вкладки файл не создан в текущем прогоне.</p>';
+    return;
+  }
   if (tabKey === 'numbers_txt') {
     wrap.innerHTML = '<span class="spinner"></span> Читаю TXT…';
     try {

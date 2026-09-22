@@ -26,6 +26,7 @@ from src.dimension_mapping import (
     run_dimension_mapping,
     save_clean_graph_pdf,
     save_clean_local_markup_pdf,
+    save_local_dimension_filter_pdf,
     save_preprocess_annotation_pdf,
     save_skeleton_pdf,
 )
@@ -683,6 +684,8 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                 save_preprocess_annotation_pdf(pdf_path, page_run.page_number, preprocess_pdf, mapping)
                 clean_markup_pdf = run_dir / f"{pdf_stem}_page{page_run.page_number}_clean_local_markup.pdf"
                 save_clean_local_markup_pdf(pdf_path, page_run.page_number, clean_markup_pdf, mapping)
+                local_filter_pdf = run_dir / f"{pdf_stem}_page{page_run.page_number}_local_dimension_filter.pdf"
+                save_local_dimension_filter_pdf(pdf_path, page_run.page_number, local_filter_pdf, mapping)
                 clean_graph_pdf = run_dir / f"{pdf_stem}_page{page_run.page_number}_dimension_graph.pdf"
                 save_clean_graph_pdf(pdf_path, page_run.page_number, clean_graph_pdf, mapping)
                 skeleton_pdf = run_dir / f"{pdf_stem}_page{page_run.page_number}_dimension_skeleton.pdf"
@@ -691,6 +694,7 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                 dimension_map_json = run_dir / f"{pdf_stem}_page{page_run.page_number}_dimension_map.json"
                 dimension_map = build_dimension_map(Path(pdf_path), page_run.page_number)
                 dimension_map["handwheels"] = mapping.get("handwheels", [])
+                dimension_map["connections"] = mapping.get("connections", [])
                 dimension_map_json.write_text(json.dumps(dimension_map, ensure_ascii=False, indent=2), encoding="utf-8")
                 render_dimension_map(Path(pdf_path), page_run.page_number, dimension_map_pdf, dimension_map)
                 page_run.analysis = {"dimension_mapping": mapping, "dimension_map": dimension_map}
@@ -698,6 +702,7 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                 page_run.files["dimensions_json"] = dimensions_json.name
                 page_run.files["preprocess_annotations_pdf"] = preprocess_pdf.name
                 page_run.files["clean_local_markup_pdf"] = clean_markup_pdf.name
+                page_run.files["local_dimension_filter_pdf"] = local_filter_pdf.name
                 page_run.files["dimension_graph_pdf"] = clean_graph_pdf.name
                 page_run.files["dimension_skeleton_pdf"] = skeleton_pdf.name
                 page_run.files["dimension_map_pdf"] = dimension_map_pdf.name

@@ -46,6 +46,38 @@ CODEX_REVIEW_SCHEMA: dict[str, Any] = {
 }
 
 
+def _preliminary_decision_from_dimension(dimension: dict[str, Any]) -> dict[str, Any]:
+    existing = dimension.get("existing_mapping") or {}
+    decision = existing.get("local_filter_decision")
+    reason = existing.get("local_filter_reason")
+    conflict_with = existing.get("local_filter_conflict_with") or existing.get("conflict_with")
+    status = existing.get("status") or dimension.get("status")
+    valid = existing.get("valid", True)
+    if not decision:
+        if status in {"invalid_overlap", "handwheel"} or valid is False:
+            decision = "exclude"
+        elif status in {"unresolved", "cross_sheet_reference"}:
+            decision = "ambiguous"
+        else:
+            decision = "include"
+    if not reason:
+        reason = existing.get("reason") or status or "no_local_reason"
+    return {
+        "decision": decision,
+        "reason": reason,
+        "conflict_with": conflict_with,
+        "status": status,
+        "valid": valid,
+        "source": "local_dimension_filter",
+    }
+
+
+def _dimension_for_review(dimension: dict[str, Any]) -> dict[str, Any]:
+    row = dict(dimension)
+    row["preliminary_decision"] = _preliminary_decision_from_dimension(dimension)
+    return row
+
+
 def build_map_text(mapping: dict[str, Any]) -> str:
     lines = [
         f"PDF: {mapping.get('pdf')}",
@@ -75,8 +107,9 @@ def build_map_text(mapping: dict[str, Any]) -> str:
     for dimension in mapping.get("dimensions", []):
         possible = ",".join(item["edge_id"] for item in dimension.get("edge_candidates", []))
         existing = dimension.get("existing_mapping", {})
+        preliminary = _preliminary_decision_from_dimension(dimension)
         lines.append(
-            f"{dimension['id']} value_mm={dimension['value_mm']} label_center={dimension['label_center']} selected_edge={dimension.get('selected_edge_id')} possible_edges={possible} status={dimension.get('status')} attachment_kind={existing.get('attachment_kind')} dimension_stroke={existing.get('dimension_stroke')} leader_stroke={existing.get('leader_stroke')} extension_strokes={existing.get('extension_strokes')}"
+            f"{dimension['id']} value_mm={dimension['value_mm']} label_center={dimension['label_center']} selected_edge={dimension.get('selected_edge_id')} possible_edges={possible} status={dimension.get('status')} preliminary_decision={preliminary.get('decision')} preliminary_reason={preliminary.get('reason')} preliminary_conflict_with={preliminary.get('conflict_with')} attachment_kind={existing.get('attachment_kind')} attachment_source={existing.get('attachment_source')} dimension_stroke={existing.get('dimension_stroke')} leader_stroke={existing.get('leader_stroke')} extension_strokes={existing.get('extension_strokes')}"
         )
     lines.append("DISCARDED_NUMBERS:")
     lines.extend(f"{item['text']} reason={item['reason']}" for item in mapping.get("discarded_numbers", []))
@@ -89,9 +122,19 @@ def build_review_payload(mapping: dict[str, Any], map_text: str) -> dict[str, An
         "vertices": mapping.get("vertices", []),
         "uncertain_vertices": mapping.get("uncertain_vertices", []),
         "edges": mapping.get("edges", []),
-        "dimensions": mapping.get("dimensions", []),
+        "dimensions": [_dimension_for_review(item) for item in mapping.get("dimensions", [])],
+        "preliminary_decisions": [
+            {
+                "candidate_id": item.get("id"),
+                "value_mm": item.get("value_mm"),
+                "edge_id": item.get("selected_edge_id"),
+                **_preliminary_decision_from_dimension(item),
+            }
+            for item in mapping.get("dimensions", [])
+        ],
         "edge_candidate_groups": mapping.get("edge_candidate_groups", []),
         "handwheels": mapping.get("handwheels", []),
+        "connections": mapping.get("connections", []),
         "map_text": map_text,
     }
 
