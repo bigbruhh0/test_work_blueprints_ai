@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import math
@@ -676,6 +676,435 @@ def compute_endpoint_adjustments(mapping: dict[str, Any]) -> list[dict[str, Any]
             adjustments.append(adjustment)
     mapping["endpoint_adjustments"] = adjustments
     return adjustments
+
+
+def _ray_segment_hit(
+    ray_start: tuple[float, float],
+    direction: tuple[float, float],
+    segment_start: tuple[float, float],
+    segment_end: tuple[float, float],
+    max_distance: float,
+    back_tolerance: float = 6.0,
+) -> tuple[float, tuple[float, float]] | None:
+    """First point where a ray meets a segment; (distance along ray, point)."""
+    dx, dy = direction
+    s_x = segment_end[0] - segment_start[0]
+    s_y = segment_end[1] - segment_start[1]
+    denominator = dx * s_y - dy * s_x
+    if abs(denominator) <= 1e-9:
+        return None
+    q_x = segment_start[0] - ray_start[0]
+    q_y = segment_start[1] - ray_start[1]
+    distance = (q_x * s_y - q_y * s_x) / denominator
+    position = (q_x * dy - q_y * dx) / denominator
+    if not (-back_tolerance <= distance <= max_distance):
+        return None
+    if not (-0.02 <= position <= 1.02):
+        return None
+    return distance, (ray_start[0] + distance * dx, ray_start[1] + distance * dy)
+
+
+def _ray_segment_near_miss(
+    ray_start: tuple[float, float],
+    direction: tuple[float, float],
+    segment_start: tuple[float, float],
+    segment_end: tuple[float, float],
+    max_distance: float,
+    side_tolerance: float = 10.0,
+    back_tolerance: float = 6.0,
+) -> tuple[float, tuple[float, float], float] | None:
+    """Closest segment point when a projected extension line passes just beside pipe contour."""
+    dx, dy = direction
+    nx, ny = -dy, dx
+    candidates: list[tuple[float, tuple[float, float], float]] = []
+
+    def add_candidate(point: tuple[float, float]) -> None:
+        qx = point[0] - ray_start[0]
+        qy = point[1] - ray_start[1]
+        distance = qx * dx + qy * dy
+        side_gap = abs(qx * nx + qy * ny)
+        if -back_tolerance <= distance <= max_distance and side_gap <= side_tolerance:
+            candidates.append((distance, point, side_gap))
+
+    add_candidate(segment_start)
+    add_candidate(segment_end)
+
+    side_start = (segment_start[0] - ray_start[0]) * nx + (segment_start[1] - ray_start[1]) * ny
+    side_end = (segment_end[0] - ray_start[0]) * nx + (segment_end[1] - ray_start[1]) * ny
+    if abs(side_start - side_end) > 1e-9:
+        position = side_start / (side_start - side_end)
+        if -0.02 <= position <= 1.02:
+            point = (
+                segment_start[0] + (segment_end[0] - segment_start[0]) * position,
+                segment_start[1] + (segment_end[1] - segment_start[1]) * position,
+            )
+            add_candidate(point)
+
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: (item[2], abs(item[0])))
+
+
+EXTENSION_VERTEX_MAX_PROJECTION_PX = 90.0
+EXTENSION_VERTEX_MERGE_PX = 9.0
+EXTENSION_VERTEX_REPLACE_PX = 11.0
+EXTENSION_VERTEX_NEAR_MISS_PX = 16.0
+
+
+def _edges_touch(first: dict[str, Any], second: dict[str, Any], tolerance: float = 12.0) -> bool:
+    first_points = (_edge_point(first, "start"), _edge_point(first, "end"))
+    second_points = (_edge_point(second, "start"), _edge_point(second, "end"))
+    return any(
+        p1 is not None and p2 is not None and _point_distance(p1, p2) <= tolerance
+        for p1 in first_points
+        for p2 in second_points
+    )
+
+
+def _dimension_target_points(dimension: dict[str, Any]) -> tuple[tuple[float, float], tuple[float, float]]:
+    stroke = dimension.get("dimension_stroke") or {}
+    start = _edge_point(stroke, "start")
+    end = _edge_point(stroke, "end")
+    if start is not None and end is not None:
+        return start, end
+    center = dimension.get("label_center") or [0.0, 0.0]
+    point = (float(center[0]), float(center[1]))
+    return point, point
+
+
+def _extension_vertex_candidate_for_stroke(
+    dimension: dict[str, Any],
+    stroke: dict[str, Any],
+    edges: list[dict[str, Any]],
+    edge_by_id: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    start = _edge_point(stroke, "start")
+    end = _edge_point(stroke, "end")
+    if start is None or end is None:
+        return None
+    length = _point_distance(start, end)
+    if length <= 1e-6:
+        return None
+    target_points = _dimension_target_points(dimension)
+    target_endpoint = stroke.get("target_endpoint")
+    if target_endpoint == "start":
+        dimension_side_target = target_points[0]
+    elif target_endpoint == "end":
+        dimension_side_target = target_points[1]
+    else:
+        dimension_side_target = min(
+            target_points,
+            key=lambda point: _distance_to_segment(point, start, end)[0],
+        )
+    target_gap, _target_position, target_touch = _distance_to_segment(dimension_side_target, start, end)
+    start_to_dimension = _point_distance(start, dimension_side_target)
+    end_to_dimension = _point_distance(end, dimension_side_target)
+    if start_to_dimension <= end_to_dimension:
+        dimension_side = start
+        ray_start = end
+    else:
+        dimension_side = end
+        ray_start = start
+    direction = (
+        (ray_start[0] - dimension_side[0]) / length,
+        (ray_start[1] - dimension_side[1]) / length,
+    )
+
+    declared_edge = edge_by_id.get(stroke.get("pipe_edge_id"))
+    ordered_edges: list[dict[str, Any]] = []
+    if declared_edge is not None:
+        ordered_edges.append(declared_edge)
+        ordered_edges.extend(
+            edge
+            for edge in edges
+            if edge is not declared_edge and _edges_touch(edge, declared_edge)
+        )
+    else:
+        ordered_edges.extend(edges)
+
+    ray_options: list[tuple[int, str, tuple[float, float], tuple[float, float]]] = [(0, "opposite_dimension_endpoint", ray_start, direction)]
+    if target_gap <= 3.0:
+        for endpoint_name, endpoint in (("start", start), ("end", end)):
+            endpoint_gap = _point_distance(endpoint, target_touch)
+            if endpoint_gap <= 3.0:
+                continue
+            endpoint_direction = (
+                (endpoint[0] - target_touch[0]) / endpoint_gap,
+                (endpoint[1] - target_touch[1]) / endpoint_gap,
+            )
+            ray_options.append((1, f"target_touch_to_{endpoint_name}", endpoint, endpoint_direction))
+
+    unique_ray_options: list[tuple[int, str, tuple[float, float], tuple[float, float]]] = []
+    for option in ray_options:
+        _priority, _source, option_start, option_direction = option
+        if any(
+            _point_distance(option_start, existing_start) <= 0.5
+            and abs(option_direction[0] - existing_direction[0]) <= 0.02
+            and abs(option_direction[1] - existing_direction[1]) <= 0.02
+            for _existing_priority, _existing_source, existing_start, existing_direction in unique_ray_options
+        ):
+            continue
+        unique_ray_options.append(option)
+
+    best_hit = None
+    for ray_priority, ray_source, option_start, option_direction in unique_ray_options:
+        for edge in ordered_edges:
+            edge_start = _edge_point(edge, "start")
+            edge_end = _edge_point(edge, "end")
+            if edge_start is None or edge_end is None:
+                continue
+            edge_rank = 0 if edge is declared_edge else 1
+            candidate = _ray_segment_hit(
+                option_start,
+                option_direction,
+                edge_start,
+                edge_end,
+                EXTENSION_VERTEX_MAX_PROJECTION_PX,
+            )
+            if candidate is not None:
+                distance, point = candidate
+                score = (0, edge_rank, ray_priority, abs(distance))
+                row = (score, distance, point, 0.0, edge, option_start, ray_source)
+                if best_hit is None or row[0] < best_hit[0]:
+                    best_hit = row
+                continue
+            near_candidate = _ray_segment_near_miss(
+                option_start,
+                option_direction,
+                edge_start,
+                edge_end,
+                EXTENSION_VERTEX_MAX_PROJECTION_PX,
+                side_tolerance=EXTENSION_VERTEX_NEAR_MISS_PX,
+            )
+            if near_candidate is None:
+                continue
+            distance, point, side_gap = near_candidate
+            score = (1, edge_rank, ray_priority, side_gap, abs(distance))
+            row = (score, distance, point, side_gap, edge, option_start, ray_source)
+            if best_hit is None or row[0] < best_hit[0]:
+                best_hit = row
+    if best_hit is None:
+        return None
+    _score, distance, point, side_gap, hit_edge, used_ray_start, ray_source = best_hit
+    return {
+        "dimension_id": dimension.get("id"),
+        "extension_index": stroke.get("index"),
+        "pipe_edge_id": hit_edge.get("id"),
+        "ray_start": [round(used_ray_start[0], 2), round(used_ray_start[1], 2)],
+        "ray_source": ray_source,
+        "point": [round(point[0], 2), round(point[1], 2)],
+        "projection_gap_px": round(distance, 2),
+        "side_gap_px": round(side_gap, 2),
+        "projection_kind": "near_miss" if side_gap > 0 else "intersection",
+    }
+
+
+def compute_extension_vertices(mapping: dict[str, Any]) -> list[dict[str, Any]]:
+    """Отметить новые вершины там, где выносные линии (продолженные до трубы) её пересекают.
+
+    Для каждого валидного (include) размера берём его выносные линии (не lead), продолжаем
+    каждую мнимой линией в сторону трубы и точку пересечения с ребром трубы отмечаем
+    как новую вершину. Близкие вершины схлопываются в одну.
+    """
+    edges = mapping.get("edges") or []
+    edge_by_id = {edge.get("id"): edge for edge in edges if edge.get("id")}
+
+    def edge_gap(point: tuple[float, float], edge: dict[str, Any] | None) -> float:
+        if edge is None:
+            return float("inf")
+        return _distance_to_segment(point, tuple(edge["start"]), tuple(edge["end"]))[0]
+
+    candidates: list[dict[str, Any]] = []
+    for dimension in mapping.get("dimensions") or []:
+        if dimension.get("local_filter_decision") != "include":
+            continue
+        if not isinstance(dimension.get("dimension_stroke"), dict):
+            continue
+        for stroke in dimension.get("extension_strokes") or []:
+            if not isinstance(stroke, dict):
+                continue
+            start = _edge_point(stroke, "start")
+            end = _edge_point(stroke, "end")
+            if start is None or end is None:
+                continue
+            dx = end[0] - start[0]
+            dy = end[1] - start[1]
+            length = math.hypot(dx, dy)
+            if length <= 1e-6:
+                continue
+            target_points = _dimension_target_points(dimension)
+            target_endpoint = stroke.get("target_endpoint")
+            if target_endpoint == "start":
+                dimension_side_target = target_points[0]
+            elif target_endpoint == "end":
+                dimension_side_target = target_points[1]
+            else:
+                dimension_side_target = min(
+                    target_points,
+                    key=lambda point: _distance_to_segment(point, start, end)[0],
+                )
+            target_gap, _target_position, target_touch = _distance_to_segment(dimension_side_target, start, end)
+            start_to_dimension = _point_distance(start, dimension_side_target)
+            end_to_dimension = _point_distance(end, dimension_side_target)
+            if start_to_dimension <= end_to_dimension:
+                dimension_side = start
+                ray_start = end
+            else:
+                dimension_side = end
+                ray_start = start
+            direction = (
+                (ray_start[0] - dimension_side[0]) / length,
+                (ray_start[1] - dimension_side[1]) / length,
+            )
+
+            declared_edge = edge_by_id.get(stroke.get("pipe_edge_id"))
+
+            ordered_edges = []
+            if declared_edge is not None:
+                ordered_edges.append(declared_edge)
+                ordered_edges.extend(
+                    edge
+                    for edge in edges
+                    if edge is not declared_edge and _edges_touch(edge, declared_edge)
+                )
+            else:
+                ordered_edges.extend(edges)
+
+            ray_options: list[tuple[int, str, tuple[float, float], tuple[float, float]]] = [(0, "opposite_dimension_endpoint", ray_start, direction)]
+            if target_gap <= 3.0:
+                for endpoint_name, endpoint in (("start", start), ("end", end)):
+                    endpoint_gap = _point_distance(endpoint, target_touch)
+                    if endpoint_gap <= 3.0:
+                        continue
+                    endpoint_direction = (
+                        (endpoint[0] - target_touch[0]) / endpoint_gap,
+                        (endpoint[1] - target_touch[1]) / endpoint_gap,
+                    )
+                    ray_options.append((1, f"target_touch_to_{endpoint_name}", endpoint, endpoint_direction))
+
+            unique_ray_options: list[tuple[int, str, tuple[float, float], tuple[float, float]]] = []
+            for option in ray_options:
+                _priority, _source, option_start, option_direction = option
+                if any(
+                    _point_distance(option_start, existing_start) <= 0.5
+                    and abs(option_direction[0] - existing_direction[0]) <= 0.02
+                    and abs(option_direction[1] - existing_direction[1]) <= 0.02
+                    for _existing_priority, _existing_source, existing_start, existing_direction in unique_ray_options
+                ):
+                    continue
+                unique_ray_options.append(option)
+
+            best_hit = None
+            for ray_priority, ray_source, option_start, option_direction in unique_ray_options:
+                for edge in ordered_edges:
+                    edge_start = _edge_point(edge, "start")
+                    edge_end = _edge_point(edge, "end")
+                    if edge_start is None or edge_end is None:
+                        continue
+                    edge_rank = 0 if edge is declared_edge else 1
+                    candidate = _ray_segment_hit(
+                        option_start,
+                        option_direction,
+                        edge_start,
+                        edge_end,
+                        EXTENSION_VERTEX_MAX_PROJECTION_PX,
+                    )
+                    if candidate is not None:
+                        distance, point = candidate
+                        score = (0, edge_rank, ray_priority, abs(distance))
+                        row = (score, distance, point, 0.0, edge, option_start, ray_source)
+                        if best_hit is None or row[0] < best_hit[0]:
+                            best_hit = row
+                        continue
+                    near_candidate = _ray_segment_near_miss(
+                        option_start,
+                        option_direction,
+                        edge_start,
+                        edge_end,
+                        EXTENSION_VERTEX_MAX_PROJECTION_PX,
+                        side_tolerance=EXTENSION_VERTEX_NEAR_MISS_PX,
+                    )
+                    if near_candidate is None:
+                        continue
+                    distance, point, side_gap = near_candidate
+                    score = (1, edge_rank, ray_priority, side_gap, abs(distance))
+                    row = (score, distance, point, side_gap, edge, option_start, ray_source)
+                    if best_hit is None or row[0] < best_hit[0]:
+                        best_hit = row
+            if best_hit is None:
+                continue
+            _score, _distance, point, side_gap, hit_edge, used_ray_start, ray_source = best_hit
+            candidates.append(
+                {
+                    "dimension_id": dimension.get("id"),
+                    "extension_index": stroke.get("index"),
+                    "pipe_edge_id": hit_edge.get("id"),
+                    "ray_start": [round(used_ray_start[0], 2), round(used_ray_start[1], 2)],
+                    "ray_source": ray_source,
+                    "point": [round(point[0], 2), round(point[1], 2)],
+                    "projection_gap_px": round(_distance, 2),
+                    "side_gap_px": round(side_gap, 2),
+                    "projection_kind": "near_miss" if side_gap > 0 else "intersection",
+                }
+            )
+
+    vertices: list[dict[str, Any]] = []
+    for candidate in candidates:
+        point = tuple(candidate["point"])
+        merged = next(
+            (vertex for vertex in vertices if _point_distance(tuple(vertex["point"]), point) <= EXTENSION_VERTEX_MERGE_PX),
+            None,
+        )
+        if merged is None:
+            vertices.append(
+                {
+                    "dimension_ids": [candidate["dimension_id"]],
+                    "extension_indices": [candidate["extension_index"]],
+                    "pipe_edge_id": candidate["pipe_edge_id"],
+                    "ray_start": candidate["ray_start"],
+                    "ray_source": candidate.get("ray_source", "opposite_dimension_endpoint"),
+                    "point": candidate["point"],
+                    "projection_gap_px": candidate["projection_gap_px"],
+                    "side_gap_px": candidate.get("side_gap_px", 0.0),
+                    "projection_kind": candidate.get("projection_kind", "intersection"),
+                }
+            )
+        else:
+            merged["dimension_ids"].append(candidate["dimension_id"])
+            merged["extension_indices"].append(candidate["extension_index"])
+            if abs(float(candidate["projection_gap_px"])) < abs(float(merged["projection_gap_px"])):
+                merged["point"] = candidate["point"]
+                merged["projection_gap_px"] = candidate["projection_gap_px"]
+                merged["pipe_edge_id"] = candidate["pipe_edge_id"]
+                merged["ray_start"] = candidate["ray_start"]
+                merged["ray_source"] = candidate.get("ray_source", "opposite_dimension_endpoint")
+                merged["side_gap_px"] = candidate.get("side_gap_px", 0.0)
+                merged["projection_kind"] = candidate.get("projection_kind", "intersection")
+    for index, vertex in enumerate(vertices, start=1):
+        vertex["id"] = f"VE-{index:02d}"
+
+    suppressed_vertex_ids: list[str] = []
+    for source_vertex in mapping.get("vertices") or []:
+        source_id = source_vertex.get("id")
+        if not source_id:
+            continue
+        source_point = (float(source_vertex.get("x", 0.0)), float(source_vertex.get("y", 0.0)))
+        replacement = next(
+            (
+                vertex
+                for vertex in vertices
+                if _point_distance(source_point, tuple(vertex["point"])) <= EXTENSION_VERTEX_REPLACE_PX
+            ),
+            None,
+        )
+        if replacement is None:
+            continue
+        suppressed_vertex_ids.append(str(source_id))
+        replacement.setdefault("replaces_vertex_ids", []).append(str(source_id))
+
+    mapping["extension_vertices"] = vertices
+    mapping["suppressed_vertex_ids"] = suppressed_vertex_ids
+    return vertices
 
 
 def apply_local_dimension_filter(mapping: dict[str, Any]) -> dict[str, Any]:
@@ -1429,6 +1858,11 @@ def map_dimensions(pdf_path: str | Path, page_number: int) -> dict[str, Any]:
         }
         compute_endpoint_adjustments(result)
         apply_local_dimension_filter(result)
+        compute_extension_vertices(result)
+        result["handwheels"] = _handwheel_details(page, result)
+        annotate_valve_edges(result)
+        result["handwheel_glyphs"] = _handwheel_glyph_rows(page)
+        result["handwheel_vertices"] = _glyph_pipe_vertex_rows(result)
         return result
 
 
@@ -1758,6 +2192,206 @@ def _handwheel_details(
     return details
 
 
+HANDWHEEL_GLYPH_MIN_LEG_PX = 8.0
+HANDWHEEL_GLYPH_MAX_LEG_PX = 90.0
+HANDWHEEL_GLYPH_CROSS_MIN = 0.28
+HANDWHEEL_GLYPH_CROSS_MAX = 0.72
+HANDWHEEL_GLYPH_PAD_PX = 4.0
+HANDWHEEL_GLYPH_ARROW_RADIUS_PX = 36.0
+HANDWHEEL_GLYPH_TEXT_RADIUS_PX = 95.0
+
+
+def _handwheel_glyph_parallelograms(
+    drawings: list[dict[str, Any]],
+    rectangles: list[fitz.Rect] | None = None,
+) -> list[dict[str, Any]]:
+    """Найти обозначения штурвалов: две короткие линии, крестящиеся около своих середин.
+
+    Символ может быть наклонён в любую сторону (по x, y, z изометрии), поэтому
+    параллелограмм строится по направлениям двух найденных линий крестики.
+    """
+    candidates: list[tuple[tuple[float, float], tuple[float, float], float, float, float, float]] = []
+    for start, end in _drawing_segments(drawings, rectangles):
+        length = _point_distance(start, end)
+        if not (HANDWHEEL_GLYPH_MIN_LEG_PX <= length <= HANDWHEEL_GLYPH_MAX_LEG_PX):
+            continue
+        candidates.append((start, end, length, (end[0] - start[0]) / length, (end[1] - start[1]) / length))
+
+    found: list[dict[str, Any]] = []
+    for first_index, (first_start, first_end, first_length, first_ux, first_uy) in enumerate(candidates):
+        dx_first = first_end[0] - first_start[0]
+        dy_first = first_end[1] - first_start[1]
+        for second_index in range(first_index + 1, len(candidates)):
+            second_start, second_end, second_length, second_ux, second_uy = candidates[second_index]
+            if first_length / second_length > 2.0 or second_length / first_length > 2.0:
+                continue
+            dx_second = second_end[0] - second_start[0]
+            dy_second = second_end[1] - second_start[1]
+            denominator = dx_first * dy_second - dy_first * dx_second
+            if abs(denominator) <= 0.05 * first_length * second_length:
+                continue
+            q_x = second_start[0] - first_start[0]
+            q_y = second_start[1] - first_start[1]
+            first_position = (q_x * dy_second - q_y * dx_second) / denominator
+            second_position = (q_x * dy_first - q_y * dx_first) / denominator
+            if not (
+                HANDWHEEL_GLYPH_CROSS_MIN <= first_position <= HANDWHEEL_GLYPH_CROSS_MAX
+                and HANDWHEEL_GLYPH_CROSS_MIN <= second_position <= HANDWHEEL_GLYPH_CROSS_MAX
+            ):
+                continue
+            cross = (
+                first_start[0] + first_position * dx_first,
+                first_start[1] + first_position * dy_first,
+            )
+            if any(_point_distance(cross, glyph["center"]) <= 10.0 for glyph in found):
+                continue
+            first_half = first_length * max(first_position, 1.0 - first_position) + HANDWHEEL_GLYPH_PAD_PX
+            second_half = second_length * max(second_position, 1.0 - second_position) + HANDWHEEL_GLYPH_PAD_PX
+            corners = []
+            for sign_first in (-1.0, 1.0):
+                for sign_second in (-1.0, 1.0):
+                    corners.append(
+                        [
+                            round(cross[0] + sign_first * first_half * first_ux + sign_second * second_half * second_ux, 2),
+                            round(cross[1] + sign_first * first_half * first_uy + sign_second * second_half * second_uy, 2),
+                        ]
+                    )
+            found.append({"center": [round(cross[0], 2), round(cross[1], 2)], "corners": corners})
+    for index, glyph in enumerate(found, start=1):
+        glyph["id"] = f"HG-{index:02d}"
+    return found
+
+
+def _handwheel_glyph_rows(page: Any) -> list[dict[str, Any]]:
+    rectangles = mark_pipeline.find_rectangles(page, page.rect)
+    drawings = page.get_drawings()
+    glyphs = _handwheel_glyph_parallelograms(drawings, rectangles)
+    if not glyphs:
+        return []
+
+    text_rows = _handwheel_text_rects(page.get_text("words"))
+    text_rects = [rect for _text, rect in text_rows]
+    arrow_paths = _handwheel_arrow_paths(text_rects, drawings, rectangles)
+    if not text_rects and not arrow_paths:
+        return []
+
+    filtered: list[dict[str, Any]] = []
+    for glyph in glyphs:
+        center_values = glyph.get("center") or []
+        if len(center_values) < 2:
+            continue
+        center = (float(center_values[0]), float(center_values[1]))
+        arrow_gap = min(
+            (
+                _distance_to_segment(center, tuple(segment[0]), tuple(segment[1]))[0]
+                for path in arrow_paths
+                for segment in path
+            ),
+            default=None,
+        )
+        text_gap = min((_distance_to_rect(center, rect) for rect in text_rects), default=None)
+        if arrow_gap is not None and arrow_gap <= HANDWHEEL_GLYPH_ARROW_RADIUS_PX:
+            glyph["matched_source"] = "handwheel_lead"
+            glyph["matched_gap_px"] = round(arrow_gap, 2)
+            filtered.append(glyph)
+            continue
+        if text_gap is not None and text_gap <= HANDWHEEL_GLYPH_TEXT_RADIUS_PX:
+            glyph["matched_source"] = "handwheel_text"
+            glyph["matched_gap_px"] = round(text_gap, 2)
+            filtered.append(glyph)
+    for index, glyph in enumerate(filtered, start=1):
+        glyph["id"] = f"HG-{index:02d}"
+    return filtered
+
+
+def annotate_valve_edges(mapping: dict[str, Any]) -> list[dict[str, Any]]:
+    valve_edges: list[dict[str, Any]] = []
+    edge_by_id = {edge.get("id"): edge for edge in mapping.get("edges") or [] if edge.get("id")}
+    for item in mapping.get("handwheels") or []:
+        edge_id = item.get("edge_id")
+        if not edge_id or item.get("edge_created"):
+            continue
+        edge = edge_by_id.get(edge_id)
+        if edge is None:
+            continue
+        handwheel_id = item.get("id")
+        edge["element_type"] = "valve"
+        edge["is_valve_edge"] = True
+        edge["valve_source"] = "handwheel_lead"
+        ids = edge.setdefault("valve_handwheel_ids", [])
+        if handwheel_id and handwheel_id not in ids:
+            ids.append(handwheel_id)
+        valve_edges.append(
+            {
+                "edge_id": edge_id,
+                "element_type": "valve",
+                "source": "handwheel_lead",
+                "handwheel_id": handwheel_id,
+                "arrow_end": item.get("arrow_end"),
+                "edge_distance_px": item.get("edge_distance_px"),
+            }
+        )
+    mapping["valve_edges"] = valve_edges
+    return valve_edges
+
+
+def _dimension_projected_on_edge(dimension: dict[str, Any], edge_id: str | None) -> bool:
+    if not edge_id:
+        return False
+    return dimension.get("edge_id") == edge_id
+
+
+def _dimension_related_to_edge(dimension: dict[str, Any], edge_id: str | None) -> bool:
+    if _dimension_projected_on_edge(dimension, edge_id):
+        return True
+    return bool(edge_id) and any(stroke.get("pipe_edge_id") == edge_id for stroke in dimension.get("extension_strokes") or [] if isinstance(stroke, dict))
+
+
+HANDWHEEL_GLYPH_VERTEX_MAX_EDGE_GAP_PX = 45.0
+
+
+def _glyph_pipe_vertex_rows(mapping: dict[str, Any]) -> list[dict[str, Any]]:
+    """Две вершины на контуре трубы — начало и конец штурвала по его розовой метке."""
+    edges = mapping.get("edges") or []
+    vertices: list[dict[str, Any]] = []
+    for glyph in mapping.get("handwheel_glyphs") or []:
+        corners = glyph.get("corners") or []
+        center = glyph.get("center")
+        if not center or len(center) < 2 or len(corners) != 4:
+            continue
+        center_point = (float(center[0]), float(center[1]))
+        best = None
+        for edge in edges:
+            gap, _position, projection = _distance_to_segment(center_point, tuple(edge["start"]), tuple(edge["end"]))
+            if best is None or gap < best[0]:
+                best = (gap, edge, projection)
+        if best is None or best[0] > HANDWHEEL_GLYPH_VERTEX_MAX_EDGE_GAP_PX:
+            continue
+        _gap, edge, projection = best
+        edge_start = edge["start"]
+        edge_end = edge["end"]
+        edge_length = _point_distance(tuple(edge_start), tuple(edge_end)) or 1.0
+        unit_x = (edge_end[0] - edge_start[0]) / edge_length
+        unit_y = (edge_end[1] - edge_start[1]) / edge_length
+
+        def offset_along(point: list[float]) -> float:
+            return (point[0] - edge_start[0]) * unit_x + (point[1] - edge_start[1]) * unit_y
+
+        offsets = [offset_along(corner) for corner in corners]
+        for suffix, role, position in (("A", "start", min(offsets)), ("B", "end", max(offsets))):
+            vertices.append(
+                {
+                    "id": f"{glyph['id']}-{suffix}",
+                    "source": "handwheel_glyph_span",
+                    "role": role,
+                    "handwheel_id": glyph.get("id"),
+                    "edge_id": edge.get("id"),
+                    "point": [round(edge_start[0] + position * unit_x, 2), round(edge_start[1] + position * unit_y, 2)],
+                }
+            )
+    return vertices
+
+
 def save_clean_local_markup_pdf(
     pdf_path: str | Path,
     page_number: int,
@@ -1914,49 +2548,90 @@ def save_local_dimension_filter_pdf(
                 label = f"{label} -> {dimension['local_filter_conflict_with']}"
             marked.insert_text(center + (24, -10), label, fontsize=7, fontname="helv", color=color)
 
-        for vertex in mapping.get("vertices", []):
-            try:
-                center = fitz.Point(float(vertex["x"]), float(vertex["y"]))
-            except (KeyError, TypeError, ValueError):
+        glyph_color = (1.0, 0.35, 0.8)
+        for glyph in mapping.get("handwheel_glyphs") or []:
+            corners = glyph.get("corners") or []
+            if len(corners) != 4:
                 continue
-            role = vertex.get("role")
-            color = mark_pipeline.VERTEX_ROLE_COLORS.get(role, (0.10, 0.10, 0.10))
-            radius = 6.0 if role == "endpoint" else 5.0
-            marked.draw_circle(center, radius + 1.8, color=(1.0, 1.0, 1.0), fill=(1.0, 1.0, 1.0), fill_opacity=0.72, width=0.8)
-            marked.draw_circle(center, radius, color=color, fill=color, fill_opacity=0.92, width=1.0)
-            label = str(vertex.get("id") or "V?")
-            label_point = center + (8, -8)
-            label_rect = fitz.Rect(label_point.x - 1, label_point.y - 8, label_point.x + 20, label_point.y + 3)
-            marked.draw_rect(label_rect, color=(1.0, 1.0, 1.0), fill=(1.0, 1.0, 1.0), fill_opacity=0.72, width=0)
-            marked.insert_text(label_point, label, fontsize=8, fontname="helv", color=color)
+            points = [fitz.Point(float(corner[0]), float(corner[1])) for corner in corners]
+            points.append(points[0])
+            marked.draw_polyline(points, color=glyph_color, width=1.5)
 
-        compute_endpoint_adjustments(mapping)
-        endpoint_color = (0.25, 0.05, 0.75)
-        original_color = (0.45, 0.45, 0.50)
-        for adjustment in mapping.get("endpoint_adjustments", []):
-            original = adjustment.get("original")
-            adjusted = adjustment.get("adjusted")
-            if not original or not adjusted:
+        extension_vertex_color = (0.45, 0.05, 0.75)
+        handwheel_vertices = mapping.get("handwheel_vertices") or []
+        handwheel_points = [
+            tuple(vertex["point"])
+            for vertex in handwheel_vertices
+            if isinstance(vertex.get("point"), list) and len(vertex.get("point") or []) >= 2
+        ]
+        for vertex in mapping.get("extension_vertices", []):
+            point = vertex.get("point")
+            ray_start = vertex.get("ray_start")
+            if not point or len(point) < 2 or not ray_start or len(ray_start) < 2:
                 continue
-            original_point = fitz.Point(float(original[0]), float(original[1]))
-            adjusted_point = fitz.Point(float(adjusted[0]), float(adjusted[1]))
-            marked.draw_line(original_point, adjusted_point, color=endpoint_color, width=2.2)
-            marked.draw_circle(original_point, 4.0, color=original_color, fill=(0.86, 0.86, 0.90), fill_opacity=0.82, width=1.0)
-            marked.draw_circle(adjusted_point, 9.0, color=(1.0, 1.0, 1.0), fill=(1.0, 1.0, 1.0), fill_opacity=0.72, width=0.8)
-            marked.draw_circle(adjusted_point, 7.0, color=endpoint_color, fill=None, width=2.4)
-            marked.draw_line(adjusted_point + (-8, 0), adjusted_point + (8, 0), color=endpoint_color, width=1.8)
-            marked.draw_line(adjusted_point + (0, -8), adjusted_point + (0, 8), color=endpoint_color, width=1.8)
-            label = f"{adjustment.get('vertex_id', 'V?')} -> {adjustment.get('vertex_id', 'V?')}*"
-            if adjustment.get("dimension_id"):
-                label = f"{label} / {adjustment['dimension_id']}"
-            label_point = adjusted_point + (12, -12)
-            label_rect = fitz.Rect(label_point.x - 2, label_point.y - 9, label_point.x + 68, label_point.y + 4)
-            marked.draw_rect(label_rect, color=(1.0, 1.0, 1.0), fill=(1.0, 1.0, 1.0), fill_opacity=0.78, width=0)
-            marked.insert_text(label_point, label, fontsize=8, fontname="helv", color=endpoint_color)
+            if any(_point_distance((float(point[0]), float(point[1])), handwheel_point) <= 8.0 for handwheel_point in handwheel_points):
+                continue
+            from_point = fitz.Point(float(ray_start[0]), float(ray_start[1]))
+            center = fitz.Point(float(point[0]), float(point[1]))
+            marked.draw_line(
+                from_point,
+                center,
+                color=extension_vertex_color,
+                width=0.8,
+                dashes="[2 2] 0",
+            )
+            marked.draw_circle(center, 9.0, color=(1.0, 1.0, 1.0), fill=(1.0, 1.0, 1.0), fill_opacity=0.72, width=0.8)
+            marked.draw_circle(center, 6.5, color=extension_vertex_color, fill=None, width=2.2)
+            marked.draw_line(center + (-4.5, 0), center + (4.5, 0), color=extension_vertex_color, width=1.6)
+            marked.draw_line(center + (0, -4.5), center + (0, 4.5), color=extension_vertex_color, width=1.6)
+            label = str(vertex.get("id") or "VE?")
+            dimensions_label = ",".join(str(item) for item in (vertex.get("dimension_ids") or []) if item)
+            if dimensions_label:
+                label = f"{label}/{dimensions_label}"
+            label_point = center + (11, -11)
+            label_rect = fitz.Rect(label_point.x - 2, label_point.y - 9, label_point.x + 66, label_point.y + 4)
+            marked.draw_rect(label_rect, color=(1.0, 1.0, 1.0), fill=(1.0, 1.0, 1.0), fill_opacity=0.85, width=0)
+            marked.insert_text(label_point, label, fontsize=8, fontname="helv", color=extension_vertex_color)
+
+        handwheel_vertex_color = (0.14, 0.39, 0.92)
+        for vertex in handwheel_vertices:
+            point = vertex.get("point")
+            if not point or len(point) < 2:
+                continue
+            center = fitz.Point(float(point[0]), float(point[1]))
+            marked.draw_circle(center, 11.0, color=(1.0, 1.0, 1.0), fill=(1.0, 1.0, 1.0), fill_opacity=0.82, width=0.8)
+            marked.draw_circle(center, 7.8, color=handwheel_vertex_color, fill=None, width=2.8)
+            marked.draw_line(center + (-5.8, -5.8), center + (5.8, 5.8), color=handwheel_vertex_color, width=2.0)
+            marked.draw_line(center + (-5.8, 5.8), center + (5.8, -5.8), color=handwheel_vertex_color, width=2.0)
+            label = str(vertex.get("id") or "VH?")
+            detail = str(vertex.get("handwheel_id") or "HW?")
+            if vertex.get("dimension_id"):
+                detail = f"{detail} / {vertex['dimension_id']}"
+            elif vertex.get("edge_id"):
+                detail = f"{detail} / {vertex['edge_id']}"
+            if vertex.get("point_source"):
+                detail = f"{detail} / {vertex['point_source']}"
+            label_point = center + (13, -13)
+            label_rect = fitz.Rect(label_point.x - 2, label_point.y - 21, label_point.x + 160, label_point.y + 8)
+            marked.draw_rect(label_rect, color=(1.0, 1.0, 1.0), fill=(1.0, 1.0, 1.0), fill_opacity=0.92, width=0)
+            marked.insert_text(label_point, label, fontsize=11, fontname="helv", color=handwheel_vertex_color)
+            marked.insert_text(label_point + (0, 12), detail, fontsize=8.5, fontname="helv", color=handwheel_vertex_color)
+
+        for item in mapping.get("handwheels") or _handwheel_details(page, mapping):
+            arrow_end = item.get("arrow_end")
+            if not arrow_end or len(arrow_end) < 2:
+                continue
+            center = fitz.Point(float(arrow_end[0]), float(arrow_end[1]))
+            marked.draw_circle(center, 4.2, color=handwheel_vertex_color, fill=handwheel_vertex_color, fill_opacity=0.88, width=1.0)
+            lead_label = f"{item.get('id', 'HW?')} lead -> {item.get('edge_id') or '?'}"
+            label_point = center + (7, 7)
+            label_rect = fitz.Rect(label_point.x - 2, label_point.y - 9, label_point.x + 92, label_point.y + 4)
+            marked.draw_rect(label_rect, color=(1.0, 1.0, 1.0), fill=(1.0, 1.0, 1.0), fill_opacity=0.88, width=0)
+            marked.insert_text(label_point, lead_label, fontsize=7.5, fontname="helv", color=handwheel_vertex_color)
 
         marked.insert_text(
             fitz.Point(24, 28),
-            "LOCAL DIMENSION FILTER: green include, red exclude; violet endpoint shift by extension contact",
+            "LOCAL DIMENSION FILTER: green include, red exclude; violet new vertices on extension-to-pipe projection",
             fontsize=9,
             fontname="helv",
             color=(0.05, 0.18, 0.14),
@@ -2149,6 +2824,8 @@ __all__ = [
     "map_dimensions",
     "run_dimension_mapping",
     "compute_endpoint_adjustments",
+    "compute_extension_vertices",
+    "annotate_valve_edges",
     "apply_local_dimension_filter",
     "save_dimension_mapping_pdf",
     "save_preprocess_annotation_pdf",

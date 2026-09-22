@@ -1,4 +1,4 @@
-import tempfile
+﻿import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -6,9 +6,9 @@ from unittest import mock
 
 import fitz
 
-from src.dimension_mapping import _dimension_hints_from_text, _first_arrow_third, _handwheel_arrow_segments, _handwheel_details, _handwheel_text_rects, _is_rectangle_side, _same_directed_contour, apply_local_dimension_filter, compute_endpoint_adjustments, save_clean_local_markup_pdf, save_local_dimension_filter_pdf, save_preprocess_annotation_pdf
+from src.dimension_mapping import _dimension_hints_from_text, _first_arrow_third, _handwheel_arrow_segments, _handwheel_details, _handwheel_text_rects, _is_rectangle_side, _same_directed_contour, apply_local_dimension_filter, compute_endpoint_adjustments, compute_extension_vertices, save_clean_local_markup_pdf, save_local_dimension_filter_pdf, save_preprocess_annotation_pdf
 from src.dimension_mapping import _direct_dimension_stroke_from_label, _fallback_leader_stroke_from_label, _find_extension_strokes, _merge_dimension_stroke, _resolve_leader_target
-from src.dimension_mapping import _annotation_arrow_segments, _reserved_annotation_strokes
+from src.dimension_mapping import _annotation_arrow_segments, _glyph_pipe_vertex_rows, _handwheel_glyph_parallelograms, _handwheel_glyph_rows, _reserved_annotation_strokes, annotate_valve_edges
 from src.dimension_review import build_review_payload
 
 
@@ -455,6 +455,275 @@ class DimensionRuleTests(unittest.TestCase):
 
         self.assertEqual(mapping["dimensions"][1]["local_filter_decision"], "exclude")
         self.assertEqual(mapping["dimensions"][1]["local_filter_reason"], "covered_by_short_endpoint_leader_overlap")
+
+    def test_extension_vertices_project_onto_pipe_edge(self) -> None:
+        mapping = {
+            "edges": [{"id": "E1", "start": [0.0, 40.0], "end": [200.0, 40.0]}],
+            "dimensions": [
+                {
+                    "id": "D001",
+                    "local_filter_decision": "include",
+                    "dimension_stroke": {"start": [10.0, 0.0], "end": [60.0, 0.0], "merged_indices": [1]},
+                    "extension_strokes": [
+                        {"index": 11, "start": [10.0, 30.0], "end": [10.0, 10.0], "pipe_edge_id": "E1"},
+                        {"index": 12, "start": [60.0, 10.0], "end": [60.0, 30.0], "pipe_edge_id": "E1"},
+                    ],
+                }
+            ],
+        }
+
+        vertices = compute_extension_vertices(mapping)
+
+        self.assertEqual([vertex["id"] for vertex in vertices], ["VE-01", "VE-02"])
+        self.assertEqual(sorted(vertex["point"] for vertex in vertices), [[10.0, 40.0], [60.0, 40.0]])
+
+    def test_extension_vertices_merge_close_hits_into_one(self) -> None:
+        mapping = {
+            "edges": [{"id": "E1", "start": [0.0, 40.0], "end": [200.0, 40.0]}],
+            "dimensions": [
+                {
+                    "id": "D001",
+                    "local_filter_decision": "include",
+                    "dimension_stroke": {"start": [10.0, 0.0], "end": [60.0, 0.0], "merged_indices": [1]},
+                    "extension_strokes": [{"index": 11, "start": [10.0, 30.0], "end": [10.0, 10.0], "pipe_edge_id": "E1"}],
+                },
+                {
+                    "id": "D002",
+                    "local_filter_decision": "include",
+                    "dimension_stroke": {"start": [12.0, 0.0], "end": [20.0, 0.0], "merged_indices": [2]},
+                    "extension_strokes": [{"index": 21, "start": [12.0, 10.0], "end": [12.0, 30.0], "pipe_edge_id": "E1"}],
+                },
+            ],
+        }
+
+        vertices = compute_extension_vertices(mapping)
+
+        self.assertEqual(len(vertices), 1)
+        self.assertEqual(vertices[0]["id"], "VE-01")
+        self.assertEqual(vertices[0]["point"], [10.0, 40.0])
+        self.assertEqual(vertices[0]["dimension_ids"], ["D001", "D002"])
+
+    def test_extension_vertices_extend_away_from_dimension_line_side(self) -> None:
+        mapping = {
+            "vertices": [{"id": "V01", "role": "corner", "x": 10.0, "y": 40.0}],
+            "edges": [
+                {"id": "E1", "start": [0.0, 40.0], "end": [200.0, 40.0]},
+                {"id": "E2", "start": [10.0, 6.0], "end": [60.0, 6.0]},
+            ],
+            "dimensions": [
+                {
+                    "id": "D001",
+                    "local_filter_decision": "include",
+                    "dimension_stroke": {"start": [10.0, 0.0], "end": [60.0, 0.0], "merged_indices": [1]},
+                    "extension_strokes": [
+                        {"index": 11, "start": [10.0, 30.0], "end": [10.0, 5.0], "target_endpoint": "start", "pipe_edge_id": "E1"},
+                    ],
+                }
+            ],
+        }
+
+        vertices = compute_extension_vertices(mapping)
+
+        self.assertEqual(vertices[0]["point"], [10.0, 40.0])
+        self.assertEqual(vertices[0]["pipe_edge_id"], "E1")
+        self.assertEqual(mapping["suppressed_vertex_ids"], ["V01"])
+
+    def test_extension_vertices_accept_near_miss_pipe_contour(self) -> None:
+        mapping = {
+            "edges": [{"id": "E1", "start": [20.0, 40.0], "end": [200.0, 40.0]}],
+            "dimensions": [
+                {
+                    "id": "D001",
+                    "local_filter_decision": "include",
+                    "dimension_stroke": {"start": [10.0, 0.0], "end": [60.0, 0.0], "merged_indices": [1]},
+                    "extension_strokes": [
+                        {"index": 11, "start": [12.0, 30.0], "end": [12.0, 4.0], "target_endpoint": "start", "pipe_edge_id": "E1"},
+                    ],
+                }
+            ],
+        }
+
+        vertices = compute_extension_vertices(mapping)
+
+        self.assertEqual(vertices[0]["point"], [20.0, 40.0])
+        self.assertEqual(vertices[0]["projection_kind"], "near_miss")
+        self.assertEqual(vertices[0]["side_gap_px"], 8.0)
+
+    def test_extension_vertices_use_middle_touch_to_choose_outward_endpoint(self) -> None:
+        mapping = {
+            "edges": [{"id": "E1", "start": [328.32, 319.7], "end": [328.32, 345.4]}],
+            "dimensions": [
+                {
+                    "id": "D001",
+                    "local_filter_decision": "include",
+                    "dimension_stroke": {"start": [296.64, 363.33], "end": [296.64, 337.89], "merged_indices": [1]},
+                    "extension_strokes": [
+                        {"index": 11, "start": [255.6, 361.65], "end": [320.16, 324.45], "target_endpoint": "end", "pipe_edge_id": "E1"},
+                    ],
+                }
+            ],
+        }
+
+        vertices = compute_extension_vertices(mapping)
+
+        self.assertEqual(vertices[0]["point"], [328.32, 319.75])
+        self.assertEqual(vertices[0]["ray_source"], "target_touch_to_end")
+
+    def test_extension_vertices_skip_excluded_dimensions(self) -> None:
+        mapping = {
+            "edges": [{"id": "E1", "start": [0.0, 40.0], "end": [200.0, 40.0]}],
+            "dimensions": [
+                {
+                    "id": "D001",
+                    "local_filter_decision": "exclude",
+                    "dimension_stroke": {"start": [10.0, 0.0], "end": [60.0, 0.0], "merged_indices": [1]},
+                    "extension_strokes": [{"index": 11, "start": [10.0, 30.0], "end": [10.0, 10.0], "pipe_edge_id": "E1"}],
+                },
+                {
+                    "id": "D002",
+                    "local_filter_decision": "ambiguous",
+                    "dimension_stroke": {"start": [60.0, 0.0], "end": [90.0, 0.0], "merged_indices": [2]},
+                    "extension_strokes": [{"index": 21, "start": [60.0, 10.0], "end": [60.0, 30.0], "pipe_edge_id": "E1"}],
+                },
+            ],
+        }
+
+        self.assertEqual(compute_extension_vertices(mapping), [])
+
+    def test_extension_vertices_skip_when_pipe_is_too_far(self) -> None:
+        mapping = {
+            "edges": [{"id": "E1", "start": [0.0, 300.0], "end": [200.0, 300.0]}],
+            "dimensions": [
+                {
+                    "id": "D001",
+                    "local_filter_decision": "include",
+                    "dimension_stroke": {"start": [10.0, 0.0], "end": [60.0, 0.0], "merged_indices": [1]},
+                    "extension_strokes": [{"index": 11, "start": [10.0, 2.0], "end": [10.0, 0.0], "pipe_edge_id": "E1"}],
+                }
+            ],
+        }
+
+        self.assertEqual(compute_extension_vertices(mapping), [])
+
+    def test_handwheel_glyph_parallelogram_wraps_crossing_legs(self) -> None:
+        drawings = [{"items": [
+            ("l", fitz.Point(100.0, 100.0), fitz.Point(140.0, 160.0)),
+            ("l", fitz.Point(100.0, 160.0), fitz.Point(140.0, 100.0)),
+        ]}]
+
+        glyphs = _handwheel_glyph_parallelograms(drawings)
+
+        self.assertEqual(len(glyphs), 1)
+        center = glyphs[0]["center"]
+        self.assertEqual(center, [120.0, 130.0])
+        corners = glyphs[0]["corners"]
+        self.assertEqual(len(corners), 4)
+        min_x = min(corner[0] for corner in corners)
+        max_x = max(corner[0] for corner in corners)
+        min_y = min(corner[1] for corner in corners)
+        max_y = max(corner[1] for corner in corners)
+        self.assertLessEqual(min_x, 100.0)
+        self.assertGreaterEqual(max_x, 140.0)
+        self.assertLessEqual(min_y, 100.0)
+        self.assertGreaterEqual(max_y, 160.0)
+
+    def test_glyph_pipe_vertices_span_glyph_along_edge(self) -> None:
+        mapping = {
+            "edges": [{"id": "E1", "start": [0.0, 100.0], "end": [200.0, 100.0]}],
+            "handwheel_glyphs": [
+                {"id": "HG-01", "center": [50.0, 98.0], "corners": [[30.0, 88.0], [70.0, 88.0], [70.0, 108.0], [30.0, 108.0]]},
+            ],
+        }
+
+        rows = _glyph_pipe_vertex_rows(mapping)
+        start = next(row for row in rows if row["role"] == "start")
+        end = next(row for row in rows if row["role"] == "end")
+
+        self.assertEqual([row["id"] for row in rows], ["HG-01-A", "HG-01-B"])
+        self.assertEqual(start["point"], [30.0, 100.0])
+        self.assertEqual(end["point"], [70.0, 100.0])
+        self.assertEqual(start["edge_id"], "E1")
+
+    def test_glyph_pipe_vertices_follow_glyph_beyond_edge_ends(self) -> None:
+        mapping = {
+            "edges": [{"id": "E1", "start": [40.0, 100.0], "end": [60.0, 100.0]}],
+            "handwheel_glyphs": [
+                {"id": "HG-01", "center": [50.0, 98.0], "corners": [[30.0, 88.0], [70.0, 88.0], [70.0, 108.0], [30.0, 108.0]]},
+            ],
+        }
+
+        rows = _glyph_pipe_vertex_rows(mapping)
+        start = next(row for row in rows if row["role"] == "start")
+        end = next(row for row in rows if row["role"] == "end")
+
+        self.assertEqual(start["point"], [30.0, 100.0])
+        self.assertEqual(end["point"], [70.0, 100.0])
+
+    def test_glyph_pipe_vertices_skip_when_no_pipe_edge_nearby(self) -> None:
+        mapping = {
+            "edges": [{"id": "E9", "start": [500.0, 500.0], "end": [600.0, 500.0]}],
+            "handwheel_glyphs": [
+                {"id": "HG-01", "center": [50.0, 50.0], "corners": [[40.0, 40.0], [60.0, 40.0], [60.0, 60.0], [40.0, 60.0]]},
+            ],
+        }
+
+        self.assertEqual(_glyph_pipe_vertex_rows(mapping), [])
+
+    def test_handwheel_glyph_ignores_t_cross_and_parallel_lines(self) -> None:
+        drawings = [{"items": [
+            ("l", fitz.Point(100.0, 100.0), fitz.Point(140.0, 100.0)),
+            ("l", fitz.Point(120.0, 100.0), fitz.Point(120.0, 160.0)),
+        ]}, {"items": [
+            ("l", fitz.Point(200.0, 200.0), fitz.Point(280.0, 200.0)),
+            ("l", fitz.Point(200.0, 220.0), fitz.Point(280.0, 220.0)),
+        ]}]
+
+        self.assertEqual(_handwheel_glyph_parallelograms(drawings), [])
+
+    def test_handwheel_glyph_rows_keep_only_lead_confirmed_crosses(self) -> None:
+        page = SimpleNamespace(
+            rect=fitz.Rect(0, 0, 500, 500),
+            get_drawings=lambda: [{"items": [
+                ("l", fitz.Point(110.0, 120.0), fitz.Point(150.0, 160.0)),
+                ("l", fitz.Point(110.0, 160.0), fitz.Point(150.0, 120.0)),
+                ("l", fitz.Point(300.0, 300.0), fitz.Point(340.0, 340.0)),
+                ("l", fitz.Point(300.0, 340.0), fitz.Point(340.0, 300.0)),
+            ]}],
+            get_text=lambda _kind: [(10, 10, 80, 24, "ШТУРВАЛ", 0, 0, 0)],
+        )
+
+        with mock.patch("src.dimension_mapping.mark_pipeline.find_rectangles", return_value=[]), mock.patch(
+            "src.dimension_mapping._handwheel_arrow_paths",
+            return_value=[[
+                ((80.0, 24.0), (130.0, 140.0)),
+            ]],
+        ):
+            glyphs = _handwheel_glyph_rows(page)
+
+        self.assertEqual(len(glyphs), 1)
+        self.assertEqual(glyphs[0]["matched_source"], "handwheel_lead")
+        self.assertEqual(glyphs[0]["center"], [130.0, 140.0])
+
+    def test_handwheel_annotation_marks_pipe_edge_as_valve(self) -> None:
+        mapping = {
+            "edges": [{"id": "E001", "start": [0, 0], "end": [100, 0]}],
+            "handwheels": [
+                {
+                    "id": "HW-001",
+                    "edge_id": "E001",
+                    "edge_created": False,
+                    "arrow_end": [50, 0],
+                    "edge_distance_px": 0.0,
+                }
+            ],
+        }
+
+        valve_edges = annotate_valve_edges(mapping)
+
+        self.assertEqual(valve_edges[0]["edge_id"], "E001")
+        self.assertTrue(mapping["edges"][0]["is_valve_edge"])
+        self.assertEqual(mapping["edges"][0]["element_type"], "valve")
+        self.assertEqual(mapping["edges"][0]["valve_handwheel_ids"], ["HW-001"])
 
     def test_local_dimension_filter_keeps_middle_hit_leader_callout(self) -> None:
         mapping = {
