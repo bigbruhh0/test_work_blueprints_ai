@@ -117,17 +117,6 @@ def _connection_classify(text: str) -> tuple[str, str | None, bool]:
     sheet_number = _extract_sheet_number(normalized)
     if sheet_number is not None:
         return "continuation", sheet_number, True
-    continuation_keywords = (
-        "СМ.",
-        "СМ ",
-        "SEE SHEET",
-        "CONTINUATION",
-        "ЛИСТ",
-        "SHEET",
-    )
-    has_sheet_hint = any(keyword in upper for keyword in continuation_keywords)
-    if has_sheet_hint:
-        return "other", None, True
     return "other", None, False
 
 
@@ -165,12 +154,11 @@ def _connection_rows_from_page(
     for index, line in enumerate(lines, start=1):
         label = " ".join(part[4] for part in sorted(line, key=lambda item: item[0]))
         upper = label.upper()
-        if not any(keyword in upper for keyword in ("ПОДКЛЮЧЕНИЕ", "TIE-IN", "TIE IN", "СМ.", "SEE SHEET", "CONTINUATION", "ЛИСТ", "SHEET")):
+        has_explicit_sheet_reference = bool(re.search(r"\bЛИСТ\b\s*[:№]?\s*(?:№\s*)?\d+", label, flags=re.IGNORECASE | re.UNICODE))
+        if not any(keyword in upper for keyword in ("ПОДКЛЮЧЕНИЕ", "TIE-IN", "TIE IN")) and not has_explicit_sheet_reference:
             continue
         connection_type, target_sheet, has_sheet_hint = _connection_classify(label)
-        if connection_type == "other" and not has_sheet_hint and not any(
-            keyword in upper for keyword in ("ПОДКЛЮЧЕНИЕ", "TIE-IN", "TIE IN", "СМ.", "SEE SHEET", "CONTINUATION", "ЛИСТ", "SHEET")
-        ):
+        if connection_type == "other" and not has_sheet_hint and not any(keyword in upper for keyword in ("ПОДКЛЮЧЕНИЕ", "TIE-IN", "TIE IN")):
             continue
         x0 = min(item[0] for item in line)
         y0 = min(item[1] for item in line)
@@ -1758,7 +1746,42 @@ def _find_extension_strokes(
     return [item[1] for item in sorted(candidates_by_endpoint.values(), key=lambda item: item[0])][:2]
 
 
-def map_dimensions(pdf_path: str | Path, page_number: int) -> dict[str, Any]:
+def _local_processing_snapshot(mapping: dict[str, Any]) -> dict[str, Any]:
+    """Return the pre-finalization geometry used by the length-analysis stage."""
+    snapshot = dict(mapping)
+    snapshot["analysis_stage"] = "local_processing"
+    snapshot["base_vertices"] = [dict(vertex) for vertex in mapping.get("vertices") or []]
+    snapshot["base_edges"] = [dict(edge) for edge in mapping.get("edges") or []]
+    snapshot["local_decisions"] = [
+        {
+            "candidate_id": dimension.get("id"),
+            "value_mm": dimension.get("value"),
+            "decision": dimension.get("local_filter_decision"),
+            "reason": dimension.get("local_filter_reason"),
+            "conflict_with": dimension.get("local_filter_conflict_with"),
+            "status": dimension.get("status"),
+        }
+        for dimension in mapping.get("dimensions") or []
+        if dimension.get("id")
+    ]
+    # Handwheel locations are diagnostic evidence, not final V/E topology.
+    annotations = mapping.get("handwheel_annotations") or {}
+    snapshot["handwheel_annotations"] = {
+        "handwheels": [dict(item) for item in annotations.get("handwheels") or []],
+        "glyphs": [dict(item) for item in annotations.get("glyphs") or []],
+    }
+    # The snapshot deliberately has no final contour data.  Keep only the
+    # base V/E layer and local candidate evidence for the next analysis.
+    for key in (
+        "final_vertices", "handwheel_vertices", "edge_segments", "final_contour",
+        "handwheels", "handwheel_edges", "valve_edges", "handwheel_glyphs",
+        "source_edges", "parent_edges",
+    ):
+        snapshot.pop(key, None)
+    return snapshot
+
+
+def map_dimensions(pdf_path: str | Path, page_number: int, *, finalize: bool = True) -> dict[str, Any]:
     pdf_path = str(pdf_path)
     with fitz.open(pdf_path) as document:
         page = document[page_number - 1]
@@ -1817,6 +1840,7 @@ def map_dimensions(pdf_path: str | Path, page_number: int) -> dict[str, Any]:
                         "id": f"D{index:03d}",
                         "value": float(text.replace(",", ".")),
                         "text": text,
+                        "bbox": [round(rect.x0, 2), round(rect.y0, 2), round(rect.x1, 2), round(rect.y1, 2)],
                         "hints": sorted(hints),
                         "label_center": [round(center[0], 2), round(center[1], 2)],
                         "edge_id": edge["id"],
@@ -1833,6 +1857,7 @@ def map_dimensions(pdf_path: str | Path, page_number: int) -> dict[str, Any]:
                         "id": f"D{index:03d}",
                         "value": float(text.replace(",", ".")),
                         "text": text,
+                        "bbox": [round(rect.x0, 2), round(rect.y0, 2), round(rect.x1, 2), round(rect.y1, 2)],
                         "hints": sorted(hints),
                         "label_center": [round(center[0], 2), round(center[1], 2)],
                         "edge_id": None,
@@ -1982,10 +2007,16 @@ def map_dimensions(pdf_path: str | Path, page_number: int) -> dict[str, Any]:
         }
         compute_endpoint_adjustments(result)
         apply_local_dimension_filter(result)
+        result["handwheel_annotations"] = {
+            "handwheels": _handwheel_details(page, result),
+            "glyphs": _handwheel_glyph_rows(page),
+        }
+        if not finalize:
+            return _local_processing_snapshot(result)
         compute_extension_vertices(result)
-        result["handwheels"] = _handwheel_details(page, result)
+        result["handwheels"] = result["handwheel_annotations"]["handwheels"]
         annotate_valve_edges(result)
-        result["handwheel_glyphs"] = _handwheel_glyph_rows(page)
+        result["handwheel_glyphs"] = result["handwheel_annotations"]["glyphs"]
         compute_final_vertices(result)
         split_edges_by_final_vertices(result)
         return result
@@ -4188,6 +4219,103 @@ def save_local_dimension_filter_pdf(
         output.close()
 
 
+def save_pipeline_length_diagnostic_pdf(
+    pdf_path: str | Path,
+    page_number: int,
+    output_pdf: str | Path,
+    mapping: dict[str, Any],
+) -> None:
+    """Render only the base V/E geometry and local dimension decisions."""
+    with fitz.open(str(pdf_path)) as document:
+        source_page = document[page_number - 1]
+        output = fitz.open()
+        marked = output.new_page(width=source_page.rect.width, height=source_page.rect.height)
+        marked.show_pdf_page(marked.rect, document, page_number - 1)
+        edge_color = (0.05, 0.35, 0.85)
+        for edge in mapping.get("base_edges") or mapping.get("edges") or []:
+            start, end = edge.get("start"), edge.get("end")
+            if not isinstance(start, list) or not isinstance(end, list):
+                continue
+            marked.draw_line(fitz.Point(*start[:2]), fitz.Point(*end[:2]), color=edge_color, width=1.8)
+            midpoint = fitz.Point((float(start[0]) + float(end[0])) / 2, (float(start[1]) + float(end[1])) / 2)
+            marked.insert_text(midpoint + (3, -3), str(edge.get("id") or "E?"), fontsize=6, color=edge_color)
+
+        vertex_color = (0.55, 0.05, 0.75)
+        for vertex in mapping.get("base_vertices") or []:
+            point = (vertex.get("x"), vertex.get("y"))
+            if point[0] is None or point[1] is None:
+                continue
+            center = fitz.Point(float(point[0]), float(point[1]))
+            marked.draw_circle(center, 6.0, color=vertex_color, fill=None, width=1.8)
+            marked.insert_text(center + (8, -7), str(vertex.get("id") or "V?"), fontsize=7, color=vertex_color)
+
+        decision_colors = {
+            "include": (0.0, 0.65, 0.15),
+            "exclude": (0.85, 0.05, 0.05),
+            "ambiguous": (0.95, 0.55, 0.0),
+        }
+        for dimension in mapping.get("dimensions") or []:
+            decision = dimension.get("local_filter_decision") or "ambiguous"
+            color = decision_colors.get(decision, decision_colors["ambiguous"])
+            for key, width in (("dimension_stroke", 2.4), ("leader_stroke", 1.8)):
+                points = _stroke_points(dimension.get(key) or {})
+                if points is not None:
+                    marked.draw_line(points[0], points[1], color=color, width=width)
+            for stroke in dimension.get("extension_strokes") or []:
+                points = _stroke_points(stroke)
+                if points is not None:
+                    marked.draw_line(points[0], points[1], color=color, width=1.6)
+            center = dimension.get("label_center")
+            if isinstance(center, list) and len(center) >= 2:
+                point = fitz.Point(float(center[0]), float(center[1]))
+                label = f"{dimension.get('id', 'D?')}={dimension.get('value', '?')} [{decision}]"
+                marked.insert_text(point + (10, -8), label[:48], fontsize=7, color=color)
+
+        # Handwheel evidence is intentionally separate from the base V/E graph.
+        # It helps the provider relate a dimension to a valve without introducing
+        # final HG vertices or valve edges at this stage.
+        handwheel_color = (0.08, 0.2, 0.95)
+        glyph_color = (0.75, 0.05, 0.65)
+        annotations = mapping.get("handwheel_annotations") or {}
+        for item in annotations.get("handwheels") or []:
+            for segment in item.get("arrow_segments") or []:
+                points = _stroke_points(segment)
+                if points is not None:
+                    marked.draw_line(points[0], points[1], color=handwheel_color, width=2.2)
+            arrow_end = item.get("arrow_end")
+            if isinstance(arrow_end, list) and len(arrow_end) >= 2:
+                point = fitz.Point(float(arrow_end[0]), float(arrow_end[1]))
+                marked.insert_text(point + (5, -4), str(item.get("id") or "HW"), fontsize=7, color=handwheel_color)
+        for glyph in annotations.get("glyphs") or []:
+            corners = [
+                fitz.Point(float(point[0]), float(point[1]))
+                for point in glyph.get("corners") or []
+                if isinstance(point, list) and len(point) >= 2
+            ]
+            if len(corners) == 4:
+                for first, second in ((0, 1), (1, 3), (3, 2), (2, 0)):
+                    marked.draw_line(corners[first], corners[second], color=glyph_color, width=1.8)
+            center = glyph.get("center")
+            if isinstance(center, list) and len(center) >= 2:
+                point = fitz.Point(float(center[0]), float(center[1]))
+                marked.insert_text(point + (6, -6), str(glyph.get("id") or "HG"), fontsize=7, color=glyph_color)
+
+        marked.insert_text(
+            fitz.Point(24, 28),
+            f"PIPELINE LENGTH / LOCAL BASE GEOMETRY / page {page_number}",
+            fontsize=11,
+            color=(0.08, 0.12, 0.2),
+        )
+        marked.insert_text(
+            fitz.Point(24, 42),
+            "V/E base geometry; green=include red=exclude orange=ambiguous; blue/magenta=handwheel evidence",
+            fontsize=8,
+            color=(0.08, 0.12, 0.2),
+        )
+        output.save(str(output_pdf))
+        output.close()
+
+
 def save_final_contour_rays_pdf(
     pdf_path: str | Path,
     page_number: int,
@@ -4454,8 +4582,15 @@ def save_skeleton_pdf(
         output.close()
 
 
-def run_dimension_mapping(pdf_path: str | Path, page_number: int, output_pdf: str | Path, output_json: str | Path) -> dict[str, Any]:
-    mapping = map_dimensions(pdf_path, page_number)
+def run_dimension_mapping(
+    pdf_path: str | Path,
+    page_number: int,
+    output_pdf: str | Path,
+    output_json: str | Path,
+    *,
+    finalize: bool = True,
+) -> dict[str, Any]:
+    mapping = map_dimensions(pdf_path, page_number, finalize=finalize)
     save_dimension_mapping_pdf(pdf_path, page_number, output_pdf, mapping)
     Path(output_json).write_text(json.dumps(mapping, ensure_ascii=False, indent=2), encoding="utf-8")
     return mapping
@@ -4473,6 +4608,7 @@ __all__ = [
     "save_dimension_mapping_pdf",
     "save_preprocess_annotation_pdf",
     "save_local_dimension_filter_pdf",
+    "save_pipeline_length_diagnostic_pdf",
     "save_final_contour_rays_pdf",
     "save_clean_graph_pdf",
     "save_skeleton_pdf",

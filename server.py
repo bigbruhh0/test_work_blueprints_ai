@@ -28,10 +28,12 @@ from src.dimension_mapping import (
     save_clean_local_markup_pdf,
     save_local_dimension_filter_pdf,
     save_final_contour_rays_pdf,
+    save_pipeline_length_diagnostic_pdf,
     save_preprocess_annotation_pdf,
     save_skeleton_pdf,
 )
 from src.dimension_review import build_map_text, calculate_lengths, codex_login_command, codex_login_status, review_map_with_provider
+from src.pipeline_length import build_pipeline_length_page_payload, build_pipeline_length_payload, build_pipeline_length_result, build_pipeline_length_text, calculate_provider_length_summary, merge_pipeline_length_provider_traces, run_pipeline_length_provider
 from src.eval_data import aggregate_eval_results, evaluate_line_for_prompt, list_eval_groups, summarize_prompt_eval_rows
 from src.pdf_groups import get_pdf_cache_status, prepare_pdf_groups
 from src.prepare_stage import run_prepare
@@ -46,6 +48,7 @@ load_dotenv(ROOT / ".env")
 
 PIPELINE_STEPS = [
     ("local_processing", "Локальная обработка"),
+    ("pipeline_length", "Расчет длины трубопровода"),
     ("dimension_review", "Карта размеров + проверка провайдером"),
 ]
 
@@ -54,6 +57,7 @@ RUN_KIND_BY_STAGE = {
     "local_processing": ("local_processing", "Локальная обработка"),
     "prepare": ("local_prepare", "Локальная обработка"),
     "dimensions": ("dimension_mapping", "Локальная обработка"),
+    "pipeline_length": ("pipeline_length", "Расчет длины трубопровода"),
     "dimension_review": ("dimension_review", "Карта размеров + проверка провайдером"),
 }
 ENV: dict[str, str] = {}
@@ -84,6 +88,10 @@ class LineRun:
     status: str = "pending"
     error: str = ""
     page_results: dict[int, PageRun] = field(default_factory=dict)
+    files: dict[str, str] = field(default_factory=dict)
+    analysis: dict[str, Any] | None = None
+    provider_trace: dict[str, Any] | None = None
+    events: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -93,6 +101,7 @@ class RunState:
     source_name: str
     pdf_path: str
     line_ids: list[str]
+    excluded_pages: list[int] = field(default_factory=list)
     stop_stage: str = "dimension_review"
     status: str = "running"
     created_at: str = ""
@@ -119,6 +128,7 @@ def favicon() -> Any:
 def startup() -> None:
     ENV.update({key: value.strip() for key, value in os.environ.items() if key.startswith("DEEPSEEK")})
     run_db.init_db()
+    run_db.mark_running_runs_interrupted("Прогон был прерван перезапуском сервера")
 
 
 @app.get("/")
@@ -311,6 +321,15 @@ class ManualStatusBody(BaseModel):
     status: str
 
 
+class PipelineLengthConfirmationBody(BaseModel):
+    run_id: str
+    line_id: str
+    candidate_ids: list[str] = []
+    keep_local_candidate_ids: list[str] = []
+    intermediate_distance_indices: list[int] = []
+    edge_ids: list[str] = []
+
+
 def _feedback_revision(page: dict[str, Any]) -> dict[str, Any]:
     from src import prompts
 
@@ -441,6 +460,76 @@ def update_manual_status(body: ManualStatusBody) -> dict[str, Any]:
     return run
 
 
+@app.post("/api/pipeline-length/confirm")
+def confirm_pipeline_length_proposals(body: PipelineLengthConfirmationBody) -> dict[str, Any]:
+    """Record only explicitly accepted provider proposals; local decisions stay intact."""
+    persisted_state = STATE["runs"].get(body.run_id)
+    if persisted_state:
+        run_dict_value = run_dict(persisted_state)
+    else:
+        run_dict_value = run_db.load_run(body.run_id)
+    if not run_dict_value:
+        raise HTTPException(404, "Прогон не найден")
+    line = next((item for item in run_dict_value.get("lines", []) if item.get("line_id") == body.line_id), None)
+    analysis = (line or {}).get("analysis") or {}
+    pipeline = analysis.get("pipeline_length") or {}
+    provider = pipeline.get("provider_result") or {}
+    if not pipeline:
+        raise HTTPException(400, "Расчет длины для линии еще не готов")
+    assessments = {str(item.get("candidate_id")): item for item in provider.get("candidate_assessments") or []}
+    distances = provider.get("intermediate_distances") or []
+    routes = {str(item.get("edge_id")): item for item in provider.get("edge_routes") or []}
+    unknown_candidates = [item for item in body.candidate_ids if item not in assessments]
+    unknown_local_candidates = [item for item in body.keep_local_candidate_ids if item not in assessments]
+    unknown_distances = [item for item in body.intermediate_distance_indices if item < 0 or item >= len(distances)]
+    unknown_edges = [item for item in body.edge_ids if item not in routes]
+    if unknown_candidates or unknown_local_candidates or unknown_distances or unknown_edges:
+        raise HTTPException(400, {"unknown_candidate_ids": unknown_candidates, "unknown_local_candidate_ids": unknown_local_candidates, "unknown_distance_indices": unknown_distances, "unknown_edge_ids": unknown_edges})
+    previous = pipeline.get("manual_confirmation") or {}
+    accepted = set(str(item) for item in previous.get("candidate_ids") or [])
+    kept_local = set(str(item) for item in previous.get("keep_local_candidate_ids") or [])
+    accepted.update(str(item) for item in body.candidate_ids)
+    kept_local.update(str(item) for item in body.keep_local_candidate_ids)
+    # A later choice for the same candidate replaces the earlier choice.
+    accepted -= kept_local
+    kept_local -= accepted
+    distance_indices = set(int(item) for item in previous.get("intermediate_distance_indices") or [])
+    distance_indices.update(int(item) for item in body.intermediate_distance_indices)
+    edge_ids = set(str(item) for item in previous.get("edge_ids") or [])
+    edge_ids.update(str(item) for item in body.edge_ids)
+    confirmation = {
+        "candidate_ids": sorted(accepted),
+        "keep_local_candidate_ids": sorted(kept_local),
+        "intermediate_distance_indices": sorted(distance_indices),
+        "edge_ids": sorted(edge_ids),
+        "candidate_assessments": [assessments[item] for item in sorted(accepted)],
+        "kept_local_assessments": [assessments[item] for item in sorted(kept_local)],
+        "intermediate_distances": [distances[item] for item in sorted(distance_indices)],
+        "edge_routes": [routes[item] for item in sorted(edge_ids)],
+        "confirmed_at": now(),
+        "source": "user_manual_confirmation",
+    }
+    pipeline["manual_confirmation"] = confirmation
+    payload = ((line or {}).get("provider_trace") or {}).get("payload")
+    if payload:
+        provider["calculated_lengths"] = calculate_provider_length_summary(payload, provider, confirmation)
+        pipeline["provider_result"] = provider
+    pipeline["applied_provider_changes"] = bool(
+        confirmation["candidate_ids"] or confirmation["keep_local_candidate_ids"] or confirmation["intermediate_distance_indices"] or confirmation["edge_ids"]
+    )
+    analysis["pipeline_length"] = pipeline
+    line["analysis"] = analysis
+    if persisted_state:
+        target_line = persisted_state.lines.get(body.line_id)
+        if target_line:
+            target_line.analysis = analysis
+            _persist(persisted_state)
+            return run_dict(persisted_state)
+    run_dict_value["lines"] = [line if item.get("line_id") == body.line_id else item for item in run_dict_value.get("lines", [])]
+    run_db.save_run(run_dict_value)
+    return run_dict_value
+
+
 @app.get("/api/prompts/{name}")
 def get_prompt(name: str) -> dict[str, Any]:
     from src import prompts
@@ -552,8 +641,8 @@ def create_run(body: AnalyzeBody) -> dict[str, Any]:
     if not document:
         raise HTTPException(404, "Документ не найден")
     stop_stage = (body.stop_stage or "dimension_review").strip().lower()
-    if stop_stage not in {"local_processing", "prepare", "dimensions", "dimension_review"}:
-        raise HTTPException(400, "stop_stage: local_processing|dimension_review")
+    if stop_stage not in {"local_processing", "prepare", "dimensions", "pipeline_length", "dimension_review"}:
+        raise HTTPException(400, "stop_stage: local_processing|pipeline_length|dimension_review")
     if stop_stage in {"prepare", "dimensions"}:
         stop_stage = "local_processing"
     provider = (body.provider or ENV.get("AI_PROVIDER", "deepseek") or "deepseek").strip().lower()
@@ -575,6 +664,7 @@ def create_run(body: AnalyzeBody) -> dict[str, Any]:
         source_name=document["source_name"],
         pdf_path=document["pdf_path"],
         line_ids=list(body.line_ids),
+        excluded_pages=sorted(excluded_pages),
         stop_stage=stop_stage,
         created_at=now(),
         kind=kind,
@@ -655,14 +745,33 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                     _persist(run)
                     return
 
-            if stop_stage in {"local_processing", "dimensions", "dimension_review"}:
+            if stop_stage in {"local_processing", "dimensions", "pipeline_length", "dimension_review"}:
                 page_run.stage = "dimensions"
                 page_run.status = "running"
                 page_run.events.append({"time": now(), "stage": "dimensions", "message": "локальная обработка: разметка и привязка размеров"})
                 pdf_stem = Path(pdf_path).stem
                 dimensions_pdf = run_dir / f"{pdf_stem}_page{page_run.page_number}_dimensions_marked.pdf"
                 dimensions_json = run_dir / f"{pdf_stem}_page{page_run.page_number}_dimensions.json"
-                mapping = run_dimension_mapping(pdf_path, page_run.page_number, dimensions_pdf, dimensions_json)
+                pipeline_length_mode = stop_stage == "pipeline_length"
+                mapping = run_dimension_mapping(
+                    pdf_path,
+                    page_run.page_number,
+                    dimensions_pdf,
+                    dimensions_json,
+                    finalize=not pipeline_length_mode,
+                )
+                if pipeline_length_mode:
+                    diagnostic_pdf = run_dir / f"{pdf_stem}_page{page_run.page_number}_pipeline_length_diagnostic.pdf"
+                    save_pipeline_length_diagnostic_pdf(pdf_path, page_run.page_number, diagnostic_pdf, mapping)
+                    page_run.analysis = {"pipeline_length_local": mapping}
+                    page_run.files["dimensions_pdf"] = dimensions_pdf.name
+                    page_run.files["dimensions_json"] = dimensions_json.name
+                    page_run.files["pipeline_length_diagnostic_pdf"] = diagnostic_pdf.name
+                    page_run.stage = "pipeline_length"
+                    page_run.status = "local_complete"
+                    page_run.events.append({"time": now(), "stage": "pipeline_length", "message": "локальный снимок готов, ожидается общий расчет по линии"})
+                    _persist(run)
+                    return
                 with fitz.open(str(pdf_path)) as source_document:
                     mapping["handwheels"] = _handwheel_details(
                         source_document[page_run.page_number - 1],
@@ -785,6 +894,79 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
             _persist(run)
         for future in futures:
             future.result()
+
+    if stop_stage == "pipeline_length":
+        for line in run.lines.values():
+            local_pages = [
+                (page_run.page_number, (page_run.analysis or {}).get("pipeline_length_local"))
+                for page_run in line.page_results.values()
+                if (page_run.analysis or {}).get("pipeline_length_local")
+            ]
+            if not local_pages or any(page_run.status == "error" for page_run in line.page_results.values()):
+                line.status = "error"
+                line.error = "Не удалось собрать локальные данные для расчета длины"
+                continue
+            try:
+                line.events.append({"time": now(), "stage": "pipeline_length", "message": "сбор payload по всем листам линии"})
+                payload = build_pipeline_length_payload(line.line_id, run.source_name, local_pages)
+                line.analysis = {
+                    "pipeline_length": {
+                        "payload_summary": {
+                            "analysis_type": payload["analysis_type"],
+                            "line_id": payload["line_id"],
+                            "pages": payload["cross_page_context"]["page_order"],
+                        },
+                    }
+                }
+                line_dir = ARTIFACTS_DIR / run.run_id / line.line_id
+                payload_path = line_dir / f"{Path(run.source_name).stem}_{line.line_id}_pipeline_length_payload.json"
+                text_path = line_dir / f"{Path(run.source_name).stem}_{line.line_id}_pipeline_length.txt"
+                response_path = line_dir / f"{Path(run.source_name).stem}_{line.line_id}_pipeline_length_response.json"
+                payload_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                text_path.write_text(build_pipeline_length_text(payload), encoding="utf-8")
+                line.events.append({"time": now(), "stage": "pipeline_length", "message": f"отправка payload провайдеру по листам ({provider})"})
+                _persist(run)
+                page_traces = []
+                for page in payload.get("pages") or []:
+                    page_payload = build_pipeline_length_page_payload(payload, page)
+                    line.events.append({"time": now(), "stage": "pipeline_length", "message": f"лист {page.get('page')}: запрос провайдеру"})
+                    _persist(run)
+                    page_trace = run_pipeline_length_provider(page_payload, api_key, model, provider=provider)
+                    page_traces.append(page_trace)
+                    line.events.append({
+                        "time": now(),
+                        "stage": "pipeline_length",
+                        "message": f"лист {page.get('page')}: ответ получен за {page_trace.get('elapsed_seconds')} с",
+                    })
+                    _persist(run)
+                trace = merge_pipeline_length_provider_traces(payload, page_traces)
+                line.events.append({"time": now(), "stage": "pipeline_length", "message": "ответы провайдера по листам собраны, разбор результата"})
+                result = build_pipeline_length_result(payload, trace["answer"])
+                response_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+                line.analysis["pipeline_length"] = result
+                line.provider_trace = trace
+                line.files = {
+                    "pipeline_length_payload_json": payload_path.name,
+                    "pipeline_length_text": text_path.name,
+                    "pipeline_length_response_json": response_path.name,
+                }
+                for page_run in line.page_results.values():
+                    page_run.stage = "pipeline_length"
+                    page_run.status = "complete"
+                    page_run.events.append({"time": now(), "stage": "pipeline_length", "message": "расчет линии готов, предложения требуют ручного подтверждения"})
+                line.status = "complete"
+            except Exception as error:  # noqa: BLE001
+                line.status = "error"
+                line.error = str(error)
+                line.events.append({"time": now(), "stage": "pipeline_length", "message": f"ошибка провайдера: {error}"})
+                for page_run in line.page_results.values():
+                    page_run.status = "error"
+                    page_run.error = str(error)
+            _persist(run)
+        statuses = {line.status for line in run.lines.values()}
+        run.status = "error" if "error" in statuses else "complete"
+        _persist(run)
+        return
 
     for line in run.lines.values():
         statuses = {page_run.status for page_run in line.page_results.values()}
@@ -910,7 +1092,58 @@ def _run_export_rows(run: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     vertices = []
     coordinates = []
     analyses = []
+    pipeline_totals = []
+    branch_rows = []
+    local_decisions = []
+    provider_reviews = []
+    page_length_rows = []
+    handwheels = []
+    cross_sheet = []
+    line_rows = []
+    point_rows = []
+    segment_rows = []
+    element_rows = []
+    uncertainty_rows = []
     for line in run.get("lines", []):
+        line_pipeline = (line.get("analysis") or {}).get("pipeline_length") or {}
+        line_local = line_pipeline.get("local_result") or {}
+        line_provider = line_pipeline.get("provider_result") or {}
+        line_lengths = line_provider.get("calculated_lengths") or line_provider.get("lengths") or {}
+        local_lengths = line_local.get("main") or {}
+        local_branch = line_local.get("branch") or {}
+        line_pages = [page.get("page_number") for page in line.get("page_results", [])]
+        line_files = line.get("files") or {}
+        provider_file = line_files.get("pipeline_length_response_json", "")
+        support_count = 0
+        valve_count = 0
+        for page in line.get("page_results", []):
+            page_analysis = page.get("analysis") or {}
+            page_elements = page_analysis.get("elements") or []
+            support_count += sum(1 for item in page_elements if str(item.get("element_type") or item.get("type") or "").lower() == "support")
+            valve_count += sum(1 for item in page_elements if str(item.get("element_type") or item.get("type") or "").lower() in {"valve", "handwheel", "valve / handwheel"})
+            local_page = page_analysis.get("pipeline_length_local") or {}
+            valve_count += len((local_page.get("handwheel_annotations") or {}).get("handwheels") or [])
+        line_rows.append({
+            "line_id": line.get("line_id"),
+            "pages": ", ".join(str(page) for page in line_pages),
+            "local_main_length_mm": local_lengths.get("clean_length_mm") or line_local.get("clean_length_mm"),
+            "local_branch_length_mm": local_branch.get("clean_length_mm", 0.0),
+            "local_total_length_mm": line_local.get("clean_length_mm"),
+            "main_length_mm": (line_lengths.get("main") or {}).get("clean_length_mm"),
+            "branch_length_mm": (line_lengths.get("branch") or {}).get("clean_length_mm"),
+            "total_length_mm": line_lengths.get("total_clean_length_mm"),
+            "provider_minus_local_mm": ((line_lengths.get("total_clean_length_mm") or 0) - (line_local.get("clean_length_mm") or 0)) if line_pipeline else None,
+            "supports_count": support_count,
+            "valves_count": valve_count,
+            "completeness_status": line.get("status"),
+            "error": line.get("error", ""),
+            "pipeline_payload": line_files.get("pipeline_length_payload_json", ""),
+            "provider_response": provider_file,
+            "provider_elapsed_seconds": (line.get("provider_trace") or {}).get("elapsed_seconds"),
+            "provider_total_tokens": (line.get("provider_trace") or {}).get("total_tokens"),
+            "provider_fixes": len((line_pipeline.get("manual_confirmation") or {}).get("candidate_ids") or []),
+            "local_kept": len((line_pipeline.get("manual_confirmation") or {}).get("keep_local_candidate_ids") or []),
+        })
         for page in line.get("page_results", []):
             base = {
                 "line_id": line.get("line_id"),
@@ -920,12 +1153,25 @@ def _run_export_rows(run: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
                 "error": page.get("error", ""),
                 "numbers_count": len(page.get("numbers", [])),
                 "vertices_count": len(page.get("vertices", [])),
+                "diagnostic_pdf": (page.get("files") or {}).get("pipeline_length_diagnostic_pdf", ""),
             }
             pages.append(base)
             for item in page.get("numbers", []):
                 numbers.append({"line_id": line.get("line_id"), "page_number": page.get("page_number"), **item})
             for item in page.get("vertices", []):
                 vertices.append({"line_id": line.get("line_id"), "page_number": page.get("page_number"), **item})
+                point_rows.append({
+                    "point_id": item.get("id"),
+                    "line_id": line.get("line_id"),
+                    "page_number": page.get("page_number"),
+                    "purpose": item.get("role"),
+                    "x": item.get("x"),
+                    "y": item.get("y"),
+                    "z": item.get("z"),
+                    "coordinate_source": item.get("source") or "base vertex geometry",
+                    "source_area": json.dumps(item.get("bbox"), ensure_ascii=False) if item.get("bbox") else "",
+                    "diagnostic_pdf": base["diagnostic_pdf"],
+                })
             for item in page.get("coordinates", []):
                 coordinates.append({"line_id": line.get("line_id"), "page_number": page.get("page_number"), **item})
             if page.get("analysis"):
@@ -944,6 +1190,184 @@ def _run_export_rows(run: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
                     "stage": event.get("stage", ""),
                     "message": event.get("message", ""),
                 })
+            local_snapshot = (page.get("analysis") or {}).get("pipeline_length_local") or {}
+            pipeline_page_result = (line_pipeline.get("local_result") or {}).get("page_summaries") or []
+            page_summary = next((item for item in pipeline_page_result if item.get("page") == page.get("page_number")), None)
+            if page_summary:
+                page_length_rows.append({
+                    "line_id": line.get("line_id"),
+                    "page_number": page.get("page_number"),
+                    "local_clean_mm": page_summary.get("clean_length_mm"),
+                    "local_dirty_mm": page_summary.get("dirty_length_mm"),
+                    "local_ambiguous_mm": page_summary.get("ambiguous_length_mm"),
+                    "diagnostic_pdf": base["diagnostic_pdf"],
+                })
+            base_edges = local_snapshot.get("base_edges") or local_snapshot.get("edges") or []
+            dimensions_by_edge = {}
+            for dimension in local_snapshot.get("dimensions") or []:
+                if dimension.get("edge_id"):
+                    dimensions_by_edge.setdefault(dimension.get("edge_id"), []).append(dimension)
+            for edge in base_edges:
+                edge_id = edge.get("id")
+                source_dimensions = dimensions_by_edge.get(edge_id) or []
+                segment_rows.append({
+                    "segment_id": f"{line.get('line_id')}:{page.get('page_number')}:{edge_id}",
+                    "line_id": line.get("line_id"),
+                    "page_number": page.get("page_number"),
+                    "from_point": edge.get("from_vertex") or edge.get("from_node_id"),
+                    "to_point": edge.get("to_vertex") or edge.get("to_node_id"),
+                    "dn": edge.get("dn"),
+                    "length_mm": round(sum(float(item.get("value_mm") or item.get("value") or 0.0) for item in source_dimensions if (item.get("local_decision") or {}).get("decision", item.get("local_filter_decision")) == "include"), 2) or None,
+                    "pixel_length": edge.get("pixel_length"),
+                    "source_dimensions": ", ".join(str(item.get("id")) for item in source_dimensions),
+                    "source_dimension_values": ", ".join(str(item.get("value")) for item in source_dimensions),
+                    "source_page": page.get("page_number"),
+                    "diagnostic_pdf": base["diagnostic_pdf"],
+                })
+            for item in (local_snapshot.get("handwheel_annotations") or {}).get("handwheels") or []:
+                handwheels.append({
+                    "line_id": line.get("line_id"),
+                    "page_number": page.get("page_number"),
+                    "handwheel_id": item.get("id"),
+                    "label": item.get("label"),
+                    "arrow_found": item.get("arrow_found"),
+                    "edge_id": item.get("edge_id"),
+                    "arrow_end": json.dumps(item.get("arrow_end"), ensure_ascii=False),
+                })
+                element_rows.append({
+                    "element_id": item.get("id"),
+                    "element_type": "valve / handwheel",
+                    "line_id": line.get("line_id"),
+                    "page_number": page.get("page_number"),
+                    "attached_edge": item.get("edge_id"),
+                    "attached_point": "",
+                    "x": (item.get("arrow_end") or [None, None])[0],
+                    "y": (item.get("arrow_end") or [None, None])[1],
+                    "z": None,
+                    "source_area": json.dumps(item.get("bbox"), ensure_ascii=False) if item.get("bbox") else "",
+                    "diagnostic_pdf": base["diagnostic_pdf"],
+                })
+            for dimension in local_snapshot.get("dimensions") or []:
+                local_decisions.append({
+                    "line_id": line.get("line_id"),
+                    "page_number": page.get("page_number"),
+                    "candidate_id": dimension.get("id"),
+                    "value_mm": dimension.get("value"),
+                    "decision": dimension.get("local_filter_decision"),
+                    "reason": dimension.get("local_filter_reason"),
+                    "conflict_with": dimension.get("local_filter_conflict_with"),
+                    "source_edge": dimension.get("edge_id"),
+                    "bbox": json.dumps(dimension.get("bbox"), ensure_ascii=False) if dimension.get("bbox") else "",
+                    "diagnostic_pdf": base["diagnostic_pdf"],
+                })
+                if dimension.get("local_filter_decision") == "ambiguous":
+                    uncertainty_rows.append({
+                        "line_id": line.get("line_id"),
+                        "page_number": page.get("page_number"),
+                        "object_id": dimension.get("id"),
+                        "object_type": "dimension candidate",
+                        "reason": dimension.get("local_filter_reason") or "ambiguous local decision",
+                        "missing_information": "manual review",
+                    })
+        pipeline = (line.get("analysis") or {}).get("pipeline_length") or {}
+        if pipeline:
+            local = pipeline.get("local_result") or {}
+            provider = pipeline.get("provider_result") or {}
+            calculated = provider.get("calculated_lengths") or provider.get("lengths") or {}
+            pipeline_totals.append({
+                "line_id": line.get("line_id"),
+                "local_clean_mm": local.get("clean_length_mm"),
+                "local_dirty_mm": local.get("dirty_length_mm"),
+                "local_ambiguous_mm": local.get("ambiguous_length_mm"),
+                "provider_clean_mm": calculated.get("total_clean_length_mm"),
+                "provider_dirty_mm": calculated.get("total_dirty_length_mm"),
+                "provider_ambiguous_mm": calculated.get("total_ambiguous_length_mm"),
+                "manual_confirmation": json.dumps(pipeline.get("manual_confirmation") or {}, ensure_ascii=False),
+                "payload_file": (line.get("files") or {}).get("pipeline_length_payload_json", ""),
+                "response_file": (line.get("files") or {}).get("pipeline_length_response_json", ""),
+            })
+            for branch in calculated.get("branches") or []:
+                branch_rows.append({
+                    "line_id": line.get("line_id"),
+                    "branch_id": branch.get("branch_id"),
+                    "name": branch.get("name"),
+                    "junction_vertex_id": branch.get("junction_vertex_id"),
+                    "endpoint_vertex_id": branch.get("endpoint_vertex_id"),
+                    "edge_ids": ", ".join(str(item) for item in branch.get("edge_ids") or []),
+                    "candidate_ids": ", ".join(str(item) for item in branch.get("candidate_ids") or []),
+                    "clean_length_mm": branch.get("clean_length_mm"),
+                    "dirty_length_mm": branch.get("dirty_length_mm"),
+                    "ambiguous_length_mm": branch.get("ambiguous_length_mm"),
+                })
+            estimates = local.get("candidate_estimates") or []
+            if not estimates:
+                payload_pages = ((line.get("provider_trace") or {}).get("payload") or {}).get("pages") or []
+                estimates = [
+                    {
+                        "candidate_id": dimension.get("id"),
+                        "candidate_key": dimension.get("candidate_key"),
+                        "page": page_data.get("page"),
+                        "value_mm": dimension.get("value_mm"),
+                        "local_decision": (dimension.get("local_decision") or {}).get("decision"),
+                        "reason": (dimension.get("local_decision") or {}).get("reason"),
+                    }
+                    for page_data in payload_pages
+                    for dimension in page_data.get("dimensions") or []
+                ]
+            reviews = {str(item.get("candidate_id")): item for item in provider.get("candidate_assessments") or []}
+            manual = pipeline.get("manual_confirmation") or {}
+            selected_provider = {str(item) for item in manual.get("candidate_ids") or []}
+            selected_local = {str(item) for item in manual.get("keep_local_candidate_ids") or []}
+            for estimate in estimates:
+                key = str(estimate.get("candidate_key") or estimate.get("candidate_id"))
+                review = reviews.get(key) or next((item for candidate_id, item in reviews.items() if candidate_id.endswith(":" + str(estimate.get("candidate_id")))), {})
+                manual_choice = "provider" if key in selected_provider else ("local" if key in selected_local else "")
+                provider_decision = estimate.get("local_decision")
+                if review.get("proposed_decision"):
+                    provider_decision = review.get("proposed_decision")
+                elif review.get("assessment") in {"disputed", "insufficient"}:
+                    provider_decision = "ambiguous"
+                provider_reviews.append({
+                    "line_id": line.get("line_id"),
+                    "page_number": estimate.get("page"),
+                    "candidate_id": key,
+                    "value_mm": estimate.get("value_mm"),
+                    "local_decision": estimate.get("local_decision"),
+                    "local_reason": estimate.get("reason"),
+                    "provider_assessment": review.get("assessment"),
+                    "provider_proposed_decision": review.get("proposed_decision"),
+                    "provider_reason": review.get("reason"),
+                    "provider_effective_decision": provider_decision,
+                    "manual_choice": manual_choice,
+                    "counted_locally_mm": estimate.get("value_mm") if estimate.get("local_decision") == "include" else 0,
+                    "counted_provider_mm": estimate.get("value_mm") if provider_decision == "include" else 0,
+                })
+            cross_sheet_items = list(
+                provider.get("cross_sheet_measurements")
+                or provider.get("intermediate_distances")
+                or []
+            )
+            for item in provider.get("cross_sheet_links") or []:
+                cross_sheet_items.append({"kind": "cross_sheet_link", **item})
+            for item in cross_sheet_items:
+                cross_sheet.append({"line_id": line.get("line_id"), **item})
+            for item in provider.get("candidate_assessments") or []:
+                if item.get("assessment") in {"disputed", "insufficient"}:
+                    uncertainty_rows.append({
+                        "line_id": line.get("line_id"),
+                        "page_number": str(item.get("candidate_id", "")).split(":", 1)[0],
+                        "object_id": item.get("candidate_id"),
+                        "object_type": "provider review",
+                        "reason": item.get("reason"),
+                        "missing_information": item.get("proposed_decision") or item.get("assessment"),
+                    })
+            trace_answer = (line.get("provider_trace") or {}).get("answer")
+            if trace_answer:
+                analyses.append({
+                    "line_id": line.get("line_id"),
+                    "page_number": "line",
+                    "analysis_json": json.dumps(trace_answer, ensure_ascii=False),
+                })
     return {
         "Страницы": pages,
         "Числа": numbers,
@@ -952,6 +1376,20 @@ def _run_export_rows(run: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
         "Анализ": analyses,
         "События": events,
         "Ошибки": errors,
+        "Расчет длины": pipeline_totals,
+        "Ответвления": branch_rows,
+        "Расчет по листам": page_length_rows,
+        "Локальные решения": local_decisions,
+        "Кандидаты длины": provider_reviews,
+        "Сравнение": provider_reviews,
+        "Штурвалы": handwheels,
+        "Межлистовые": cross_sheet,
+        "Линии": line_rows,
+        "Итоги": line_rows,
+        "Точки": point_rows,
+        "Участки": segment_rows,
+        "Элементы": element_rows,
+        "Неопределенности": uncertainty_rows,
     }
 
 
@@ -1064,12 +1502,17 @@ def run_dict(run: RunState) -> dict[str, Any]:
         "status": run.status,
         "source_name": run.source_name,
         "line_ids": run.line_ids,
+        "excluded_pages": run.excluded_pages,
         "lines": [
             {
                 "line_id": line.line_id,
                 "pages": line.pages,
                 "status": line.status,
                 "error": line.error,
+                "files": line.files,
+                "analysis": line.analysis,
+                "provider_trace": line.provider_trace,
+                "events": line.events,
                 "page_results": [
                     {
                         "page_number": page_run.page_number,

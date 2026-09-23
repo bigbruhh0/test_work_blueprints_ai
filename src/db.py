@@ -106,6 +106,38 @@ def load_run(run_id: str) -> dict[str, Any] | None:
     return json.loads(row["data"])
 
 
+def mark_running_runs_interrupted(message: str) -> int:
+    """Convert persisted in-flight runs to a visible interrupted state after restart."""
+    interrupted = 0
+    timestamp = _now()
+    with _connect() as connection:
+        rows = connection.execute("SELECT run_id, data FROM runs WHERE status = 'running'").fetchall()
+        for row in rows:
+            try:
+                data = json.loads(row["data"] or "{}")
+            except (TypeError, ValueError):
+                data = {}
+            if data.get("status") != "running":
+                continue
+            data["status"] = "error"
+            for line in data.get("lines", []):
+                if line.get("status") not in {"complete", "error"}:
+                    line["status"] = "error"
+                    line["error"] = line.get("error") or message
+                    line.setdefault("events", []).append({"time": timestamp, "stage": "error", "message": message})
+                for page in line.get("page_results", []):
+                    if page.get("status") in {"pending", "running"}:
+                        page["status"] = "error"
+                        page["error"] = page.get("error") or message
+                        page.setdefault("events", []).append({"time": timestamp, "stage": "error", "message": message})
+            connection.execute(
+                "UPDATE runs SET status = ?, updated_at = ?, data = ? WHERE run_id = ?",
+                ("error", timestamp, json.dumps(data, ensure_ascii=False), row["run_id"]),
+            )
+            interrupted += 1
+    return interrupted
+
+
 def list_runs() -> list[dict[str, Any]]:
     with _connect() as connection:
         rows = connection.execute(
@@ -134,6 +166,11 @@ def list_runs() -> list[dict[str, Any]]:
             data = {}
         errors = []
         manual_adjustment_count = 0
+        provider_elapsed_seconds = 0.0
+        provider_total_tokens = 0
+        provider_token_values = False
+        provider_fixes = 0
+        local_kept = 0
         feedback = feedback_by_run.get(row["run_id"], {})
         for line in data.get("lines", []):
             if line.get("error"):
@@ -142,6 +179,15 @@ def list_runs() -> list[dict[str, Any]]:
                 if page.get("error"):
                     errors.append(f"стр. {page.get('page_number')}: {page['error']}")
                 manual_adjustment_count += len(((page.get("analysis") or {}).get("manual_adjustments") or {}))
+            trace = line.get("provider_trace") or {}
+            if trace.get("elapsed_seconds") is not None:
+                provider_elapsed_seconds += float(trace.get("elapsed_seconds") or 0.0)
+            if trace.get("total_tokens") is not None:
+                provider_total_tokens += int(trace.get("total_tokens") or 0)
+                provider_token_values = True
+            confirmation = (((line.get("analysis") or {}).get("pipeline_length") or {}).get("manual_confirmation") or {})
+            provider_fixes += len(confirmation.get("candidate_ids") or [])
+            local_kept += len(confirmation.get("keep_local_candidate_ids") or [])
         output.append(
             {
                 "run_id": row["run_id"],
@@ -150,6 +196,7 @@ def list_runs() -> list[dict[str, Any]]:
                 "status": "error" if errors else row["status"],
                 "source_name": row["source_name"],
                 "line_ids": line_ids,
+                "excluded_pages": data.get("excluded_pages", []),
                 "stop_stage": row["stop_stage"],
                 "kind": row["kind"],
                 "kind_label": row["kind_label"],
@@ -158,6 +205,11 @@ def list_runs() -> list[dict[str, Any]]:
                 "error_count": len(errors),
                 "errors": errors[:3],
                 "manual_adjustment_count": manual_adjustment_count,
+                "provider_elapsed_seconds": round(provider_elapsed_seconds, 3) if provider_elapsed_seconds else None,
+                "provider_total_tokens": provider_total_tokens if provider_token_values else None,
+                "provider_fixes": provider_fixes,
+                "local_kept": local_kept,
+                "review_net": provider_fixes - local_kept,
                 "feedback": {
                     "positive": int(feedback.get("positive") or 0),
                     "negative": int(feedback.get("negative") or 0),

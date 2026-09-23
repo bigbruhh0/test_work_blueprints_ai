@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://test-chertezh.local/schemas/pipeline_length_response.schema.json",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["candidate_assessments", "edge_routes", "cross_sheet_links", "intermediate_distances", "lengths"],
+  "properties": {
+    "candidate_assessments": {"type": "array", "items": {"type": "object", "required": ["candidate_id", "assessment"], "additionalProperties": true}},
+    "edge_routes": {"type": "array", "items": {"type": "object", "required": ["edge_id", "route_type"], "additionalProperties": true}},
+    "branch_routes": {"type": "array", "items": {"type": "object", "required": ["branch_id", "edge_ids", "candidate_ids"], "additionalProperties": true}},
+    "route_segments": {"type": "array", "items": {"type": "object", "required": ["segment_id", "route_type", "candidate_ids"], "additionalProperties": true}},
+    "cross_sheet_links": {"type": "array", "items": {"type": "object", "additionalProperties": true}},
+    "intermediate_distances": {"type": "array", "items": {"type": "object", "additionalProperties": true}},
+    "lengths": {"type": "object", "required": ["main", "branch"], "additionalProperties": true}
+  }
+}

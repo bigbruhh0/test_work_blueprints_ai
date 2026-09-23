@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://test-chertezh.local/schemas/pipeline_length_payload.schema.json",
+  "type": "object",
+  "required": ["analysis_type", "line_id", "source_name", "pages", "cross_page_context"],
+  "properties": {
+    "analysis_type": {"const": "pipeline_length"},
+    "line_id": {"type": "string"},
+    "source_name": {"type": "string"},
+    "pages": {"type": "array", "items": {"type": "object", "required": ["page", "vertices", "edges", "dimensions", "local_decisions", "connections", "discarded_numbers", "handwheels", "handwheel_glyphs"], "additionalProperties": true}},
+    "cross_page_context": {"type": "object", "required": ["line_id", "page_order"], "additionalProperties": true}
+  },
+  "additionalProperties": true
+}

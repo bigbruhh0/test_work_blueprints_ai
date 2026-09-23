@@ -1,0 +1,37 @@
+Ты проверяешь расчет длины трубопровода по одному листу. Отвечай только JSON. Все reason/name пиши на русском.
+
+Сделай один быстрый проход:
+1. Для каждого dimensions[*] верни ровно одну candidate_assessment.
+2. Обычно соглашайся с local_decision. Меняй его только при явной ошибке: дублирующий/вложенный размер, размер штурвала, размер смежного листа, явное несоответствие ребру.
+3. Размер штурвала определяй по выносным линиям размерной линии: если выносные/leader/extension указывают на область handwheels или handwheel_glyphs, это размер штурвала/арматуры. В reason обязательно напиши фразу "размер штурвала". Если такой размер не должен входить в длину трубы, предложи proposed_decision="exclude".
+4. Если размер относится к другому листу по явной ссылке со словом "ЛИСТ" и номером, не включай его в длину текущего листа; добавь запись в intermediate_distances с kind="adjacent_sheet_length".
+5. Одиночное "СМ." без слова "ЛИСТ" игнорируй.
+6. Классифицируй только очевидные edge_routes как main/branch. Не восстанавливай длину по пикселям, радиусам и геометрии.
+7. Не придумывай VE/HG/F-* и не запускай повторные циклы.
+
+candidate_id используй как во входе: обычно "<page>:D001".
+
+Верни JSON:
+{
+  "candidate_assessments": [
+    {"candidate_id":"216:D001","local_decision":"include|exclude|ambiguous","assessment":"accepted|disputed|insufficient","proposed_decision":null,"reason":"кратко"}
+  ],
+  "edge_routes": [
+    {"edge_id":"216:E001","route_type":"main|branch","reason":"кратко"}
+  ],
+  "branch_routes": [
+    {"branch_id":"BR-01","name":"ответвление","junction_vertex_id":"V01","endpoint_vertex_id":"V09","edge_ids":["216:E003"],"candidate_ids":["216:D004"],"reason":"кратко"}
+  ],
+  "route_segments": [],
+  "cross_sheet_links": [],
+  "intermediate_distances": [
+    {"kind":"adjacent_sheet_length","from_page":216,"to_page":217,"value_mm":0.0,"source":"216:D001","reason":"кратко","confidence":0.0}
+  ],
+  "lengths": {
+    "main":{"clean_length_mm":0.0,"dirty_length_mm":0.0,"ambiguous_length_mm":0.0},
+    "branch":{"clean_length_mm":0.0,"dirty_length_mm":0.0,"ambiguous_length_mm":0.0},
+    "total_clean_length_mm":0.0,
+    "total_dirty_length_mm":0.0,
+    "total_ambiguous_length_mm":0.0
+  }
+}

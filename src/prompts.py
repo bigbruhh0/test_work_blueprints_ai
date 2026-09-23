@@ -14,6 +14,11 @@ PROMPT_REGISTRY: dict[str, dict[str, str]] = {
         "default_file": str(ROOT / "prompts" / "defaults" / "dimension_review.txt"),
         "usage": "Этап «Карта размеров + проверка провайдером»",
     },
+    "pipeline_length": {
+        "title": "Расчет длины трубопровода",
+        "default_file": str(ROOT / "prompts" / "defaults" / "pipeline_length.txt"),
+        "usage": "Этап «Расчет длины трубопровода»",
+    },
 }
 
 

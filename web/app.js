@@ -1,4 +1,4 @@
-const state = { document: null, runId: null, selected: new Set(), sourceMode: 'local', provider: 'deepseek', config: null, filesByLine: {}, tracesByLine: {}, graphsByLine: {}, selectedPage: {}, currentRun: null, feedback: {}, manualEdit: false, three: null, viewers3d: new Set() };
+const state = { document: null, runId: null, selected: new Set(), sourceMode: 'local', provider: 'deepseek', config: null, filesByLine: {}, tracesByLine: {}, graphsByLine: {}, selectedPage: {}, currentRun: null, feedback: {}, manualEdit: false, providerDecisionEdit: new Set(), three: null, viewers3d: new Set() };
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 const esc = (value) => String(value ?? '').replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -6,6 +6,7 @@ const esc = (value) => String(value ?? '').replace(/[&<>"]/g, (c) => ({'&':'&amp
 const STAGE_LABELS = {
   prepare: 'Локальная подготовка + разметка',
   dimensions: 'Локальная подготовка + привязка размеров',
+  pipeline_length: 'Расчет длины трубопровода',
   dimension_review: 'Карта размеров + проверка провайдером',
   done: 'Готово',
   error: 'Ошибка',
@@ -477,6 +478,15 @@ function renderRun(run) {
   container.innerHTML = '';
   for (const line of run.lines) {
     const badge = line.status === 'complete' ? 'ok' : line.status === 'error' ? 'error' : 'run';
+    const lineRunning = line.status === 'pending' || line.status === 'running';
+    const lineEvents = line.events || [];
+    const lineEventsHtml = lineEvents.map(function (event, index) {
+      const isCurrent = lineRunning && index === lineEvents.length - 1;
+      return '<li class="' + (isCurrent ? 'current' : '') + '">'
+        + (isCurrent ? '<span class="spinner"></span> ' : '')
+        + '<span class="event-stage">' + esc(STAGE_LABELS[event.stage] || event.stage) + '</span>: ' + esc(event.message)
+        + '</li>';
+    }).join('');
     let pagesHtml = '';
     for (const pr of (line.page_results || [])) {
       const prRunning = pr.status === 'running' || pr.status === 'pending';
@@ -503,6 +513,9 @@ function renderRun(run) {
       + esc(line.status) + '</span>'
       + '<span class="group-item-meta">стр. ' + (line.pages || []).join(', ') + '</span></div>'
       + (line.error ? '<div class="badge error">' + esc(line.error) + '</div>' : '')
+      + '<ul class="events line-events">' + (lineEventsHtml || '') + '</ul>'
+      + pipelineLengthSummary(line)
+      + lineArtifactLinks(line.line_id, line, state.runId)
       + pagesHtml;
     container.appendChild(card);
   }
@@ -511,6 +524,7 @@ function renderRun(run) {
 const VIEWER_TABS = [
   { key: 'clean_local_markup_pdf', label: 'Локальная разметка' },
   { key: 'local_dimension_filter_pdf', label: 'Локальная фильтрация размеров' },
+  { key: 'pipeline_length_diagnostic_pdf', label: 'Расчет длины: базовая геометрия' },
   { key: 'final_contour_rays_pdf', label: 'Лучевые привязки финального контура' },
   { key: 'numbers_pdf', label: 'Разметка чисел' },
   { key: 'vertices_pdf', label: 'Вершины' },
@@ -547,6 +561,186 @@ function artifactLinks(lineId, pageResult, runId) {
   return '<div class="row artifacts">' + Object.entries(files).map(function (pair) {
     return '<a class="artifact-tag" href="' + artifactLinkUrl(runId, lineId, pair[1]) + '" download>⭳ ' + esc(pair[0]) + '</a>';
   }).join('') + '</div>';
+}
+
+function lineArtifactLinks(lineId, line, runId) {
+  const files = line.files || {};
+  if (!Object.keys(files).length) return '';
+  return '<div class="row artifacts">' + Object.entries(files).map(function (pair) {
+    return '<a class="artifact-tag" href="' + artifactLinkUrl(runId, lineId, pair[1]) + '" download>⭳ ' + esc(pair[0]) + '</a>';
+  }).join('') + '</div>';
+}
+
+function pipelineLengthEstimates(line) {
+  const analysis = line.analysis && line.analysis.pipeline_length;
+  const local = analysis && analysis.local_result;
+  if (local && Array.isArray(local.candidate_estimates) && local.candidate_estimates.length) return local.candidate_estimates;
+  const pages = line.provider_trace && line.provider_trace.payload && line.provider_trace.payload.pages;
+  if (!Array.isArray(pages)) return [];
+  return pages.flatMap(function (page) {
+    return (page.dimensions || []).map(function (row) {
+      const decision = row.local_decision || {};
+      return {
+        candidate_id: row.id,
+        candidate_key: row.candidate_key || (page.page + ':' + row.id),
+        page: page.page,
+        value_mm: row.value_mm,
+        edge_id: row.edge_id,
+        local_decision: decision.decision,
+        reason: decision.reason,
+      };
+    });
+  });
+}
+
+function formatMm(value) {
+  if (value == null || value === '') return '—';
+  const number = Number(value);
+  if (!Number.isFinite(number)) return String(value);
+  return number.toLocaleString('ru-RU', { maximumFractionDigits: 1 }) + ' мм';
+}
+
+function formatSeconds(value) {
+  if (value == null || value === '') return '—';
+  const number = Number(value);
+  if (!Number.isFinite(number)) return String(value) + ' с';
+  return number.toLocaleString('ru-RU', { maximumFractionDigits: 1 }) + ' с';
+}
+
+function decisionBadge(decision) {
+  const normalized = String(decision || 'ambiguous').toLowerCase();
+  const label = normalized === 'include' ? 'include'
+    : normalized === 'exclude' ? 'exclude'
+      : normalized === 'accepted' ? 'accepted'
+        : normalized === 'disputed' ? 'disputed'
+          : normalized === 'insufficient' ? 'insufficient'
+            : normalized || 'ambiguous';
+  return '<span class="decision-pill decision-' + esc(label.replace(/[^a-z0-9_-]/g, '-')) + '">' + esc(label) + '</span>';
+}
+
+function pipelineLengthSummary(line) {
+  const analysis = line.analysis && line.analysis.pipeline_length;
+  if (!analysis) return '';
+  const local = analysis.local_result || {};
+  const estimates = pipelineLengthEstimates(line);
+  const localClean = local.clean_length_mm ?? estimates.filter(function (row) { return row.local_decision === 'include'; }).reduce(function (sum, row) { return sum + Number(row.value_mm || 0); }, 0);
+  const localDirty = local.dirty_length_mm ?? estimates.filter(function (row) { return row.local_decision !== 'exclude'; }).reduce(function (sum, row) { return sum + Number(row.value_mm || 0); }, 0);
+  const provider = analysis.provider_result || {};
+  const manual = analysis.manual_confirmation || {};
+  const lengths = provider.calculated_lengths || provider.lengths || {};
+  const trace = line.provider_trace || {};
+  const route = function (label, value) {
+    value = value || {};
+    return '<div class="pipeline-route-card ' + (label === 'Ответвления' ? 'branch' : 'main') + '"><span>' + esc(label) + '</span><strong>' + esc(formatMm(value.clean_length_mm)) + '</strong><small>грязная ' + esc(formatMm(value.dirty_length_mm)) + ' · сомнения ' + esc(formatMm(value.ambiguous_length_mm)) + '</small></div>';
+  };
+  const assessments = Array.isArray(provider.candidate_assessments) ? provider.candidate_assessments : [];
+  const disputes = assessments.filter(function (item) { return item.assessment === 'disputed' || item.assessment === 'insufficient'; });
+  const intermediate = Array.isArray(provider.intermediate_distances) ? provider.intermediate_distances : [];
+  const branches = Array.isArray(lengths.branches) ? lengths.branches : [];
+  const manualAccepted = (manual.candidate_ids || []).length;
+  const manualKept = (manual.keep_local_candidate_ids || []).length;
+  const handwheelCount = (line.page_results || []).reduce(function (total, page) {
+    const snapshot = page.analysis && page.analysis.pipeline_length_local;
+    const annotations = snapshot && snapshot.handwheel_annotations;
+    return total + (annotations && Array.isArray(annotations.glyphs) ? annotations.glyphs.length : 0);
+  }, 0);
+  return '<details class="pipeline-summary collapsible-result" open><summary>Расчет длины трубопровода</summary>'
+    + '<div class="pipeline-summary-grid">'
+    + '<div class="pipeline-total-card local"><small>Локальный расчет</small><strong>' + esc(formatMm(localClean)) + '</strong><span>грязная ' + esc(formatMm(localDirty)) + ' · сомнения ' + esc(formatMm(local.ambiguous_length_mm)) + '</span></div>'
+    + '<div class="pipeline-total-card provider"><small>Подтверждение провайдера</small><strong>' + esc(formatMm(lengths.total_clean_length_mm)) + '</strong><span>грязная ' + esc(formatMm(lengths.total_dirty_length_mm)) + ' · сомнения ' + esc(formatMm(lengths.total_ambiguous_length_mm)) + '</span></div>'
+    + '<div class="pipeline-total-card trace"><small>AI запрос</small><strong>' + esc(formatSeconds(trace.elapsed_seconds)) + '</strong><span>' + esc(trace.total_tokens != null ? trace.total_tokens + ' токенов' : 'токены: —') + '</span></div>'
+    + '<div class="pipeline-total-card manual"><small>Ручные решения</small><strong>+' + esc(manualAccepted) + ' / −' + esc(manualKept) + '</strong><span>+ провайдер · − локальное</span></div>'
+    + '</div>'
+    + '<div class="pipeline-route-grid">' + route('Основная линия', lengths.main) + route('Ответвления', lengths.branch) + '</div>'
+    + '<div class="pipeline-meta-row">'
+    + '<span>Штурвалы: <b>' + esc(handwheelCount) + '</b></span>'
+    + '<span>Спорные: <b>' + esc(disputes.length) + '</b></span>'
+    + '<span>Смежные: <b>' + esc(intermediate.length) + '</b></span>'
+    + '<span>Автоприменение: <b>нет</b></span>'
+    + '</div>'
+    + (branches.length ? '<div class="pipeline-chip-row">' + branches.map(function (branch) { return '<span class="pipeline-chip">' + esc(branch.branch_id || 'BR') + ' · ' + esc(formatMm(branch.clean_length_mm)) + '</span>'; }).join('') + '</div>' : '')
+    + (disputes.length ? '<p class="pipeline-note"><b>Требуют внимания:</b> ' + esc(disputes.map(function (item) { return item.candidate_id; }).join(', ')) + '</p>' : '')
+    + (intermediate.length ? '<p class="pipeline-note"><b>Смежные расстояния:</b> ' + esc(intermediate.map(function (item) { return (item.from_page || '?') + '→' + (item.to_page || '?') + ': ' + (item.value_mm || '?') + ' мм'; }).join('; ')) + '</p>' : '')
+    + '</details>';
+}
+
+function pipelineProviderAssessment(provider, estimate) {
+  const assessments = Array.isArray(provider && provider.candidate_assessments) ? provider.candidate_assessments : [];
+  const key = String(estimate.candidate_key || '');
+  const id = String(estimate.candidate_id || '');
+  const item = assessments.find(function (candidate) {
+    const candidateId = String(candidate.candidate_id || '');
+    return candidateId === key || candidateId === id || candidateId.endsWith(':' + id);
+  });
+  if (!item) return '<span class="muted">нет ответа</span>';
+  const proposed = item.proposed_decision ? ' · предложение: ' + item.proposed_decision : '';
+  return decisionBadge(item.assessment || 'без оценки') + (proposed ? '<span class="provider-proposal">' + esc(proposed) + '</span>' : '')
+    + (item.reason ? '<br><span class="muted">' + esc(item.reason) + '</span>' : '');
+}
+
+function pipelineLengthPageDetail(line, pageNumber) {
+  const analysis = line.analysis && line.analysis.pipeline_length;
+  if (!analysis) return '';
+  const local = analysis.local_result || {};
+  const provider = analysis.provider_result || {};
+  const manual = analysis.manual_confirmation || {};
+  const pageResult = (line.page_results || []).find(function (page) { return Number(page.page_number) === Number(pageNumber); });
+  const diagnosticFile = pageResult && pageResult.files && pageResult.files.pipeline_length_diagnostic_pdf;
+  const diagnosticMarkup = diagnosticFile
+    ? '<details class="notes collapsible-result" open><summary>Изображение для проверки провайдера</summary><img class="viewer-frame" src="' + viewerImageUrl(state.runId, line.line_id, diagnosticFile) + '" alt="Диагностика расчета длины, лист ' + esc(pageNumber) + '"></details>'
+    : '';
+  const estimates = pipelineLengthEstimates(line).filter(function (row) { return Number(row.page) === Number(pageNumber); });
+  const pageSummary = (local.page_summaries || []).find(function (row) { return Number(row.page) === Number(pageNumber); }) || {
+    clean_length_mm: estimates.filter(function (row) { return row.local_decision === 'include'; }).reduce(function (sum, row) { return sum + Number(row.value_mm || 0); }, 0),
+  };
+  const rows = estimates.map(function (row) {
+    const matchingAssessment = (provider.candidate_assessments || []).find(function (item) {
+      const candidateId = String(item.candidate_id || '');
+      return candidateId === String(row.candidate_key) || candidateId.endsWith(':' + String(row.candidate_id));
+    });
+    const candidateKey = row.candidate_key || row.candidate_id;
+    const providerCandidateId = matchingAssessment?.candidate_id || row.candidate_key || row.candidate_id;
+    const providerAssessment = String(matchingAssessment?.assessment || '').toLowerCase();
+    const providerProposal = matchingAssessment?.proposed_decision;
+    const localDecision = row.local_decision || 'ambiguous';
+    const manuallyAccepted = (manual.candidate_ids || []).map(String).includes(String(candidateKey)) || (manual.candidate_ids || []).some(function (item) { return String(item).endsWith(':' + String(row.candidate_id)); });
+    const manuallyKept = (manual.keep_local_candidate_ids || []).map(String).includes(String(candidateKey)) || (manual.keep_local_candidate_ids || []).some(function (item) { return String(item).endsWith(':' + String(row.candidate_id)); });
+    const manualChoice = manuallyAccepted
+      ? 'принято решение провайдера'
+      : (manuallyKept ? 'оставлено локальное решение' : '');
+    const editKey = [line.line_id, providerCandidateId].join('|');
+    const isEditingManualChoice = state.providerDecisionEdit.has(editKey);
+    const actionableProposal = matchingAssessment && providerAssessment !== 'accepted' && providerProposal && providerProposal !== localDecision;
+    const showDecisionButtons = actionableProposal && (!manualChoice || isEditingManualChoice);
+    const manualMarkup = manualChoice
+      ? '<br><span class="manual-choice">ручной фикс: ' + esc(manualChoice) + '</span>'
+        + (!isEditingManualChoice ? '<button type="button" class="provider-edit-button" data-provider-edit="' + esc(editKey) + '">Изменить</button>' : '')
+      : '';
+    return '<tr><td><b>' + esc(row.candidate_key || row.candidate_id) + '</b><br><span class="muted">' + esc(row.edge_id || 'без ребра') + '</span></td>'
+      + '<td><b>' + esc(formatMm(row.value_mm)) + '</b><br>' + decisionBadge(row.local_decision || 'ambiguous') + '<br><span class="muted">' + esc(row.reason || '') + '</span></td>'
+      + '<td>' + pipelineProviderAssessment(provider, row) + manualMarkup
+      + (showDecisionButtons ? '<div class="provider-actions"><button type="button" class="provider-confirm-button" data-provider-line="' + esc(line.line_id) + '" data-provider-action="accept" data-provider-candidate="' + esc(providerCandidateId) + '">Принять провайдера</button>'
+        + '<button type="button" class="provider-confirm-button secondary" data-provider-line="' + esc(line.line_id) + '" data-provider-action="keep_local" data-provider-candidate="' + esc(providerCandidateId) + '">Оставить локальное</button></div>' : '')
+      + '</td></tr>';
+  }).join('');
+  return diagnosticMarkup + '<section class="pipeline-length-page">'
+    + '<div class="pipeline-page-heading"><h2>Лист ' + esc(pageNumber) + '</h2><span>предварительная сумма ' + esc(formatMm(pageSummary.clean_length_mm ?? 0)) + '</span></div>'
+    + '<div class="table-wrap pipeline-review-wrap"><table class="data-table pipeline-review-table"><thead><tr><th>Кандидат</th><th>Локальное решение</th><th>Подтверждение провайдера</th></tr></thead><tbody>'
+    + (rows || '<tr><td colspan="3">Размерных кандидатов нет</td></tr>')
+    + '</tbody></table></div></section>';
+}
+
+function pipelineHandwheelBlock(line) {
+  const rows = [];
+  (line.page_results || []).forEach(function (page) {
+    const annotations = page.analysis && page.analysis.pipeline_length_local && page.analysis.pipeline_length_local.handwheel_annotations;
+    (annotations && annotations.handwheels || []).forEach(function (item) {
+      rows.push('<tr><td>' + esc(page.page_number) + '</td><td>' + esc(item.id || 'HW') + '</td><td>' + esc(item.label || 'штурвал') + '</td><td>' + esc(item.arrow_found ? 'найден lead' : 'без lead') + '</td><td>' + esc(item.edge_id || '—') + '</td></tr>');
+    });
+  });
+  return '<details class="notes collapsible-result" open><summary>Штурвалы (' + rows.length + ')</summary>'
+    + (rows.length ? '<table class="viewer-table"><thead><tr><th>Лист</th><th>ID</th><th>Обозначение</th><th>Привязка</th><th>Базовое ребро</th></tr></thead><tbody>' + rows.join('') + '</tbody></table>' : '<p class="muted">Штурвалы не найдены.</p>')
+    + '</details>';
 }
 
 function viewerCard(lineId, pageResult, runId) {
@@ -638,7 +832,8 @@ function renderTrace(trace) {
     + (trace.prompt_version != null ? 'промпт: v' + esc(trace.prompt_version) + ' · ' : '')
     + (trace.prompt_sha256 ? 'sha256: ' + esc(String(trace.prompt_sha256).slice(0, 12)) + ' · ' : '')
     + (trace.status_code != null ? 'status: ' + esc(trace.status_code) + ' · ' : '')
-    + (trace.elapsed_seconds != null ? 'время: ' + esc(trace.elapsed_seconds) + 's' : '');
+    + (trace.elapsed_seconds != null ? 'время: ' + esc(trace.elapsed_seconds) + ' с · ' : '')
+    + (trace.total_tokens != null ? 'токены: ' + esc(trace.total_tokens) : '');
   const section = function (title, text) {
     return '<details class="trace-section"><summary>' + esc(title) + '</summary><div class="trace-content"><button type="button" class="copy-text-button trace-copy">Копировать</button><pre class="raw-json">' + esc(text) + '</pre></div></details>';
   };
@@ -1346,6 +1541,9 @@ function renderResults(run) {
       return '<button type="button" class="viewer-tab page-selector' + (selectedPage === pr.page_number ? ' on' : '') + '" data-line="' + esc(line.line_id) + '" data-page="' + pr.page_number + '">Лист ' + pr.page_number + '</button>';
     }).join('');
     const firstPage = selectedPage ? pages.find(function (p) { return p.page_number === selectedPage; }) || pages[0] : pages[0];
+    const lineProviderTrace = line.provider_trace
+      ? '<details class="notes collapsible-result line-provider-result"><summary>Ответ провайдера / AI запрос</summary><div class="line-provider-trace" data-line-provider-trace="' + esc(line.line_id) + '"><p class="muted">Загрузка ответа…</p></div></details>'
+      : '';
     return '<div class="line-card">'
       + '<h3>' + esc(line.line_id) + ' <span class="group-item-meta">стр. ' + (line.pages || []).join(', ') + '</span></h3>'
       + (state.graphsByLine[line.line_id]
@@ -1359,21 +1557,70 @@ function renderResults(run) {
           + '<div><span class="kpi-label">Листов</span><strong>' + pages.length + '</strong></div>'
           + '</div>'
         : '')
+      + lineProviderTrace
+      + (line.analysis && line.analysis.pipeline_length ? pipelineLengthSummary(line) + pipelineHandwheelBlock(line) : '')
       + '<div class="row page-selector-row">' + pageButtons + '</div>'
       + '<div class="page-content" data-line="' + esc(line.line_id) + '">'
-      + (firstPage ? pageDetailHtml(line.line_id, firstPage) : '<p class="muted">Страниц нет</p>')
+      + (firstPage
+        ? (line.analysis && line.analysis.pipeline_length ? pipelineLengthPageDetail(line, firstPage.page_number) : pageDetailHtml(line.line_id, firstPage))
+        : '<p class="muted">Страниц нет</p>')
       + '</div>'
       + '</div>';
   }).join('<hr>');
+  $('#result-body').querySelectorAll('[data-line-provider-trace]').forEach(function (wrap) {
+    const lineId = wrap.getAttribute('data-line-provider-trace') || '';
+    const line = run.lines.find(function (item) { return item.line_id === lineId; });
+    if (!line || !line.provider_trace) return;
+    wrap.innerHTML = renderTrace(line.provider_trace);
+    bindTraceControls(wrap.closest('.line-card'), wrap);
+  });
   $('#result-body').querySelectorAll('[data-graph-3d-line]').forEach(function (container) {
     const lineId = container.getAttribute('data-graph-3d-line') || '';
     render3DGraph(container, state.graphsByLine[lineId]);
   });
   bindPageSelectors();
+  bindPipelineProviderConfirmations();
   $('#result-body').querySelectorAll('.viewer').forEach(bindViewer);
   bindFeedbackButtons($('#result-body'));
   bindManualEditing($('#result-body'));
   restoreProviderKeys(body, openProviderState);
+}
+
+function bindPipelineProviderConfirmations() {
+  $('#result-body').querySelectorAll('.provider-edit-button').forEach(function (button) {
+    button.addEventListener('click', function () {
+      state.providerDecisionEdit.add(button.dataset.providerEdit || '');
+      renderResults(state.currentRun);
+    });
+  });
+  $('#result-body').querySelectorAll('.provider-confirm-button').forEach(function (button) {
+    button.addEventListener('click', async function () {
+      const lineCard = button.closest('.line-card');
+      const heading = lineCard && lineCard.querySelector('h3');
+      const lineId = button.dataset.providerLine || (heading ? heading.textContent.trim().split(/\s+/)[0] : '');
+      button.disabled = true;
+      try {
+        const updated = await api('/api/pipeline-length/confirm', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            run_id: state.runId,
+            line_id: lineId,
+            candidate_ids: button.dataset.providerAction === 'accept' ? [button.dataset.providerCandidate] : [],
+            keep_local_candidate_ids: button.dataset.providerAction === 'keep_local' ? [button.dataset.providerCandidate] : [],
+            intermediate_distance_indices: [],
+            edge_ids: [],
+          }),
+        });
+        state.providerDecisionEdit.delete([lineId, button.dataset.providerCandidate].join('|'));
+        state.currentRun = updated;
+        renderResults(updated);
+      } catch (error) {
+        button.disabled = false;
+        alert('Не удалось принять решение провайдера: ' + error.message);
+      }
+    });
+  });
 }
 
 function bindPageSelectors() {
@@ -1390,10 +1637,13 @@ function bindPageSelectors() {
       const line = (state.currentRun.lines || []).find(function (l) { return l.line_id === lineId; });
       const pr = (line.page_results || []).find(function (p) { return p.page_number === pageNumber; });
       if (pr) {
-        content.innerHTML = pageDetailHtml(lineId, pr);
+        content.innerHTML = line.analysis && line.analysis.pipeline_length
+          ? pipelineLengthPageDetail(line, pageNumber)
+          : pageDetailHtml(lineId, pr);
         content.querySelectorAll('.viewer').forEach(bindViewer);
         bindFeedbackButtons(content);
         bindManualEditing(content);
+        bindPipelineProviderConfirmations();
       }
     });
   });
@@ -1472,9 +1722,15 @@ async function showHistory() {
       const badge = run.status === 'complete' ? 'ok' : run.status === 'error' ? 'error' : 'run';
       const when = run.created_at ? new Date(run.created_at).toLocaleString('ru-RU') : '';
       const kindLabel = run.kind_label || run.stop_stage || '';
-      const model = run.model ? ' · ' + run.model : '';
-      const provider = run.provider ? ' · ' + run.provider : '';
       const manual = Number(run.manual_adjustment_count || 0) ? ' · ручных правок: ' + run.manual_adjustment_count : '';
+      const providerTime = run.provider_elapsed_seconds != null ? formatSeconds(run.provider_elapsed_seconds) : '—';
+      const providerTokens = run.provider_total_tokens != null ? String(run.provider_total_tokens) : '—';
+      const providerFixes = (Number(run.provider_fixes || 0) || Number(run.local_kept || 0))
+        ? ' · решения: +' + Number(run.provider_fixes || 0) + ' / −' + Number(run.local_kept || 0)
+        : '';
+      const excludedPages = Array.isArray(run.excluded_pages) && run.excluded_pages.length
+        ? ' · исключены листы: ' + run.excluded_pages.join(', ')
+        : '';
       const feedback = run.feedback || {};
       const feedbackStats = Number(feedback.total || 0)
         ? ' · <span class="prompt-feedback prompt-feedback-up">↑ ' + Number(feedback.positive || 0) + '</span>'
@@ -1484,7 +1740,14 @@ async function showHistory() {
         + '<div class="row"><b>' + esc(run.source_name || '') + '</b> <span class="badge ' + badge + '">' + esc(run.status) + '</span>'
         + '<span class="badge kind">' + esc(kindLabel) + '</span>'
         + '<span class="group-item-meta">' + esc(when) + '</span></div>'
-        + '<div class="muted">' + esc(run.run_id) + ' · ' + (run.line_ids || []).map(esc).join(', ') + esc(provider) + esc(model) + esc(manual) + feedbackStats + '</div>'
+        + '<div class="history-metrics">'
+        + '<span><small>Линии</small><b>' + esc((run.line_ids || []).join(', ') || '—') + '</b></span>'
+        + '<span><small>Провайдер</small><b>' + esc((run.provider || '—') + (run.model ? ' · ' + run.model : '')) + '</b></span>'
+        + '<span class="history-provider-time"><small>Запрос провайдера</small><b>' + esc(providerTime) + '</b></span>'
+        + '<span><small>Токены</small><b>' + esc(providerTokens) + '</b></span>'
+        + '<span><small>Решения</small><b>+' + esc(Number(run.provider_fixes || 0)) + ' / −' + esc(Number(run.local_kept || 0)) + '</b></span>'
+        + '</div>'
+        + '<div class="muted">' + esc(run.run_id) + esc(manual) + esc(providerFixes) + esc(excludedPages) + feedbackStats + '</div>'
         + (run.error_count ? '<div class="badge error">Ошибок: ' + run.error_count + '<br>' + run.errors.map(esc).join('<br>') + '</div>' : '')
         + '<button class="open-run" type="button" data-open-run="' + esc(run.run_id) + '">Открыть →</button>'
         + '</div>';
