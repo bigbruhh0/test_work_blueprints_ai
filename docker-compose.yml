@@ -1,0 +1,22 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: test-chertezh
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      AI_PROVIDER: ${AI_PROVIDER:-deepseek}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-flash}
+      PIPELINE_WORKERS: ${PIPELINE_WORKERS:-4}
+      PIPELINE_LENGTH_MAX_TOKENS: ${PIPELINE_LENGTH_MAX_TOKENS:-8192}
+      PIPELINE_LENGTH_DEEPSEEK_TIMEOUT: ${PIPELINE_LENGTH_DEEPSEEK_TIMEOUT:-120}
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    volumes:
+      - app_cache:/app/.cache
+
+volumes:
+  app_cache:

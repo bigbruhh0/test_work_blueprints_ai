@@ -1,0 +1,17 @@
+.git
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.codex_inspect
+.cache
+.streamlit/secrets.toml
+exports
+tmp
+.env
+.run_err.log
+.run_out.log
+run_err.log
+run_out.log
+*.pdf
+*.docx

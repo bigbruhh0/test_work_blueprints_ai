@@ -1,4 +1,4 @@
-const state = { document: null, runId: null, selected: new Set(), sourceMode: 'local', provider: 'deepseek', config: null, filesByLine: {}, tracesByLine: {}, graphsByLine: {}, selectedPage: {}, currentRun: null, feedback: {}, manualEdit: false, providerDecisionEdit: new Set(), three: null, viewers3d: new Set() };
+const state = { document: null, runId: null, selected: new Set(), sourceMode: 'local', provider: 'deepseek', config: null, filesByLine: {}, tracesByLine: {}, graphsByLine: {}, selectedPage: {}, currentRun: null, feedback: {}, manualEdit: false, providerDecisionEdit: new Set(), three: null, viewers3d: new Set(), pollToken: 0 };
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 const esc = (value) => String(value ?? '').replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -434,17 +434,23 @@ async function startAnalysis() {
     $('#history-section').hidden = true;
     $('#prompt-section').hidden = true;
     $('#runs-section').scrollIntoView({ behavior: 'smooth', block: 'start' });
-    pollRun();
+    state.pollToken += 1;
+    pollRun(state.pollToken);
   } catch (error) { alert(error.message); }
 }
 
-async function pollRun() {
+async function pollRun(token) {
+  if (token !== state.pollToken) return;
   try {
-    const run = await api('/api/runs/' + state.runId);
-    renderRun(run);
-    if (run.status === 'complete' || run.status === 'error') {
+    const progress = await api('/api/runs/' + state.runId + '/progress');
+    if (token !== state.pollToken) return;
+    renderRun(progress);
+    if (progress.status === 'complete' || progress.status === 'error') {
       $('#runs-section').hidden = true;
       await refreshFeedback();
+      if (token !== state.pollToken) return;
+      const run = await api('/api/runs/' + state.runId);
+      if (token !== state.pollToken) return;
       renderResults(run);
       return;
     }
@@ -452,7 +458,7 @@ async function pollRun() {
     $('#run-status').innerHTML = '<div class="badge error">Ошибка: ' + esc(error.message) + '</div>';
     return;
   }
-  setTimeout(pollRun, 1800);
+  setTimeout(function () { pollRun(token); }, 1800);
 }
 
 async function refreshFeedback() {
@@ -1559,7 +1565,7 @@ function renderResults(run) {
         : '')
       + lineProviderTrace
       + (line.analysis && line.analysis.pipeline_length ? pipelineLengthSummary(line) + pipelineHandwheelBlock(line) : '')
-      + '<div class="row page-selector-row">' + pageButtons + '</div>'
+      + '<div class="page-nav"><span class="page-nav-label">Листы</span><div class="row page-selector-row">' + pageButtons + '</div></div>'
       + '<div class="page-content" data-line="' + esc(line.line_id) + '">'
       + (firstPage
         ? (line.analysis && line.analysis.pipeline_length ? pipelineLengthPageDetail(line, firstPage.page_number) : pageDetailHtml(line.line_id, firstPage))
@@ -1770,7 +1776,8 @@ async function openHistoryRun(runId) {
       $('#runs-section').hidden = false;
       $('#result-section').hidden = true;
       renderRun(run);
-      pollRun();
+      state.pollToken += 1;
+      pollRun(state.pollToken);
     } else {
       await refreshFeedback();
       renderResults(run);

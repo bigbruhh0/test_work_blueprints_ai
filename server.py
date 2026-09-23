@@ -1054,6 +1054,87 @@ def list_runs() -> list[dict[str, Any]]:
     return run_db.list_runs()
 
 
+def _run_progress_from_state(run: RunState) -> dict[str, Any]:
+    return {
+        "run_id": run.run_id,
+        "status": run.status,
+        "source_name": run.source_name,
+        "stop_stage": run.stop_stage,
+        "provider": run.provider,
+        "model": run.model,
+        "kind": run.kind,
+        "kind_label": run.kind_label,
+        "line_ids": run.line_ids,
+        "excluded_pages": run.excluded_pages,
+        "lines": [
+            {
+                "line_id": line.line_id,
+                "pages": line.pages,
+                "status": line.status,
+                "error": line.error,
+                "events": line.events[-20:],
+                "page_results": [
+                    {
+                        "page_number": page_run.page_number,
+                        "status": page_run.status,
+                        "stage": page_run.stage,
+                        "error": page_run.error,
+                        "events": page_run.events[-12:],
+                    }
+                    for page_run in sorted(line.page_results.values(), key=lambda item: item.page_number)
+                ],
+            }
+            for line in run.lines.values()
+        ],
+    }
+
+
+def _run_progress_from_dict(run: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "run_id": run.get("run_id"),
+        "status": run.get("status"),
+        "source_name": run.get("source_name"),
+        "stop_stage": run.get("stop_stage"),
+        "provider": run.get("provider"),
+        "model": run.get("model"),
+        "kind": run.get("kind"),
+        "kind_label": run.get("kind_label"),
+        "line_ids": run.get("line_ids") or [],
+        "excluded_pages": run.get("excluded_pages") or [],
+        "lines": [
+            {
+                "line_id": line.get("line_id"),
+                "pages": line.get("pages") or [],
+                "status": line.get("status"),
+                "error": line.get("error", ""),
+                "events": (line.get("events") or [])[-20:],
+                "page_results": [
+                    {
+                        "page_number": page.get("page_number"),
+                        "status": page.get("status"),
+                        "stage": page.get("stage"),
+                        "error": page.get("error", ""),
+                        "events": (page.get("events") or [])[-12:],
+                    }
+                    for page in line.get("page_results", [])
+                ],
+            }
+            for line in run.get("lines", [])
+        ],
+    }
+
+
+@app.get("/api/runs/{run_id}/progress")
+def get_run_progress(run_id: str) -> dict[str, Any]:
+    run = STATE["runs"].get(run_id)
+    if run:
+        return _run_progress_from_state(run)
+    persisted = run_db.load_run(run_id)
+    if not persisted:
+        raise HTTPException(404, "Прогон не найден")
+    return _run_progress_from_dict(persisted)
+
+
 @app.get("/api/runs/{run_id}")
 def get_run(run_id: str) -> dict[str, Any]:
     run = STATE["runs"].get(run_id)

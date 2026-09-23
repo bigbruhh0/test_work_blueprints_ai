@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -16,6 +17,8 @@ from . import prompts
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DEEPSEEK_TIMEOUT_SECONDS = 180
 DEFAULT_CODEX_TIMEOUT_SECONDS = 300
+DEFAULT_PIPELINE_LENGTH_MAX_TOKENS = 8192
+MAX_PIPELINE_LENGTH_MAX_TOKENS = 16000
 MAX_PROVIDER_TIMEOUT_SECONDS = 600
 MAX_PROVIDER_RESPONSE_BYTES = 4 * 1024 * 1024
 
@@ -26,6 +29,14 @@ def _bounded_timeout(env_name: str, default: int) -> int:
     except ValueError:
         value = default
     return max(1, min(value, MAX_PROVIDER_TIMEOUT_SECONDS))
+
+
+def _pipeline_length_max_tokens() -> int:
+    try:
+        value = int(os.getenv("PIPELINE_LENGTH_MAX_TOKENS", str(DEFAULT_PIPELINE_LENGTH_MAX_TOKENS)))
+    except ValueError:
+        value = DEFAULT_PIPELINE_LENGTH_MAX_TOKENS
+    return max(1024, min(value, MAX_PIPELINE_LENGTH_MAX_TOKENS))
 
 
 def _base_vertices(mapping: dict[str, Any]) -> list[dict[str, Any]]:
@@ -253,13 +264,42 @@ def build_pipeline_length_text(payload: dict[str, Any]) -> str:
 
 
 def _parse_json(text: str) -> dict[str, Any]:
-    text = text.strip()
+    original = text or ""
+    text = original.strip()
+    if not text:
+        raise ValueError("Провайдер вернул пустой ответ вместо JSON")
     if text.startswith("```"):
         text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-    result = json.loads(text)
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, flags=re.S)
+        if not match:
+            preview = text[:300].replace("\n", " ")
+            raise ValueError(f"Провайдер вернул не JSON. Начало ответа: {preview}") from None
+        try:
+            result = json.loads(match.group(0))
+        except json.JSONDecodeError as error:
+            preview = text[:300].replace("\n", " ")
+            raise ValueError(f"Провайдер вернул поврежденный JSON: {error.msg}. Начало ответа: {preview}") from None
     if not isinstance(result, dict):
         raise ValueError("pipeline_length provider response must be an object")
     return result
+
+
+def _provider_failure_details(raw: dict[str, Any], choice: dict[str, Any]) -> str:
+    usage = raw.get("usage") or {}
+    message = choice.get("message") or {}
+    completion_details = usage.get("completion_tokens_details") or {}
+    parts = [
+        f"finish_reason={choice.get('finish_reason') or 'unknown'}",
+        f"prompt_tokens={usage.get('prompt_tokens', 'unknown')}",
+        f"completion_tokens={usage.get('completion_tokens', 'unknown')}",
+        f"reasoning_tokens={completion_details.get('reasoning_tokens', 'unknown')}",
+        f"content_chars={len(message.get('content') or '')}",
+        f"reasoning_chars={len(message.get('reasoning_content') or '')}",
+    ]
+    return ", ".join(parts)
 
 
 def run_pipeline_length_provider(
@@ -272,33 +312,64 @@ def run_pipeline_length_provider(
     started = time.perf_counter()
     revision = prompts.load_prompt_revision("pipeline_length")
     prompt = revision["text"]
+    provider_prompt = (
+        "Верни только компактный JSON. Не пиши ход рассуждений, пояснения вне JSON или markdown. "
+        "reason делай коротким: до 12 слов.\n\n"
+        + prompt
+    )
     request_text = json.dumps(payload, ensure_ascii=False)
     provider = (provider or "deepseek").strip().lower()
     if provider == "deepseek":
         if not api_key:
             raise RuntimeError("DEEPSEEK_API_KEY не задан в .env")
         base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
-        response = requests.post(
-            f"{base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={
-                "model": model,
-                "temperature": 0,
-                "max_tokens": int(os.getenv("PIPELINE_LENGTH_MAX_TOKENS", "4096")),
-                "response_format": {"type": "json_object"},
-                "messages": [
-                    {"role": "system", "content": prompt},
-                    {"role": "user", "content": request_text},
-                ],
-            },
-            timeout=_bounded_timeout("PIPELINE_LENGTH_DEEPSEEK_TIMEOUT", DEFAULT_DEEPSEEK_TIMEOUT_SECONDS),
-        )
-        response.raise_for_status()
-        if len(response.content) > MAX_PROVIDER_RESPONSE_BYTES:
-            raise RuntimeError("Ответ провайдера превысил лимит 4 МБ")
-        raw = response.json()
-        answer = _parse_json(raw["choices"][0]["message"]["content"])
-        trace = {"response_raw": raw, "provider": provider}
+        request_max_tokens = _pipeline_length_max_tokens()
+        retry_max_tokens = max(request_max_tokens * 2, DEFAULT_PIPELINE_LENGTH_MAX_TOKENS)
+        token_attempts = [request_max_tokens]
+        if retry_max_tokens > request_max_tokens:
+            token_attempts.append(min(retry_max_tokens, MAX_PIPELINE_LENGTH_MAX_TOKENS))
+        last_error = None
+        raw: dict[str, Any] = {}
+        answer: dict[str, Any] | None = None
+        for attempt_index, max_tokens in enumerate(token_attempts, start=1):
+            response = requests.post(
+                f"{base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "model": model,
+                    "temperature": 0,
+                    "max_tokens": max_tokens,
+                    "response_format": {"type": "json_object"},
+                    "messages": [
+                        {"role": "system", "content": provider_prompt},
+                        {"role": "user", "content": request_text},
+                    ],
+                },
+                timeout=_bounded_timeout("PIPELINE_LENGTH_DEEPSEEK_TIMEOUT", DEFAULT_DEEPSEEK_TIMEOUT_SECONDS),
+            )
+            response.raise_for_status()
+            if len(response.content) > MAX_PROVIDER_RESPONSE_BYTES:
+                raise RuntimeError("Ответ провайдера превысил лимит 4 МБ")
+            raw = response.json()
+            choice = (raw.get("choices") or [{}])[0]
+            content = ((choice.get("message") or {}).get("content") or "")
+            try:
+                answer = _parse_json(content)
+                break
+            except ValueError as error:
+                details = _provider_failure_details(raw, choice)
+                last_error = RuntimeError(f"{error}. {details}, attempt={attempt_index}, max_tokens={max_tokens}")
+                if choice.get("finish_reason") != "length" or attempt_index == len(token_attempts):
+                    raise last_error from None
+        if answer is None:
+            raise last_error or RuntimeError("Провайдер не вернул JSON")
+        trace = {
+            "response_raw": raw,
+            "provider": provider,
+            "request_max_tokens": token_attempts[0],
+            "attempts": attempt_index,
+            "used_max_tokens": max_tokens,
+        }
     elif provider == "codex_cli":
         with tempfile.TemporaryDirectory(prefix="codex-pipeline-length-") as temp_dir:
             schema_path = Path(temp_dir) / "pipeline_length_response.schema.json"
@@ -313,7 +384,7 @@ def run_pipeline_length_provider(
             ]
             response = subprocess.run(
                 command,
-                input=("SYSTEM_PROMPT:\n" + prompt + "\n\nPAYLOAD_JSON:\n" + request_text),
+                input=("SYSTEM_PROMPT:\n" + provider_prompt + "\n\nPAYLOAD_JSON:\n" + request_text),
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
