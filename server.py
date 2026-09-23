@@ -42,7 +42,7 @@ from scripts.build_dimension_map import build_map as build_dimension_map, render
 
 ROOT = Path(__file__).resolve().parent
 WEB_DIR = ROOT / "web"
-DEFAULT_PDF = ROOT / "\u0418\u0437\u043e\u043c\u0435\u0442\u0440\u0438\u0438.pdf"
+DEFAULT_PDF = ROOT / "isometries.pdf"
 ARTIFACTS_DIR = ROOT / ".cache" / "mark_runs"
 load_dotenv(ROOT / ".env")
 

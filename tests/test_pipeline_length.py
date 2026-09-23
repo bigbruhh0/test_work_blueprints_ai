@@ -167,7 +167,7 @@ def test_provider_returns_each_branch_and_counts_explicit_candidates_once():
 
 
 def test_local_snapshot_does_not_build_final_vertices():
-    mapping = map_dimensions(Path("Изометрии.pdf"), 216, finalize=False)
+    mapping = map_dimensions(Path("isometries.pdf"), 216, finalize=False)
     assert mapping["analysis_stage"] == "local_processing"
     assert mapping["vertices"]
     assert all(str(vertex["id"]).startswith("V") for vertex in mapping["vertices"])
@@ -181,8 +181,8 @@ def test_local_snapshot_does_not_build_final_vertices():
 
 
 def test_pipeline_length_diagnostic_pdf_includes_handwheel_evidence(tmp_path):
-    mapping = map_dimensions(Path("Изометрии.pdf"), 216, finalize=False)
+    mapping = map_dimensions(Path("isometries.pdf"), 216, finalize=False)
     output = tmp_path / "pipeline_length_diagnostic.pdf"
-    save_pipeline_length_diagnostic_pdf(Path("Изометрии.pdf"), 216, output, mapping)
+    save_pipeline_length_diagnostic_pdf(Path("isometries.pdf"), 216, output, mapping)
     assert output.exists()
     assert output.stat().st_size > 0

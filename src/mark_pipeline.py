@@ -15,7 +15,7 @@ mark_pipeline.py
     <prefix>_numbers.txt          — список найденных чисел (кандидатов) и вершин
 
 Пример:
-    python mark_pipeline.py "Изометрии.pdf" 1 out
+    python mark_pipeline.py isometries.pdf 1 out
 """
 
 import math

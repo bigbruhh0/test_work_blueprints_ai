@@ -16,7 +16,7 @@ def test_provider_payload_schema_accepts_real_dimension_payload():
     Draft202012Validator.check_schema(schema)
 
     page_number = 215
-    dimension_map = build_map(Path("Изометрии.pdf"), page_number)
+    dimension_map = build_map(Path("isometries.pdf"), page_number)
     payload = build_review_payload(dimension_map, build_map_text(dimension_map))
 
     errors = list(Draft202012Validator(schema).iter_errors(payload))
@@ -29,7 +29,7 @@ def test_provider_payload_schema_accepts_real_dimension_payload():
 
 
 def test_provider_payload_uses_final_segments_and_preserves_local_statuses():
-    dimension_map = build_map(Path("Изометрии.pdf"), 218)
+    dimension_map = build_map(Path("isometries.pdf"), 218)
     payload = build_review_payload(dimension_map, build_map_text(dimension_map))
 
     assert payload["vertices"]

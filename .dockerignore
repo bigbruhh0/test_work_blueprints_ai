@@ -14,5 +14,5 @@ tmp
 run_err.log
 run_out.log
 *.pdf
-!Изометрии.pdf
+!isometries.pdf
 *.docx

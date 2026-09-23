@@ -338,7 +338,7 @@ async function loadPdf() {
   const upload = mode === 'upload';
   const fileInput = $('#pdf-file');
   if (upload && !fileInput.files[0]) { alert('Сначала выберите файл'); return; }
-  const restore = setLoading(upload ? 'Читаю выбранный файл…' : 'Читаю Изометрии.pdf…');
+  const restore = setLoading(upload ? 'Читаю выбранный файл…' : 'Читаю isometries.pdf…');
   try {
     if (upload) {
       const form = new FormData();
