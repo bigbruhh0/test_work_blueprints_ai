@@ -626,6 +626,41 @@ class _Stroke:
     length: float
     linewidth: float
     kind: str
+    arrowhead_start: bool = False
+    arrowhead_end: bool = False
+
+
+def _endpoint_has_arrowhead(
+    tip: tuple[float, float],
+    main_start: tuple[float, float],
+    main_end: tuple[float, float],
+    segments: list[tuple[tuple[float, float], tuple[float, float]]],
+) -> bool:
+    """Detect two short non-collinear legs meeting at a line endpoint."""
+    main_length = math.hypot(main_end[0] - main_start[0], main_end[1] - main_start[1])
+    legs: list[tuple[float, float]] = []
+    for start, end in segments:
+        if (start == main_start and end == main_end) or (start == main_end and end == main_start):
+            continue
+        start_gap = math.hypot(start[0] - tip[0], start[1] - tip[1])
+        end_gap = math.hypot(end[0] - tip[0], end[1] - tip[1])
+        if min(start_gap, end_gap) > 5.0:
+            continue
+        outer = end if start_gap <= end_gap else start
+        leg_length = math.hypot(outer[0] - tip[0], outer[1] - tip[1])
+        if 3.0 <= leg_length <= min(24.0, max(8.0, main_length * 0.3)):
+            legs.append(outer)
+    for first_index, first in enumerate(legs):
+        for second in legs[first_index + 1:]:
+            first_length = math.hypot(first[0] - tip[0], first[1] - tip[1]) or 1.0
+            second_length = math.hypot(second[0] - tip[0], second[1] - tip[1]) or 1.0
+            cosine = (
+                (first[0] - tip[0]) * (second[0] - tip[0])
+                + (first[1] - tip[1]) * (second[1] - tip[1])
+            ) / (first_length * second_length)
+            if -0.6 <= cosine <= 0.95:
+                return True
+    return False
 
 
 @dataclass(slots=True)
@@ -667,6 +702,16 @@ def extract_axis_graph(pdf_path, page_number: int, candidates: list[Candidate]) 
         graph.notes.append(f"vector extraction failed: {error}")
         return graph
 
+    raw_segments: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    for obj in objects:
+        pts = obj.get("pts")
+        if not pts or len(pts) < 2:
+            continue
+        first = (float(pts[0][0]), float(pts[0][1]))
+        last = (float(pts[-1][0]), float(pts[-1][1]))
+        if math.hypot(last[0] - first[0], last[1] - first[1]) >= 3.0:
+            raw_segments.append((first, last))
+
     for index, obj in enumerate(objects):
         pts = obj.get("pts")
         if not pts or len(pts) < 2:
@@ -698,6 +743,8 @@ def extract_axis_graph(pdf_path, page_number: int, candidates: list[Candidate]) 
                 length=length,
                 linewidth=linewidth,
                 kind=kind,
+                arrowhead_start=_endpoint_has_arrowhead((x0, y0), (x0, y0), (x1, y1), raw_segments),
+                arrowhead_end=_endpoint_has_arrowhead((x1, y1), (x0, y0), (x1, y1), raw_segments),
             )
         )
 

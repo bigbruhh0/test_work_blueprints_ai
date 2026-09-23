@@ -13,6 +13,7 @@
     "preliminary_decisions",
     "edge_candidate_groups",
     "handwheels",
+    "valve_edges",
     "connections",
     "map_text"
   ],
@@ -45,6 +46,10 @@
     "handwheels": {
       "type": "array",
       "items": { "$ref": "#/$defs/handwheel" }
+    },
+    "valve_edges": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/valve_edge" }
     },
     "connections": {
       "type": "array",
@@ -313,6 +318,19 @@
         "edge_kind": { "type": ["string", "null"] },
         "is_pipe_edge": { "type": ["boolean", "null"] },
         "edge_distance_px": { "type": ["number", "null"] }
+      }
+    },
+    "valve_edge": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["edge_id", "element_type"],
+      "properties": {
+        "edge_id": { "type": "string" },
+        "element_type": { "const": "valve" },
+        "is_handwheel_segment": { "type": "boolean" },
+        "handwheel_ids": { "type": "array", "items": { "type": "string" } },
+        "from_vertex": { "type": ["string", "null"] },
+        "to_vertex": { "type": ["string", "null"] }
       }
     },
     "connection": {

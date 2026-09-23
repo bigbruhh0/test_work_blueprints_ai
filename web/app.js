@@ -511,6 +511,7 @@ function renderRun(run) {
 const VIEWER_TABS = [
   { key: 'clean_local_markup_pdf', label: 'Локальная разметка' },
   { key: 'local_dimension_filter_pdf', label: 'Локальная фильтрация размеров' },
+  { key: 'final_contour_rays_pdf', label: 'Лучевые привязки финального контура' },
   { key: 'numbers_pdf', label: 'Разметка чисел' },
   { key: 'vertices_pdf', label: 'Вершины' },
   { key: 'coordinates_pdf', label: 'Координаты' },
@@ -1079,6 +1080,7 @@ function pageDetailHtml(lineId, pr) {
   }
   if (analysis.dimension_mapping) {
     const mapping = analysis.dimension_mapping;
+    const finalMapping = analysis.dimension_map || mapping;
     const dimensions = mapping.dimensions || [];
     const handwheels = mapping.handwheels || [];
     const review = analysis.dimension_review;
@@ -1141,6 +1143,19 @@ function pageDetailHtml(lineId, pr) {
           return '<tr class="candidate-' + esc(item.status) + '"><td>' + esc(item.id) + '</td><td>' + esc(item.text) + '</td><td>' + esc((item.hints || []).join(', ') || item.kind) + '</td><td>' + esc(item.status) + '</td><td>' + esc(item.edge_id || '—') + '</td></tr>';
         }).join('') + '</tbody></table></details>'
       : '';
+    const finalEdgeGroups = Array.isArray(finalMapping.edge_candidate_groups) ? finalMapping.edge_candidate_groups : [];
+    const finalEdgeGroupsBlock = finalEdgeGroups.length
+      ? '<details class="notes collapsible-result"><summary>Кандидаты по финальным отрезкам (' + finalEdgeGroups.length + ')</summary><table class="data-table"><thead><tr><th>Вершины</th><th>Рёбра</th><th>Кандидаты</th><th>Статусы</th><th>Тип</th></tr></thead><tbody>'
+        + finalEdgeGroups.map(function (group) {
+          const from = group.from_vertex || '?';
+          const to = group.to_vertex || '?';
+          const values = (group.candidate_values_mm || []).map(function (value) { return String(value); }).join(', ') || '—';
+          const candidateIds = (group.candidate_ids || []).join(', ') || '—';
+          const statuses = (group.candidate_statuses || []).join(', ') || group.status || '—';
+          const kind = group.is_handwheel_segment ? 'valve / штурвал' : 'труба';
+          return '<tr><td><b>' + esc(from + ' — ' + to) + '</b></td><td>' + esc((group.edge_ids || []).join(', ')) + '</td><td>' + esc(candidateIds + ': ' + values) + '</td><td>' + esc(statuses) + '</td><td>' + esc(kind) + '</td></tr>';
+        }).join('') + '</tbody></table></details>'
+      : '';
     const handwheelRows = handwheels.length ? handwheels : localHandwheels.map(function (item) {
       return { id: item.id, label: item.text, arrow_found: false, edge_id: item.edge_id || null };
     });
@@ -1183,6 +1198,7 @@ function pageDetailHtml(lineId, pr) {
     return '<h4>Лист ' + pr.page_number + ' — привязка размеров</h4>'
       + '<p class="muted">Рёбер графа: ' + (mapping.edges || []).length + ' · размеров: ' + dimensions.length + '</p>'
       + localCandidatesBlock
+      + finalEdgeGroupsBlock
       + handwheelBlock
       + providerBlock + downloads + viewer;
   }

@@ -27,6 +27,7 @@ from src.dimension_mapping import (
     save_clean_graph_pdf,
     save_clean_local_markup_pdf,
     save_local_dimension_filter_pdf,
+    save_final_contour_rays_pdf,
     save_preprocess_annotation_pdf,
     save_skeleton_pdf,
 )
@@ -686,6 +687,8 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                 save_clean_local_markup_pdf(pdf_path, page_run.page_number, clean_markup_pdf, mapping)
                 local_filter_pdf = run_dir / f"{pdf_stem}_page{page_run.page_number}_local_dimension_filter.pdf"
                 save_local_dimension_filter_pdf(pdf_path, page_run.page_number, local_filter_pdf, mapping)
+                final_contour_rays_pdf = run_dir / f"{pdf_stem}_page{page_run.page_number}_final_contour_rays.pdf"
+                save_final_contour_rays_pdf(pdf_path, page_run.page_number, final_contour_rays_pdf, mapping)
                 clean_graph_pdf = run_dir / f"{pdf_stem}_page{page_run.page_number}_dimension_graph.pdf"
                 save_clean_graph_pdf(pdf_path, page_run.page_number, clean_graph_pdf, mapping)
                 skeleton_pdf = run_dir / f"{pdf_stem}_page{page_run.page_number}_dimension_skeleton.pdf"
@@ -693,8 +696,10 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                 dimension_map_pdf = run_dir / f"{pdf_stem}_page{page_run.page_number}_dimension_map.pdf"
                 dimension_map_json = run_dir / f"{pdf_stem}_page{page_run.page_number}_dimension_map.json"
                 dimension_map = build_dimension_map(Path(pdf_path), page_run.page_number)
-                dimension_map["handwheels"] = mapping.get("handwheels", [])
-                dimension_map["connections"] = mapping.get("connections", [])
+                # build_dimension_map is the final source of truth for the
+                # provider payload. It already contains remapped handwheel
+                # edges and connections; do not overwrite them with the
+                # pre-split local mapping here.
                 dimension_map_json.write_text(json.dumps(dimension_map, ensure_ascii=False, indent=2), encoding="utf-8")
                 render_dimension_map(Path(pdf_path), page_run.page_number, dimension_map_pdf, dimension_map)
                 page_run.analysis = {"dimension_mapping": mapping, "dimension_map": dimension_map}
@@ -703,6 +708,7 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                 page_run.files["preprocess_annotations_pdf"] = preprocess_pdf.name
                 page_run.files["clean_local_markup_pdf"] = clean_markup_pdf.name
                 page_run.files["local_dimension_filter_pdf"] = local_filter_pdf.name
+                page_run.files["final_contour_rays_pdf"] = final_contour_rays_pdf.name
                 page_run.files["dimension_graph_pdf"] = clean_graph_pdf.name
                 page_run.files["dimension_skeleton_pdf"] = skeleton_pdf.name
                 page_run.files["dimension_map_pdf"] = dimension_map_pdf.name

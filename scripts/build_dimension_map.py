@@ -29,6 +29,7 @@ from src.dimension_mapping import _distance_to_segment  # noqa: E402
 EDGE_COLOR = (0.05, 0.38, 0.85)
 UNRESOLVED_EDGE_COLOR = (0.9, 0.5, 0.05)
 UNCERTAIN_VERTEX_COLOR = (1.0, 0.55, 0.0)
+PROJECTION_COLOR = (1.0, 0.25, 0.0)
 DIMENSION_COLORS = {
     "mapped": (0.0, 0.55, 0.15),
     "ambiguous": (0.95, 0.6, 0.0),
@@ -447,19 +448,213 @@ def _group_dimensions(edges: list[dict[str, Any]], dimensions: list[dict[str, An
     return groups
 
 
+def _provider_point(vertex: dict[str, Any]) -> list[float]:
+    point = vertex.get("point")
+    if isinstance(point, list) and len(point) >= 2:
+        return [round(float(point[0]), 2), round(float(point[1]), 2)]
+    return [round(float(vertex.get("x", 0.0)), 2), round(float(vertex.get("y", 0.0)), 2)]
+
+
+def _provider_vertex_rows(local: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return final VE/HG vertices for provider payload and diagnostics."""
+    final_rows = list(local.get("final_vertices") or [])
+    output: list[dict[str, Any]] = []
+
+    for row in final_rows:
+        point = _provider_point(row)
+        source = "handwheel" if row.get("vertex_source") == "handwheel" or row.get("handwheel_id") else "extension"
+        output.append(
+            {
+                "id": str(row.get("id")),
+                "role": row.get("role") or ("handwheel" if source == "handwheel" else "dimension"),
+                "x": point[0],
+                "y": point[1],
+                "degree": None,
+                "confidence": 1.0,
+                "source": source,
+                "edge_id": row.get("edge_id"),
+                "handwheel_id": row.get("handwheel_id"),
+                "replaced_vertex_ids": list(row.get("replaced_vertex_ids") or []),
+                "replace_reason": row.get("replace_reason"),
+            }
+        )
+    return output
+
+
+def _nearest_vertex_id(point: list[float], vertices: list[dict[str, Any]], tolerance: float) -> str | None:
+    candidates = []
+    for vertex in vertices:
+        vertex_point = (float(vertex.get("x", 0.0)), float(vertex.get("y", 0.0)))
+        candidates.append((_distance((float(point[0]), float(point[1])), vertex_point), vertex.get("id")))
+    if not candidates:
+        return None
+    distance, vertex_id = min(candidates, key=lambda item: item[0])
+    return str(vertex_id) if vertex_id and distance <= tolerance else None
+
+
+def _provider_edges(local: dict[str, Any], vertices: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    edges: list[dict[str, Any]] = []
+    for edge in local.get("final_contour") or []:
+        start = [round(float(edge["start"][0]), 2), round(float(edge["start"][1]), 2)]
+        end = [round(float(edge["end"][0]), 2), round(float(edge["end"][1]), 2)]
+        path_points = [
+            [round(float(point[0]), 2), round(float(point[1]), 2)]
+            for point in edge.get("path_points") or [start, end]
+        ]
+        row = dict(edge)
+        row.update(
+            {
+                "from_vertex": edge.get("from_vertex"),
+                "to_vertex": edge.get("to_vertex"),
+                "path_points": path_points,
+                "status": "mapped",
+                "pixel_length": round(float(edge.get("pixel_length", _distance(tuple(start), tuple(end)))), 2),
+            }
+        )
+        edges.append(row)
+    return edges
+
+
+def _provider_dimensions(local: dict[str, Any], edges: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    edge_ids = {edge.get("id") for edge in edges}
+    output: list[dict[str, Any]] = []
+    for dimension in local.get("dimensions") or []:
+        final_interval_id = dimension.get("final_interval_id")
+        segment_ids = [
+            str(edge_id)
+            for edge_id in ([final_interval_id] if final_interval_id else [])
+            if edge_id and edge_id in edge_ids
+        ]
+        primary_edge = segment_ids[0] if segment_ids else None
+        existing = {
+            key: value
+            for key, value in dimension.items()
+            if key not in {"id", "value", "text", "label_center", "edge_id", "covered_edge_ids", "edge_segments_ids"}
+        }
+        output.append(
+            {
+                "id": dimension.get("id"),
+                "page": local.get("page_number"),
+                "value_mm": float(dimension.get("value", 0.0)),
+                "text": dimension.get("text", ""),
+                "bbox": dimension.get("bbox") or [
+                    dimension.get("label_center", [0.0, 0.0])[0],
+                    dimension.get("label_center", [0.0, 0.0])[1],
+                    dimension.get("label_center", [0.0, 0.0])[0],
+                    dimension.get("label_center", [0.0, 0.0])[1],
+                ],
+                "label_center": dimension.get("label_center") or [0.0, 0.0],
+                "edge_candidates": [
+                    {"edge_id": edge_id, "distance_px": dimension.get("gap_px"), "source": "final_segment"}
+                    for edge_id in segment_ids
+                ],
+                "selected_edge_id": primary_edge,
+                "covered_edge_ids": segment_ids,
+                "status": dimension.get("status", "unresolved"),
+                "geometry_status": "mapped" if segment_ids else dimension.get("final_interval_status", "unresolved"),
+                "source": "final_dimension_mapping",
+                "mapping_method": "single_extension_projection_on_final_contour",
+                "final_from_vertex": dimension.get("final_from_vertex"),
+                "final_to_vertex": dimension.get("final_to_vertex"),
+                "final_contact_point": dimension.get("final_contact_point"),
+                "existing_mapping": existing,
+            }
+        )
+    return output
+
+
+def _final_edge_candidate_groups(edges: list[dict[str, Any]], dimensions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_edge: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for dimension in dimensions:
+        for edge_id in dimension.get("covered_edge_ids") or ([dimension.get("selected_edge_id")] if dimension.get("selected_edge_id") else []):
+            by_edge[str(edge_id)].append(dimension)
+    groups = []
+    for edge in edges:
+        edge_id = str(edge.get("id"))
+        items = by_edge.get(edge_id, [])
+        from_vertex = edge.get("from_vertex")
+        to_vertex = edge.get("to_vertex")
+        is_handwheel = bool(edge.get("is_handwheel_segment"))
+        has_distinct_endpoints = bool(from_vertex and to_vertex and str(from_vertex) != str(to_vertex))
+        # The local graph also contains short construction/helper strokes.
+        # They are useful during geometry processing but are not final pipe
+        # segments and should not be presented as candidate groups.
+        if not items and not is_handwheel and not has_distinct_endpoints:
+            continue
+        groups.append(
+            {
+                "from_vertex": from_vertex,
+                "to_vertex": to_vertex,
+                "edge_ids": [edge_id],
+                "candidate_ids": [item.get("id") for item in items],
+                "candidate_values_mm": [float(item.get("value_mm", 0.0)) for item in items],
+                "candidate_statuses": [
+                    (item.get("existing_mapping") or {}).get("local_filter_decision") or item.get("status")
+                    for item in items
+                ],
+                "is_handwheel_segment": is_handwheel,
+                "handwheel_ids": list(edge.get("handwheel_ids") or []),
+                "status": "ambiguous" if any(item.get("status") == "ambiguous" for item in items) else ("mapped" if items else "no_candidates"),
+            }
+        )
+    return groups
+
+
+def _provider_handwheels(local: dict[str, Any], edges: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_handwheel: dict[str, list[str]] = defaultdict(list)
+    for edge in edges:
+        for handwheel_id in edge.get("handwheel_ids") or []:
+            if edge.get("id") not in by_handwheel[str(handwheel_id)]:
+                by_handwheel[str(handwheel_id)].append(str(edge["id"]))
+    rows = []
+    for item in local.get("handwheels") or []:
+        row = dict(item)
+        final_edge_ids = by_handwheel.get(str(item.get("id")), [])
+        if final_edge_ids:
+            row["edge_id"] = final_edge_ids[0]
+            row["covered_edge_ids"] = final_edge_ids
+        row.pop("edge_created", None)
+        row.pop("edge_kind", None)
+        row.pop("is_pipe_edge", None)
+        rows.append(row)
+    return rows
+
+
+def _provider_valve_edges(edges: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "edge_id": edge.get("id"),
+            "element_type": "valve",
+            "is_handwheel_segment": bool(edge.get("is_handwheel_segment")),
+            "handwheel_ids": list(edge.get("handwheel_ids") or []),
+            "from_vertex": edge.get("from_vertex"),
+            "to_vertex": edge.get("to_vertex"),
+        }
+        for edge in edges
+        if edge.get("is_valve_edge") or edge.get("is_handwheel_segment")
+    ]
+
+
 def build_map(pdf_path: Path, page_number: int) -> dict[str, Any]:
-    graph = _stroke_graph(pdf_path, page_number)
-    vertices, uncertain_vertices = _vertex_rows(pdf_path, page_number)
-    edges = _build_edges(graph, vertices)
-    dimensions, discarded = _map_dimensions(pdf_path, page_number, edges, graph)
-    groups = _group_dimensions(edges, dimensions)
+    # This is the same finalized mapping used by local PDF annotations.  The
+    # provider payload must not rebuild a second pre-finalization graph.
+    local = dimension_mapping.map_dimensions(pdf_path, page_number)
+    vertices = _provider_vertex_rows(local)
+    edges = _provider_edges(local, vertices)
+    dimensions = _provider_dimensions(local, edges)
+    groups = _final_edge_candidate_groups(edges, dimensions)
+    uncertain_vertices = []
+    discarded = [
+        (item.get("text", ""), None, item.get("reason", ""))
+        for item in local.get("discarded_numbers") or []
+    ]
     unresolved_dimensions = [
         {
             "candidate_id": dimension["id"],
             "reason": "no_pipe_edge_within_tolerance",
         }
         for dimension in dimensions
-        if dimension["status"] == "unresolved"
+        if dimension.get("geometry_status") == "unresolved"
     ]
     unresolved_edges = [
         {
@@ -471,6 +666,7 @@ def build_map(pdf_path: Path, page_number: int) -> dict[str, Any]:
         for edge in edges
         if edge["status"] == "unresolved_geometry"
     ]
+    handwheels = _provider_handwheels(local, edges)
     return {
         "pdf": pdf_path.name,
         "page": page_number,
@@ -480,6 +676,12 @@ def build_map(pdf_path: Path, page_number: int) -> dict[str, Any]:
         "edges": edges,
         "dimensions": dimensions,
         "edge_candidate_groups": groups,
+        "final_vertices": local.get("final_vertices", []),
+        "handwheel_vertices": local.get("handwheel_vertices", []),
+        "valve_edges": local.get("valve_edges", []),
+        "handwheels": handwheels,
+        "connections": local.get("connections", []),
+        "valve_edges": _provider_valve_edges(edges),
         "unresolved_dimensions": unresolved_dimensions,
         "unresolved_edges": unresolved_edges,
         "discarded_numbers": [
@@ -520,6 +722,21 @@ def render_pdf(pdf_path: Path, page_number: int, output_pdf: Path, mapping: dict
                 color=color,
             )
 
+        # Show the exact one-line projections used to find final contour
+        # intersections.  They are intentionally drawn on the diagnostic PDF
+        # only and are not part of the provider payload.
+        for dimension in mapping["dimensions"]:
+            projection = dimension.get("final_projection_line")
+            if not isinstance(projection, list) or len(projection) != 2:
+                continue
+            page.draw_line(
+                fitz.Point(*projection[0]),
+                fitz.Point(*projection[1]),
+                color=PROJECTION_COLOR,
+                width=1.5,
+                overlay=True,
+            )
+
         for vertex in mapping["vertices"]:
             role_color = mark_pipeline.VERTEX_ROLE_COLORS.get(vertex["role"], (0.8, 0.05, 0.05))
             point = fitz.Point(vertex["x"], vertex["y"])
@@ -534,7 +751,7 @@ def render_pdf(pdf_path: Path, page_number: int, output_pdf: Path, mapping: dict
         dimensions_by_id = {dimension["id"]: dimension for dimension in mapping["dimensions"]}
         for dimension in mapping["dimensions"]:
             center = fitz.Point(*dimension["label_center"])
-            color = DIMENSION_COLORS[dimension["status"]]
+            color = DIMENSION_COLORS.get(dimension.get("geometry_status") or dimension.get("status"), DIMENSION_COLORS["mapped"])
             page.draw_rect(
                 fitz.Rect(center.x - 2, center.y - 8, center.x + 38, center.y + 5),
                 color=color,
@@ -598,8 +815,8 @@ def main() -> int:
         "uncertain_vertices": len(mapping["uncertain_vertices"]),
         "edges": len(mapping["edges"]),
         "dimensions": len(mapping["dimensions"]),
-        "mapped_dimensions": sum(1 for item in mapping["dimensions"] if item["status"] == "mapped"),
-        "ambiguous_dimensions": sum(1 for item in mapping["dimensions"] if item["status"] == "ambiguous"),
+        "mapped_dimensions": sum(1 for item in mapping["dimensions"] if item.get("geometry_status") == "mapped"),
+        "ambiguous_dimensions": sum(1 for item in mapping["dimensions"] if item.get("status") == "ambiguous"),
         "unresolved_dimensions": len(mapping["unresolved_dimensions"]),
     }, ensure_ascii=False, indent=2))
     return 0

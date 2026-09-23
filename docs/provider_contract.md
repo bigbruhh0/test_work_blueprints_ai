@@ -21,6 +21,7 @@ Top-level shape:
   "preliminary_decisions": [],
   "edge_candidate_groups": [],
   "handwheels": [],
+  "valve_edges": [],
   "connections": [],
   "map_text": "..."
 }
@@ -188,6 +189,23 @@ Connection/continuation/tie-in labels detected on the drawing.
   "arrow_start": [x, y],
   "arrow_end": [x, y],
   "arrow_segments": [{ "start": [x, y], "end": [x, y] }]
+}
+```
+
+### valve_edges[]
+
+Final edge segments that belong to a valve or handwheel. These are already
+normalized edges after VE/HG vertex insertion; the payload does not expose
+the old parent edge IDs.
+
+```json
+{
+  "edge_id": "HW-001-SEG",
+  "element_type": "valve",
+  "is_handwheel_segment": true,
+  "handwheel_ids": ["HW-001"],
+  "from_vertex": "HG-01-A",
+  "to_vertex": "HG-01-B"
 }
 ```
 

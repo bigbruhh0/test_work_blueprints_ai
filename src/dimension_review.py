@@ -143,6 +143,7 @@ def build_review_payload(mapping: dict[str, Any], map_text: str) -> dict[str, An
         ],
         "edge_candidate_groups": mapping.get("edge_candidate_groups", []),
         "handwheels": mapping.get("handwheels", []),
+        "valve_edges": mapping.get("valve_edges", []),
         "connections": mapping.get("connections", []),
         "map_text": map_text,
     }
