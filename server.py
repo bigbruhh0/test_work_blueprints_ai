@@ -192,13 +192,17 @@ def load_pdf(body: LoadPdfBody) -> dict[str, Any]:
         raise HTTPException(404, f"Файл не найден: {body.file_path}")
     cache_status = get_pdf_cache_status(resolved)
     pages, groups = prepare_pdf_groups(resolved, use_disk_cache=True)
+    group_rows = [
+        {"line_id": group.line_id, "pages": [page.page_number for page in group.pages]}
+        for group in groups
+    ]
     document_id = uuid.uuid4().hex[:12]
     STATE["documents"][document_id] = {
         "document_id": document_id,
         "pdf_path": str(resolved),
         "source_name": resolved.name,
         "pages_count": len(pages),
-        "groups": groups,
+        "groups": group_rows,
         "cache": cache_status,
     }
     return {
@@ -206,7 +210,7 @@ def load_pdf(body: LoadPdfBody) -> dict[str, Any]:
         "source_name": resolved.name,
         "pages_count": len(pages),
         "cache": cache_status,
-        "groups": [{"line_id": group.line_id, "pages": [page.page_number for page in group.pages]} for group in groups],
+        "groups": group_rows,
     }
 
 
@@ -222,7 +226,7 @@ async def upload_pdf(file: UploadFile) -> dict[str, Any]:
 
 def _group(document: dict[str, Any], line_id: str):
     for group in document["groups"]:
-        if group.line_id == line_id:
+        if group.get("line_id") == line_id:
             return group
     return None
 
@@ -674,7 +678,7 @@ def create_run(body: AnalyzeBody) -> dict[str, Any]:
     )
     for line_id in body.line_ids:
         group = _group(document, line_id)
-        pages = [page.page_number for page in (group.pages if group else []) if page.page_number not in excluded_pages]
+        pages = [int(page_number) for page_number in (group.get("pages") if group else []) if int(page_number) not in excluded_pages]
         if not pages:
             continue
         run.lines[line_id] = LineRun(line_id=line_id, pages=pages)

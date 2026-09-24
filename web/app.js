@@ -624,6 +624,35 @@ function decisionBadge(decision) {
   return '<span class="decision-pill decision-' + esc(label.replace(/[^a-z0-9_-]/g, '-')) + '">' + esc(label) + '</span>';
 }
 
+function pipelineAdjacentSheetItems(line) {
+  const analysis = line.analysis && line.analysis.pipeline_length;
+  const provider = (analysis && analysis.provider_result) || {};
+  const items = [];
+  (Array.isArray(provider.intermediate_distances) ? provider.intermediate_distances : []).forEach(function (item, index) {
+    items.push({ ...item, _kind: 'intermediate_distance', _index: index });
+  });
+  (Array.isArray(provider.cross_sheet_measurements) ? provider.cross_sheet_measurements : []).forEach(function (item) {
+    items.push({ ...item, _kind: 'cross_sheet_measurement' });
+  });
+  (Array.isArray(provider.cross_sheet_links) ? provider.cross_sheet_links : []).forEach(function (item) {
+    items.push({ ...item, _kind: 'cross_sheet_link' });
+  });
+  return items;
+}
+
+function pipelineAdjacentKindLabel(kind) {
+  if (kind === 'intermediate_distance') return 'смежная длина';
+  if (kind === 'cross_sheet_measurement') return 'размер с другого листа';
+  if (kind === 'cross_sheet_link') return 'ссылка СМ ЛИСТ';
+  return 'межлистовая связь';
+}
+
+function pipelineAdjacentPageLabel(item) {
+  const from = item.from_page || item.page || '?';
+  const to = item.to_page || item.target_page || item.sheet || item.target_sheet || '?';
+  return String(from) + ' → ' + String(to);
+}
+
 function pipelineLengthSummary(line) {
   const analysis = line.analysis && line.analysis.pipeline_length;
   if (!analysis) return '';
@@ -641,7 +670,8 @@ function pipelineLengthSummary(line) {
   };
   const assessments = Array.isArray(provider.candidate_assessments) ? provider.candidate_assessments : [];
   const disputes = assessments.filter(function (item) { return item.assessment === 'disputed' || item.assessment === 'insufficient'; });
-  const intermediate = Array.isArray(provider.intermediate_distances) ? provider.intermediate_distances : [];
+  const adjacentItems = pipelineAdjacentSheetItems(line);
+  const intermediate = adjacentItems.filter(function (item) { return item._kind === 'intermediate_distance'; });
   const branches = Array.isArray(lengths.branches) ? lengths.branches : [];
   const manualAccepted = (manual.candidate_ids || []).length;
   const manualKept = (manual.keep_local_candidate_ids || []).length;
@@ -666,8 +696,40 @@ function pipelineLengthSummary(line) {
     + '</div>'
     + (branches.length ? '<div class="pipeline-chip-row">' + branches.map(function (branch) { return '<span class="pipeline-chip">' + esc(branch.branch_id || 'BR') + ' · ' + esc(formatMm(branch.clean_length_mm)) + '</span>'; }).join('') + '</div>' : '')
     + (disputes.length ? '<p class="pipeline-note"><b>Требуют внимания:</b> ' + esc(disputes.map(function (item) { return item.candidate_id; }).join(', ')) + '</p>' : '')
-    + (intermediate.length ? '<p class="pipeline-note"><b>Смежные расстояния:</b> ' + esc(intermediate.map(function (item) { return (item.from_page || '?') + '→' + (item.to_page || '?') + ': ' + (item.value_mm || '?') + ' мм'; }).join('; ')) + '</p>' : '')
+    + (intermediate.length ? '<p class="pipeline-note"><b>Смежные расстояния:</b> найдены провайдером, детали ниже.</p>' : '')
     + '</details>';
+}
+
+function pipelineAdjacentSheetBlock(line) {
+  const analysis = line.analysis && line.analysis.pipeline_length;
+  const manual = (analysis && analysis.manual_confirmation) || {};
+  const accepted = new Set((manual.intermediate_distance_indices || []).map(function (item) { return Number(item); }));
+  const items = pipelineAdjacentSheetItems(line);
+  if (!items.length) return '';
+  const rows = items.map(function (item) {
+    const value = item.value_mm ?? item.length_mm ?? item.distance_mm;
+    const hasValue = value != null && value !== '';
+    const isIntermediate = item._kind === 'intermediate_distance';
+    const isAccepted = isIntermediate && accepted.has(Number(item._index));
+    const source = item.source || item.source_text || item.label || item.reference_text || item.candidate_id || '—';
+    const reason = item.reason || item.explanation || item.comment || item.note || '—';
+    const confidence = item.confidence != null ? item.confidence : (item.status || '—');
+    return '<tr>'
+      + '<td><b>' + esc(pipelineAdjacentKindLabel(item._kind)) + '</b><br><span class="muted">' + esc(pipelineAdjacentPageLabel(item)) + '</span></td>'
+      + '<td>' + (hasValue ? '<b>' + esc(formatMm(value)) + '</b>' : '<span class="muted">без длины</span>') + '<br><span class="muted">' + esc(item.route_type || item.route || 'main') + '</span></td>'
+      + '<td>' + esc(source) + '</td>'
+      + '<td>' + esc(confidence) + '</td>'
+      + '<td>' + esc(reason) + '</td>'
+      + '<td>' + (isAccepted
+        ? '<span class="manual-choice">учтено вручную</span>'
+        : (isIntermediate && hasValue ? '<button type="button" class="provider-confirm-button compact" data-provider-line="' + esc(line.line_id) + '" data-provider-action="accept_distance" data-provider-distance-index="' + esc(item._index) + '">Учесть в расчете</button>' : '<span class="muted">только справочно</span>'))
+      + '</td>'
+      + '</tr>';
+  }).join('');
+  return '<details class="notes collapsible-result pipeline-adjacent-block" open><summary>Смежные длины / СМ ЛИСТ (' + items.length + ')</summary>'
+    + '<div class="table-wrap"><table class="viewer-table pipeline-adjacent-table"><thead><tr><th>Тип</th><th>Длина</th><th>Источник</th><th>Уверенность</th><th>Пояснение</th><th>Решение</th></tr></thead><tbody>'
+    + rows
+    + '</tbody></table></div></details>';
 }
 
 function pipelineProviderAssessment(provider, estimate) {
@@ -696,6 +758,9 @@ function pipelineLengthPageDetail(line, pageNumber) {
     ? '<details class="notes collapsible-result" open><summary>Изображение для проверки провайдера</summary><img class="viewer-frame" src="' + viewerImageUrl(state.runId, line.line_id, diagnosticFile) + '" alt="Диагностика расчета длины, лист ' + esc(pageNumber) + '"></details>'
     : '';
   const estimates = pipelineLengthEstimates(line).filter(function (row) { return Number(row.page) === Number(pageNumber); });
+  const adjacentForPage = pipelineAdjacentSheetItems(line).filter(function (item) {
+    return Number(item.page || item.from_page) === Number(pageNumber);
+  });
   const pageSummary = (local.page_summaries || []).find(function (row) { return Number(row.page) === Number(pageNumber); }) || {
     clean_length_mm: estimates.filter(function (row) { return row.local_decision === 'include'; }).reduce(function (sum, row) { return sum + Number(row.value_mm || 0); }, 0),
   };
@@ -729,7 +794,14 @@ function pipelineLengthPageDetail(line, pageNumber) {
         + '<button type="button" class="provider-confirm-button secondary" data-provider-line="' + esc(line.line_id) + '" data-provider-action="keep_local" data-provider-candidate="' + esc(providerCandidateId) + '">Оставить локальное</button></div>' : '')
       + '</td></tr>';
   }).join('');
-  return diagnosticMarkup + '<section class="pipeline-length-page">'
+  const adjacentMarkup = adjacentForPage.length
+    ? '<details class="notes collapsible-result pipeline-page-adjacent"><summary>СМ ЛИСТ на этом листе (' + adjacentForPage.length + ')</summary>'
+      + '<ul class="pipeline-adjacent-list">' + adjacentForPage.map(function (item) {
+        const value = item.value_mm ?? item.length_mm ?? item.distance_mm;
+        return '<li><b>' + esc(pipelineAdjacentKindLabel(item._kind)) + '</b>: ' + esc(pipelineAdjacentPageLabel(item)) + (value != null ? ' · ' + esc(formatMm(value)) : '') + (item.reason || item.explanation ? '<br><span class="muted">' + esc(item.reason || item.explanation) + '</span>' : '') + '</li>';
+      }).join('') + '</ul></details>'
+    : '';
+  return diagnosticMarkup + adjacentMarkup + '<section class="pipeline-length-page">'
     + '<div class="pipeline-page-heading"><h2>Лист ' + esc(pageNumber) + '</h2><span>предварительная сумма ' + esc(formatMm(pageSummary.clean_length_mm ?? 0)) + '</span></div>'
     + '<div class="table-wrap pipeline-review-wrap"><table class="data-table pipeline-review-table"><thead><tr><th>Кандидат</th><th>Локальное решение</th><th>Подтверждение провайдера</th></tr></thead><tbody>'
     + (rows || '<tr><td colspan="3">Размерных кандидатов нет</td></tr>')
@@ -1564,7 +1636,7 @@ function renderResults(run) {
           + '</div>'
         : '')
       + lineProviderTrace
-      + (line.analysis && line.analysis.pipeline_length ? pipelineLengthSummary(line) + pipelineHandwheelBlock(line) : '')
+      + (line.analysis && line.analysis.pipeline_length ? pipelineLengthSummary(line) + pipelineAdjacentSheetBlock(line) + pipelineHandwheelBlock(line) : '')
       + '<div class="page-nav"><span class="page-nav-label">Листы</span><div class="row page-selector-row">' + pageButtons + '</div></div>'
       + '<div class="page-content" data-line="' + esc(line.line_id) + '">'
       + (firstPage
@@ -1614,11 +1686,11 @@ function bindPipelineProviderConfirmations() {
             line_id: lineId,
             candidate_ids: button.dataset.providerAction === 'accept' ? [button.dataset.providerCandidate] : [],
             keep_local_candidate_ids: button.dataset.providerAction === 'keep_local' ? [button.dataset.providerCandidate] : [],
-            intermediate_distance_indices: [],
+            intermediate_distance_indices: button.dataset.providerAction === 'accept_distance' ? [Number(button.dataset.providerDistanceIndex)] : [],
             edge_ids: [],
           }),
         });
-        state.providerDecisionEdit.delete([lineId, button.dataset.providerCandidate].join('|'));
+        if (button.dataset.providerCandidate) state.providerDecisionEdit.delete([lineId, button.dataset.providerCandidate].join('|'));
         state.currentRun = updated;
         renderResults(updated);
       } catch (error) {

@@ -459,6 +459,24 @@ def _normalize_page_answer(answer: dict[str, Any], page_number: Any) -> dict[str
         row.setdefault("to_page", page_number)
         segments.append(row)
     normalized["route_segments"] = segments
+
+    cross_sheet_links = []
+    for item in normalized.get("cross_sheet_links") or []:
+        row = dict(item)
+        row.setdefault("from_page", page_number)
+        row.setdefault("page", page_number)
+        cross_sheet_links.append(row)
+    normalized["cross_sheet_links"] = cross_sheet_links
+
+    intermediate_distances = []
+    for item in normalized.get("intermediate_distances") or []:
+        row = dict(item)
+        row.setdefault("from_page", page_number)
+        row.setdefault("page", page_number)
+        if row.get("candidate_id"):
+            row["candidate_id"] = _prefix_page_id(page_number, row.get("candidate_id"))
+        intermediate_distances.append(row)
+    normalized["intermediate_distances"] = intermediate_distances
     return normalized
 
 
@@ -597,10 +615,15 @@ def calculate_provider_length_summary(
     manual_confirmation = manual_confirmation or {}
     accepted_by_user = {str(item) for item in manual_confirmation.get("candidate_ids") or []}
     kept_local_by_user = {str(item) for item in manual_confirmation.get("keep_local_candidate_ids") or []}
+    accepted_intermediate_indices = {
+        int(item)
+        for item in manual_confirmation.get("intermediate_distance_indices") or []
+        if isinstance(item, int) or str(item).isdigit()
+    }
     seen_candidates: set[str] = set()
     totals = {
-        "main": {"clean_length_mm": 0.0, "dirty_length_mm": 0.0, "ambiguous_length_mm": 0.0, "counted_candidate_ids": []},
-        "branch": {"clean_length_mm": 0.0, "dirty_length_mm": 0.0, "ambiguous_length_mm": 0.0, "counted_candidate_ids": []},
+        "main": {"clean_length_mm": 0.0, "dirty_length_mm": 0.0, "ambiguous_length_mm": 0.0, "counted_candidate_ids": [], "counted_intermediate_distances": []},
+        "branch": {"clean_length_mm": 0.0, "dirty_length_mm": 0.0, "ambiguous_length_mm": 0.0, "counted_candidate_ids": [], "counted_intermediate_distances": []},
     }
     for page in payload.get("pages") or []:
         page_number = page.get("page")
@@ -641,6 +664,25 @@ def calculate_provider_length_summary(
         for key in ("clean_length_mm", "dirty_length_mm", "ambiguous_length_mm"):
             totals["branch"][key] += branch[key]
         totals["branch"]["counted_candidate_ids"].extend(branch["counted_candidate_ids"])
+    for index, item in enumerate(provider.get("intermediate_distances") or []):
+        if index not in accepted_intermediate_indices:
+            continue
+        value = float(item.get("value_mm") or item.get("length_mm") or 0.0)
+        if value <= 0:
+            continue
+        route_type = str(item.get("route_type") or item.get("route") or "main").lower()
+        branch_id = str(item.get("branch_id") or "")
+        bucket = branches.get(branch_id) if branch_id else None
+        branch_bucket = bool(bucket)
+        if not bucket:
+            bucket = totals["branch" if route_type == "branch" else "main"]
+        bucket["clean_length_mm"] += value
+        bucket["dirty_length_mm"] += value
+        bucket.setdefault("counted_intermediate_distances", []).append(index)
+        if branch_bucket:
+            totals["branch"]["clean_length_mm"] += value
+            totals["branch"]["dirty_length_mm"] += value
+            totals["branch"].setdefault("counted_intermediate_distances", []).append(index)
     for bucket in totals.values():
         for key in ("clean_length_mm", "dirty_length_mm", "ambiguous_length_mm"):
             bucket[key] = round(bucket[key], 2)
