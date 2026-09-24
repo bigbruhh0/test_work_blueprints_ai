@@ -101,6 +101,21 @@ def _dimension_row(dimension: dict[str, Any], page_number: int) -> dict[str, Any
     }
 
 
+def _coordinate_rows(mapping: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = []
+    for index, row in enumerate(mapping.get("coordinates") or [], start=1):
+        rows.append(
+            {
+                "id": row.get("id") or f"C{index:03d}",
+                "label": row.get("label"),
+                "value": row.get("value"),
+                "label_bbox": row.get("label_bbox"),
+                "value_bbox": row.get("value_bbox"),
+            }
+        )
+    return rows
+
+
 def build_pipeline_length_page(mapping: dict[str, Any], page_number: int) -> dict[str, Any]:
     dimensions = [_dimension_row(row, page_number) for row in mapping.get("dimensions") or []]
     annotations = mapping.get("handwheel_annotations") or {}
@@ -127,6 +142,7 @@ def build_pipeline_length_page(mapping: dict[str, Any], page_number: int) -> dic
         "page": page_number,
         "vertices": _base_vertices(mapping),
         "edges": _base_edges(mapping),
+        "coordinates": _coordinate_rows(mapping),
         "dimensions": dimensions,
         "local_decisions": [
             dict(row)
@@ -256,6 +272,8 @@ def build_pipeline_length_text(payload: dict[str, Any]) -> str:
         for dimension in page.get("dimensions") or []:
             local = dimension.get("local_decision") or {}
             lines.append(f"CANDIDATE {dimension.get('candidate_key')} local_id={dimension.get('id')} value_mm={dimension.get('value_mm')} edge={dimension.get('edge_id')} local={local.get('decision')} reason={local.get('reason')}")
+        for coordinate in page.get("coordinates") or []:
+            lines.append(f"COORDINATE {coordinate.get('id')} {coordinate.get('label')}={coordinate.get('value')} label_bbox={coordinate.get('label_bbox')} value_bbox={coordinate.get('value_bbox')}")
         for handwheel in page.get("handwheels") or []:
             lines.append(f"HANDWHEEL {handwheel.get('id')} label={handwheel.get('label')} edge={handwheel.get('edge_id')} arrow_end={handwheel.get('arrow_end')}")
         for glyph in page.get("handwheel_glyphs") or []:
@@ -477,6 +495,17 @@ def _normalize_page_answer(answer: dict[str, Any], page_number: Any) -> dict[str
             row["candidate_id"] = _prefix_page_id(page_number, row.get("candidate_id"))
         intermediate_distances.append(row)
     normalized["intermediate_distances"] = intermediate_distances
+
+    vertex_coordinates = []
+    for item in normalized.get("vertex_coordinates") or normalized.get("points") or []:
+        row = dict(item)
+        vertex_id = row.get("vertex_id") or row.get("id")
+        if vertex_id:
+            row["vertex_id"] = _prefix_page_id(page_number, vertex_id)
+            row.setdefault("local_vertex_id", vertex_id)
+        row.setdefault("page", page_number)
+        vertex_coordinates.append(row)
+    normalized["vertex_coordinates"] = vertex_coordinates
     return normalized
 
 
@@ -491,6 +520,7 @@ def merge_pipeline_length_provider_traces(
         "route_segments": [],
         "cross_sheet_links": [],
         "intermediate_distances": [],
+        "vertex_coordinates": [],
         "lengths": {
             "main": {"clean_length_mm": 0.0, "dirty_length_mm": 0.0, "ambiguous_length_mm": 0.0},
             "branch": {"clean_length_mm": 0.0, "dirty_length_mm": 0.0, "ambiguous_length_mm": 0.0},
@@ -508,7 +538,7 @@ def merge_pipeline_length_provider_traces(
         page_payload = trace.get("payload") or {}
         page_number = ((page_payload.get("pages") or [{}])[0] or {}).get("page")
         answer = _normalize_page_answer(trace.get("answer") or {}, page_number)
-        for key in ("candidate_assessments", "edge_routes", "branch_routes", "route_segments", "cross_sheet_links", "intermediate_distances"):
+        for key in ("candidate_assessments", "edge_routes", "branch_routes", "route_segments", "cross_sheet_links", "intermediate_distances", "vertex_coordinates"):
             combined_answer[key].extend(answer.get(key) or [])
         response_raw["page_responses"].append({
             "page": page_number,

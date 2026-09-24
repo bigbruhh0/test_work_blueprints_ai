@@ -8,6 +8,7 @@ from src.pipeline_length import (
     build_pipeline_length_payload,
     build_pipeline_length_result,
     calculate_local_length_summary,
+    merge_pipeline_length_provider_traces,
 )
 
 
@@ -66,6 +67,7 @@ def test_pipeline_length_payload_keeps_base_v_and_source_edges_only():
             "local_filter_reason": "ok", "dimension_stroke": {"start": [0, 0], "end": [1, 1]},
         }],
         "connections": [],
+        "coordinates": [{"label": "X", "value": "226150", "label_bbox": [1, 1, 2, 2], "value_bbox": [3, 1, 8, 2]}],
         "discarded_numbers": [],
     }
     payload = build_pipeline_length_payload("L-1", "drawing.pdf", [(216, mapping)])
@@ -75,6 +77,7 @@ def test_pipeline_length_payload_keeps_base_v_and_source_edges_only():
     assert payload["pages"][0]["edges"][0]["id"] == "E001"
     assert all(not str(row["id"]).startswith(("HG-", "VE-", "F-")) for row in payload["pages"][0]["vertices"] + payload["pages"][0]["edges"])
     assert payload["pages"][0]["dimensions"][0]["local_decision"]["decision"] == "include"
+    assert payload["pages"][0]["coordinates"][0]["label"] == "X"
     assert payload["pages"][0]["handwheels"] == []
     assert payload["pages"][0]["handwheel_glyphs"] == []
 
@@ -90,6 +93,19 @@ def test_pipeline_length_payload_combines_pages_and_local_summary():
     summary = calculate_local_length_summary(payload)
     assert summary["clean_length_mm"] == 100
     assert summary["ambiguous_length_mm"] == 50
+
+
+def test_pipeline_length_provider_vertex_coordinates_are_page_scoped():
+    payload = {"pages": [{"page": 216}, {"page": 217}]}
+    trace = {
+        "payload": {"pages": [{"page": 216}]},
+        "answer": {"vertex_coordinates": [{"vertex_id": "V01", "x": 1, "y": 2, "z": 3}]},
+    }
+    merged = merge_pipeline_length_provider_traces(payload, [trace])
+    point = merged["answer"]["vertex_coordinates"][0]
+    assert point["vertex_id"] == "216:V01"
+    assert point["local_vertex_id"] == "V01"
+    assert point["page"] == 216
 
 
 def test_provider_suggestions_are_not_applied_automatically():

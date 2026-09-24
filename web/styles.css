@@ -1750,8 +1750,14 @@ select {
   border-color: #d9c985;
   background: #fffdf2;
 }
+.pipeline-vertex-coordinates {
+  border-color: #b7d7ef;
+  background: #f5fbff;
+}
 .pipeline-adjacent-table th,
-.pipeline-adjacent-table td {
+.pipeline-adjacent-table td,
+.pipeline-coordinates-table th,
+.pipeline-coordinates-table td {
   vertical-align: top;
 }
 .pipeline-adjacent-table td:nth-child(1) {
@@ -1759,6 +1765,9 @@ select {
 }
 .pipeline-adjacent-table td:nth-child(2) {
   min-width: 120px;
+}
+.pipeline-coordinates-table td:nth-child(2) {
+  min-width: 150px;
 }
 .pipeline-adjacent-list {
   margin: 8px 0 0;

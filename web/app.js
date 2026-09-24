@@ -653,6 +653,28 @@ function pipelineAdjacentPageLabel(item) {
   return String(from) + ' → ' + String(to);
 }
 
+function pipelineVertexCoordinates(line) {
+  const analysis = line.analysis && line.analysis.pipeline_length;
+  const provider = (analysis && analysis.provider_result) || {};
+  return Array.isArray(provider.vertex_coordinates) ? provider.vertex_coordinates : [];
+}
+
+function pipelineVertexCoordinateKey(item) {
+  const vertexId = String(item.vertex_id || item.id || '');
+  if (vertexId.includes(':')) return vertexId;
+  const page = item.page || item.from_page;
+  return page ? String(page) + ':' + vertexId : vertexId;
+}
+
+function pipelineVertexCoordinateMap(line) {
+  const map = new Map();
+  pipelineVertexCoordinates(line).forEach(function (item) {
+    const key = pipelineVertexCoordinateKey(item);
+    if (key) map.set(key, item);
+  });
+  return map;
+}
+
 function pipelineLengthSummary(line) {
   const analysis = line.analysis && line.analysis.pipeline_length;
   if (!analysis) return '';
@@ -729,6 +751,32 @@ function pipelineAdjacentSheetBlock(line) {
   return '<details class="notes collapsible-result pipeline-adjacent-block" open><summary>Смежные длины / СМ ЛИСТ (' + items.length + ')</summary>'
     + '<div class="table-wrap"><table class="viewer-table pipeline-adjacent-table"><thead><tr><th>Тип</th><th>Длина</th><th>Источник</th><th>Уверенность</th><th>Пояснение</th><th>Решение</th></tr></thead><tbody>'
     + rows
+    + '</tbody></table></div></details>';
+}
+
+function pipelineVertexCoordinatesBlock(line) {
+  const rows = pipelineVertexCoordinates(line);
+  if (!rows.length) return '';
+  const html = rows.map(function (item) {
+    const vertex = item.vertex_id || item.id || '—';
+    const local = item.local_vertex_id && item.local_vertex_id !== vertex ? '<br><span class="muted">' + esc(item.local_vertex_id) + '</span>' : '';
+    const xyz = [item.x, item.y, item.z].map(function (value) { return value == null || value === '' ? '—' : String(value); }).join(' / ');
+    const sources = Array.isArray(item.source_coordinate_labels)
+      ? item.source_coordinate_labels.join(', ')
+      : (item.source_coordinate_labels || item.source || '—');
+    const confidence = item.confidence != null ? item.confidence : '—';
+    return '<tr>'
+      + '<td><b>' + esc(vertex) + '</b>' + local + '<br><span class="muted">лист ' + esc(item.page || '—') + '</span></td>'
+      + '<td class="mono">' + esc(xyz) + '</td>'
+      + '<td>' + esc(item.method || '—') + '</td>'
+      + '<td>' + esc(confidence) + '</td>'
+      + '<td>' + esc(sources) + '</td>'
+      + '<td>' + esc(item.reason || '—') + '</td>'
+      + '</tr>';
+  }).join('');
+  return '<details class="notes collapsible-result pipeline-vertex-coordinates" open><summary>Координаты вершин от провайдера (' + rows.length + ')</summary>'
+    + '<div class="table-wrap"><table class="viewer-table pipeline-coordinates-table"><thead><tr><th>Вершина</th><th>X / Y / Z</th><th>Метод</th><th>Уверенность</th><th>Источник</th><th>Пояснение</th></tr></thead><tbody>'
+    + html
     + '</tbody></table></div></details>';
 }
 
@@ -1002,6 +1050,22 @@ function combinedGraphForLine(line) {
   const isolated = new Set();
   const duplicates = [];
   const dimensions = new Map();
+  const providerCoordinates = pipelineVertexCoordinateMap(line);
+  const applyProviderCoordinates = function (node, pageNumber, localVertexId) {
+    const localId = String(localVertexId || node.local_vertex_id || node.id || '');
+    const coordinate = providerCoordinates.get(String(pageNumber) + ':' + localId) || providerCoordinates.get(localId);
+    if (!coordinate) return node;
+    const next = Object.assign({}, node, {
+      x: coordinate.x ?? node.x,
+      y: coordinate.y ?? node.y,
+      z: coordinate.z ?? node.z,
+      coordinate_source: 'provider',
+      coordinate_confidence: coordinate.confidence,
+      coordinate_reason: coordinate.reason,
+      source_coordinate_labels: coordinate.source_coordinate_labels,
+    });
+    return next;
+  };
   const rememberDimension = function (segment) {
     if (!segment || typeof segment !== 'object') return;
     const from = segment.from || segment.from_node_id || segment.start || segment.start_node_id;
@@ -1011,20 +1075,98 @@ function combinedGraphForLine(line) {
   };
   (line.page_results || []).forEach(function (pageResult) {
     const graph = pageResult.analysis && pageResult.analysis.graph;
-    if (!graph) return;
     const analysis = pageResult.analysis || {};
+    const localSnapshot = analysis.pipeline_length_local || {};
+    const pageNumber = pageResult.page_number;
+    if (!graph && localSnapshot) {
+      const edgeDimensions = new Map();
+      const localVertices = Array.isArray(localSnapshot.base_vertices || localSnapshot.vertices) ? (localSnapshot.base_vertices || localSnapshot.vertices) : [];
+      const fallbackNodeId = function (localId, point) {
+        if (String(localId || '').startsWith('V')) return String(localId);
+        if (!Array.isArray(point) || point.length < 2) return String(localId || '');
+        let best = null;
+        localVertices.forEach(function (vertex) {
+          const dx = Number(vertex.x) - Number(point[0]);
+          const dy = Number(vertex.y) - Number(point[1]);
+          const distance = Math.hypot(dx, dy);
+          if (Number.isFinite(distance) && (!best || distance < best.distance)) best = { id: String(vertex.id), distance: distance, vertex: vertex };
+        });
+        return best && best.distance <= 10 ? best.id : String(localId || '');
+      };
+      const ensureFallbackNode = function (localId, point) {
+        if (!localId) return '';
+        const id = String(pageNumber) + ':' + String(localId);
+        if (nodes.has(id)) return id;
+        const sourceVertex = localVertices.find(function (vertex) { return String(vertex.id) === String(localId); });
+        const base = sourceVertex || {};
+        nodes.set(id, applyProviderCoordinates(Object.assign({}, base, {
+          id: id,
+          local_vertex_id: String(localId),
+          page: pageNumber,
+          pages: [pageNumber],
+          x: base.x ?? (Array.isArray(point) ? point[0] : null),
+          y: base.y ?? (Array.isArray(point) ? point[1] : null),
+          z: base.z ?? 0,
+          role: base.role || 'edge_endpoint',
+        }), pageNumber, localId));
+        return id;
+      };
+      (Array.isArray(localSnapshot.dimensions) ? localSnapshot.dimensions : []).forEach(function (dimension) {
+        const edgeId = String(dimension.edge_id || '');
+        if (!edgeId) return;
+        const decision = dimension.local_filter_decision || ((dimension.local_decision || {}).decision);
+        if (decision === 'include' && dimension.value != null) edgeDimensions.set(edgeId, dimension.value);
+      });
+      localVertices.forEach(function (vertex, index) {
+        const localId = String(vertex.id || ('V' + (index + 1)));
+        const id = String(pageNumber) + ':' + localId;
+        if (!nodes.has(id)) {
+          nodes.set(id, applyProviderCoordinates(Object.assign({}, vertex, {
+            id: id,
+            local_vertex_id: localId,
+            page: pageNumber,
+            pages: [pageNumber],
+            z: vertex.z ?? 0,
+          }), pageNumber, localId));
+        }
+      });
+      (Array.isArray(localSnapshot.base_edges || localSnapshot.edges) ? (localSnapshot.base_edges || localSnapshot.edges) : []).forEach(function (edge, index) {
+        const fromLocal = fallbackNodeId(edge.from_vertex || edge.from_node_id || edge.from || edge.start_vertex, edge.start);
+        const toLocal = fallbackNodeId(edge.to_vertex || edge.to_node_id || edge.to || edge.end_vertex, edge.end);
+        if (!fromLocal || !toLocal) return;
+        const from = ensureFallbackNode(fromLocal, edge.start);
+        const to = ensureFallbackNode(toLocal, edge.end);
+        if (!from || !to || from === to) return;
+        const key = from + '->' + to;
+        if (edges.has(key)) {
+          duplicates.push({ from_node_id: from, to_node_id: to, page: pageNumber });
+          return;
+        }
+        const edgeId = edge.id || ('E' + (edges.size + 1));
+        edges.set(key, Object.assign({}, edge, {
+          id: String(pageNumber) + ':' + edgeId,
+          from_node_id: from,
+          to_node_id: to,
+          page: pageNumber,
+          dimension_mm: edge.length_mm ?? edge.value ?? edgeDimensions.get(String(edgeId)),
+        }));
+      });
+      return;
+    }
+    if (!graph) return;
     ((analysis.main_chain && analysis.main_chain.segments) || []).forEach(rememberDimension);
     (analysis.branches || []).forEach(function (branch) {
       (branch.segments || []).forEach(rememberDimension);
     });
     (Array.isArray(graph.nodes) ? graph.nodes : []).forEach(function (node, index) {
       const id = String(node.id || ('P' + pageResult.page_number + '-N' + index));
+      const withCoordinates = applyProviderCoordinates(Object.assign({}, node), pageResult.page_number, id);
       if (nodes.has(id)) {
         const existing = nodes.get(id);
-        if (existing.x == null && node.x != null) Object.assign(existing, node);
+        if (existing.x == null && withCoordinates.x != null) Object.assign(existing, withCoordinates);
         existing.pages = Array.from(new Set((existing.pages || []).concat(pageResult.page_number)));
       } else {
-        nodes.set(id, Object.assign({}, node, { id: id, page: pageResult.page_number, pages: [pageResult.page_number] }));
+        nodes.set(id, Object.assign({}, withCoordinates, { id: id, page: pageResult.page_number, pages: [pageResult.page_number] }));
       }
     });
     (Array.isArray(graph.edges) ? graph.edges : []).forEach(function (edge, index) {
@@ -1064,7 +1206,7 @@ async function loadThree() {
 }
 
 function graphPoint(node, index, THREE, bounds) {
-  const values = [node.x, node.y, node.z].map(Number);
+  const values = [node.x, node.y, node.z == null || node.z === '' ? 0 : node.z].map(Number);
   if (values.every(Number.isFinite)) {
     return new THREE.Vector3(
       (values[0] - bounds.min[0]) / bounds.span[0] * 12 - 6,
@@ -1129,7 +1271,7 @@ async function render3DGraph(container, graph) {
     keyLight.position.set(5, 10, 8);
     scene.add(keyLight);
 
-    const numeric = graph.nodes.map(function (node) { return [node.x, node.y, node.z].map(Number); }).filter(function (values) { return values.every(Number.isFinite); });
+    const numeric = graph.nodes.map(function (node) { return [node.x, node.y, node.z == null || node.z === '' ? 0 : node.z].map(Number); }).filter(function (values) { return values.every(Number.isFinite); });
     const min = [0, 0, 0].map(function (_, axis) { return numeric.length ? Math.min.apply(null, numeric.map(function (v) { return v[axis]; })) : 0; });
     const max = [0, 0, 0].map(function (_, axis) { return numeric.length ? Math.max.apply(null, numeric.map(function (v) { return v[axis]; })) : 1; });
     const bounds = { min: min, span: max.map(function (value, axis) { return Math.max(value - min[axis], 1); }), count: graph.nodes.length };
@@ -1636,7 +1778,7 @@ function renderResults(run) {
           + '</div>'
         : '')
       + lineProviderTrace
-      + (line.analysis && line.analysis.pipeline_length ? pipelineLengthSummary(line) + pipelineAdjacentSheetBlock(line) + pipelineHandwheelBlock(line) : '')
+      + (line.analysis && line.analysis.pipeline_length ? pipelineLengthSummary(line) + pipelineAdjacentSheetBlock(line) + pipelineVertexCoordinatesBlock(line) + pipelineHandwheelBlock(line) : '')
       + '<div class="page-nav"><span class="page-nav-label">Листы</span><div class="row page-selector-row">' + pageButtons + '</div></div>'
       + '<div class="page-content" data-line="' + esc(line.line_id) + '">'
       + (firstPage

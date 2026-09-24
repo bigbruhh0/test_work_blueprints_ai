@@ -11,6 +11,7 @@
     "route_segments": {"type": "array", "items": {"type": "object", "required": ["segment_id", "route_type", "candidate_ids"], "additionalProperties": true}},
     "cross_sheet_links": {"type": "array", "items": {"type": "object", "additionalProperties": true}},
     "intermediate_distances": {"type": "array", "items": {"type": "object", "additionalProperties": true}},
+    "vertex_coordinates": {"type": "array", "items": {"type": "object", "required": ["vertex_id"], "additionalProperties": true}},
     "lengths": {"type": "object", "required": ["main", "branch"], "additionalProperties": true}
   }
 }

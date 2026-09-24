@@ -7,7 +7,7 @@
     "analysis_type": {"const": "pipeline_length"},
     "line_id": {"type": "string"},
     "source_name": {"type": "string"},
-    "pages": {"type": "array", "items": {"type": "object", "required": ["page", "vertices", "edges", "dimensions", "local_decisions", "connections", "discarded_numbers", "handwheels", "handwheel_glyphs"], "additionalProperties": true}},
+    "pages": {"type": "array", "items": {"type": "object", "required": ["page", "vertices", "edges", "coordinates", "dimensions", "local_decisions", "connections", "discarded_numbers", "handwheels", "handwheel_glyphs"], "additionalProperties": true}},
     "cross_page_context": {"type": "object", "required": ["line_id", "page_order"], "additionalProperties": true}
   },
   "additionalProperties": true

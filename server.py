@@ -764,6 +764,7 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                     dimensions_json,
                     finalize=not pipeline_length_mode,
                 )
+                mapping["coordinates"] = list(page_run.coordinates or [])
                 if pipeline_length_mode:
                     diagnostic_pdf = run_dir / f"{pdf_stem}_page{page_run.page_number}_pipeline_length_diagnostic.pdf"
                     save_pipeline_length_diagnostic_pdf(pdf_path, page_run.page_number, diagnostic_pdf, mapping)
@@ -1383,6 +1384,21 @@ def _run_export_rows(run: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
                     "clean_length_mm": branch.get("clean_length_mm"),
                     "dirty_length_mm": branch.get("dirty_length_mm"),
                     "ambiguous_length_mm": branch.get("ambiguous_length_mm"),
+                })
+            for item in provider.get("vertex_coordinates") or []:
+                point_rows.append({
+                    "point_id": item.get("vertex_id"),
+                    "line_id": line.get("line_id"),
+                    "page_number": item.get("page"),
+                    "purpose": "provider_vertex_coordinate",
+                    "x": item.get("x"),
+                    "y": item.get("y"),
+                    "z": item.get("z"),
+                    "coordinate_source": item.get("method") or "provider",
+                    "source_area": json.dumps(item.get("source_coordinate_labels") or [], ensure_ascii=False),
+                    "diagnostic_pdf": "",
+                    "confidence": item.get("confidence"),
+                    "reason": item.get("reason"),
                 })
             estimates = local.get("candidate_estimates") or []
             if not estimates:
