@@ -1497,7 +1497,11 @@ function pageDetailHtml(lineId, pr) {
   }
   if (analysis.dimension_mapping) {
     const mapping = analysis.dimension_mapping;
-    const finalMapping = analysis.dimension_map || mapping;
+    const legacyDimensionMap = analysis.dimension_map || {};
+    const mappingHasFinalGroups = Array.isArray(mapping.final_edge_candidate_groups)
+      || Array.isArray(mapping.edge_candidate_groups)
+      || !!mapping.final_assignment_summary;
+    const finalMapping = mappingHasFinalGroups ? mapping : legacyDimensionMap;
     const dimensions = mapping.dimensions || [];
     const handwheels = mapping.handwheels || [];
     const review = analysis.dimension_review;
@@ -1512,6 +1516,12 @@ function pageDetailHtml(lineId, pr) {
         status: item.status || 'mapped',
         hints: Array.isArray(item.hints) ? item.hints : [],
         edge_id: item.edge_id || '—',
+        selected_edge_id: item.selected_edge_id || item.final_interval_id || '',
+        final_interval_id: item.final_interval_id || '',
+        final_interval_status: item.final_interval_status || '',
+        final_interval_reason: item.final_interval_reason || '',
+        final_from_vertex: item.final_from_vertex || '',
+        final_to_vertex: item.final_to_vertex || '',
         gap_px: item.gap_px ?? '—',
         leader_attached: !!item.leader_attached,
         conflict_with: item.conflict_with || '',
@@ -1560,17 +1570,44 @@ function pageDetailHtml(lineId, pr) {
           return '<tr class="candidate-' + esc(item.status) + '"><td>' + esc(item.id) + '</td><td>' + esc(item.text) + '</td><td>' + esc((item.hints || []).join(', ') || item.kind) + '</td><td>' + esc(item.status) + '</td><td>' + esc(item.edge_id || '—') + '</td></tr>';
         }).join('') + '</tbody></table></details>'
       : '';
-    const finalEdgeGroups = Array.isArray(finalMapping.edge_candidate_groups) ? finalMapping.edge_candidate_groups : [];
+    const finalEdgeGroups = Array.isArray(finalMapping.final_edge_candidate_groups)
+      ? finalMapping.final_edge_candidate_groups
+      : (Array.isArray(finalMapping.edge_candidate_groups) ? finalMapping.edge_candidate_groups : []);
+    const unresolvedFinalCandidates = Array.isArray(finalMapping.unresolved_final_candidates)
+      ? finalMapping.unresolved_final_candidates
+      : [];
+    const finalSummary = finalMapping.final_assignment_summary || {};
     const finalEdgeGroupsBlock = finalEdgeGroups.length
-      ? '<details class="notes collapsible-result"><summary>Кандидаты по финальным отрезкам (' + finalEdgeGroups.length + ')</summary><table class="data-table"><thead><tr><th>Вершины</th><th>Рёбра</th><th>Кандидаты</th><th>Статусы</th><th>Тип</th></tr></thead><tbody>'
+      ? '<details class="notes collapsible-result" open><summary>Карта финальных отрезков (' + esc(finalSummary.groups_with_candidates ?? finalEdgeGroups.length) + ' с размерами / всего ' + esc(finalSummary.final_edge_count ?? finalEdgeGroups.length) + ')</summary><table class="data-table"><thead><tr><th>Финальный отрезок</th><th>Тип</th><th>Размеры</th><th>Локально</th><th>Доказательство</th></tr></thead><tbody>'
         + finalEdgeGroups.map(function (group) {
           const from = group.from_vertex || '?';
           const to = group.to_vertex || '?';
-          const values = (group.candidate_values_mm || []).map(function (value) { return String(value); }).join(', ') || '—';
-          const candidateIds = (group.candidate_ids || []).join(', ') || '—';
-          const statuses = (group.candidate_statuses || []).join(', ') || group.status || '—';
+          const candidates = Array.isArray(group.candidates) ? group.candidates : [];
+          const values = candidates.length
+            ? candidates.map(function (candidate) {
+                return (candidate.candidate_id || 'D?') + '=' + (candidate.value_mm ?? candidate.text ?? '—');
+              }).join(', ')
+            : '—';
+          const statuses = candidates.length
+            ? candidates.map(function (candidate) {
+                return (candidate.local_decision || candidate.status || '—');
+              }).join(', ')
+            : '—';
+          const proof = candidates.length
+            ? candidates.map(function (candidate) {
+                const origin = candidate.final_ray_origin_kind ? 'луч: ' + candidate.final_ray_origin_kind : '';
+                const reason = candidate.final_interval_reason || '';
+                return [origin, reason].filter(Boolean).join(' · ');
+              }).join(' | ')
+            : 'нет кандидатов';
           const kind = group.is_handwheel_segment ? 'valve / штурвал' : 'труба';
-          return '<tr><td><b>' + esc(from + ' — ' + to) + '</b></td><td>' + esc((group.edge_ids || []).join(', ')) + '</td><td>' + esc(candidateIds + ': ' + values) + '</td><td>' + esc(statuses) + '</td><td>' + esc(kind) + '</td></tr>';
+          return '<tr><td><b>' + esc(from + ' — ' + to) + '</b><br><span class="muted">' + esc(group.edge_id || (group.edge_ids || []).join(', ') || '—') + '</span></td><td>' + esc(kind) + '</td><td>' + esc(values) + '</td><td>' + esc(statuses) + '</td><td class="candidate-reason">' + esc(proof) + '</td></tr>';
+        }).join('') + '</tbody></table></details>'
+      : '';
+    const unresolvedFinalBlock = unresolvedFinalCandidates.length
+      ? '<details class="notes collapsible-result"><summary>Не привязаны к финальному отрезку (' + unresolvedFinalCandidates.length + ')</summary><table class="data-table"><thead><tr><th>ID</th><th>Размер</th><th>Статус</th><th>Причина</th></tr></thead><tbody>'
+        + unresolvedFinalCandidates.map(function (item) {
+          return '<tr><td><b>' + esc(item.candidate_id || 'D?') + '</b></td><td>' + esc(item.value_mm ?? item.text ?? '—') + '</td><td>' + esc(item.final_interval_status || item.status || 'unresolved') + '</td><td class="candidate-reason">' + esc(item.final_interval_reason || '—') + '</td></tr>';
         }).join('') + '</tbody></table></details>'
       : '';
     const handwheelRows = handwheels.length ? handwheels : localHandwheels.map(function (item) {
@@ -1616,6 +1653,7 @@ function pageDetailHtml(lineId, pr) {
       + '<p class="muted">Рёбер графа: ' + (mapping.edges || []).length + ' · размеров: ' + dimensions.length + '</p>'
       + localCandidatesBlock
       + finalEdgeGroupsBlock
+      + unresolvedFinalBlock
       + handwheelBlock
       + providerBlock + downloads + viewer;
   }

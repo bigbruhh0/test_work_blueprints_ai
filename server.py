@@ -830,6 +830,13 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                 # provider payload. It already contains remapped handwheel
                 # edges and connections; do not overwrite them with the
                 # pre-split local mapping here.
+                for key in (
+                    "final_edge_candidate_groups",
+                    "unresolved_final_candidates",
+                    "final_assignment_summary",
+                ):
+                    if mapping.get(key) is not None:
+                        dimension_map[key] = mapping.get(key)
                 dimension_map_json.write_text(json.dumps(dimension_map, ensure_ascii=False, indent=2), encoding="utf-8")
                 render_dimension_map(Path(pdf_path), page_run.page_number, dimension_map_pdf, dimension_map)
                 page_run.analysis = {"dimension_mapping": mapping, "dimension_map": dimension_map}
