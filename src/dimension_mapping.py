@@ -2279,6 +2279,74 @@ def _has_explicit_arrowhead(
     return False
 
 
+def _segment_unit(
+    start: tuple[float, float],
+    end: tuple[float, float],
+) -> tuple[float, float] | None:
+    length = math.hypot(end[0] - start[0], end[1] - start[1])
+    if length <= 0.01:
+        return None
+    return ((end[0] - start[0]) / length, (end[1] - start[1]) / length)
+
+
+def _path_direction_is_stable(
+    path: list[tuple[tuple[float, float], tuple[float, float]]],
+    near: tuple[float, float],
+    far: tuple[float, float],
+    *,
+    min_cosine: float = 0.72,
+) -> bool:
+    overall = _segment_unit(near, far)
+    if overall is None:
+        return False
+    previous: tuple[float, float] | None = None
+    current = near
+    for segment in path:
+        start, end = segment
+        next_point = end if _point_distance(current, start) <= _point_distance(current, end) else start
+        unit = _segment_unit(current, next_point)
+        if unit is None:
+            return False
+        if unit[0] * overall[0] + unit[1] * overall[1] < min_cosine:
+            return False
+        if previous is not None and unit[0] * previous[0] + unit[1] * previous[1] < min_cosine:
+            return False
+        previous = unit
+        current = next_point
+    return _point_distance(current, far) <= 5.0
+
+
+def _leader_target_for_raw_segment(
+    tip: tuple[float, float],
+    used_indices: set[int],
+    segments: list[tuple[tuple[float, float], tuple[float, float]]],
+    *,
+    target_search_px: float,
+    min_target_length_px: float,
+) -> tuple[tuple[tuple[float, float], tuple[float, float]], tuple[float, float], float] | None:
+    dimension_candidates = [
+        segment
+        for index, segment in enumerate(segments)
+        if index not in used_indices
+        and _point_distance(segment[0], segment[1]) >= min_target_length_px
+        and _distance_to_segment(tip, segment[0], segment[1])[0] <= target_search_px
+    ]
+    if not dimension_candidates:
+        return None
+    dimension_segment = min(
+        dimension_candidates,
+        key=lambda segment: _distance_to_segment(tip, segment[0], segment[1])[0],
+    )
+    target_gap, position, projection = _distance_to_segment(
+        tip,
+        dimension_segment[0],
+        dimension_segment[1],
+    )
+    if position < 0.08 or position > 0.92:
+        return None
+    return dimension_segment, projection, target_gap
+
+
 def _handwheel_arrow_segments(
     text_rects: list[fitz.Rect],
     drawings: list[dict[str, Any]],
@@ -2733,13 +2801,13 @@ def _raw_dimension_leader_chain(
     label_center: tuple[float, float],
     rectangles: list[fitz.Rect] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], tuple[float, float]] | None:
-    """Find a multi-sector lead from a number to a dimension arrow."""
+    """Find a proven lead from a number to a dimension arrow."""
     segments = _drawing_segments(page.get_drawings(), rectangles)
     if not segments:
         return None
     target_search_px = 4.0
     min_target_length_px = 28.0
-    candidates: list[tuple[float, list[tuple[tuple[float, float], tuple[float, float]]], tuple[float, float], tuple[float, float], tuple[tuple[float, float], tuple[float, float]]]] = []
+    candidates: list[tuple[float, list[tuple[tuple[float, float], tuple[float, float]]], tuple[float, float], tuple[float, float], tuple[tuple[float, float], tuple[float, float]], tuple[float, float]]] = []
     for seed_index, seed in enumerate(segments):
         start, end = seed
         start_gap = _point_distance(start, label_center)
@@ -2750,34 +2818,43 @@ def _raw_dimension_leader_chain(
         if seed_gap < 2.0 or seed_gap > 28.0:
             continue
         near, far = (start, end) if start_gap <= end_gap else (end, start)
+
+        # First prefer a real one-sector leader.  It must start near the
+        # number, end with an arrowhead, and touch a dimension stroke.
+        if _has_explicit_arrowhead(far, seed, segments):
+            target = _leader_target_for_raw_segment(
+                far,
+                {seed_index},
+                segments,
+                target_search_px=target_search_px,
+                min_target_length_px=min_target_length_px,
+            )
+            if target is not None:
+                dimension_segment, projection, target_gap = target
+                candidates.append((seed_gap + target_gap - 6.0, [seed], near, far, dimension_segment, projection))
+                continue
+
         queue = [(far, [seed], {seed_index})]
         while queue:
             current, path, used = queue.pop(0)
             if _has_explicit_arrowhead(current, path[-1], segments):
-                dimension_candidates = [
-                    segment
-                    for index, segment in enumerate(segments)
-                    if index not in used
-                    and _point_distance(segment[0], segment[1]) >= min_target_length_px
-                    and _distance_to_segment(current, segment[0], segment[1])[0] <= target_search_px
-                ]
-                if dimension_candidates:
-                    dimension_segment = min(
-                        dimension_candidates,
-                        key=lambda segment: _distance_to_segment(current, segment[0], segment[1])[0],
-                    )
-                    target_gap, _position, projection = _distance_to_segment(
-                        current,
-                        dimension_segment[0],
-                        dimension_segment[1],
-                    )
-                    if _position < 0.08 or _position > 0.92:
-                        # A raw sector ending exactly at another line's
-                        # endpoint is usually an extension/dimension joint,
-                        # not a leader pointing to that dimension arrow.
+                if not _path_direction_is_stable(path, near, current):
+                    continue
+                target = _leader_target_for_raw_segment(
+                    current,
+                    used,
+                    segments,
+                    target_search_px=target_search_px,
+                    min_target_length_px=min_target_length_px,
+                )
+                if target is not None:
+                    dimension_segment, projection, target_gap = target
+                    path_length = sum(_point_distance(item[0], item[1]) for item in path)
+                    direct_gap = _point_distance(near, current)
+                    if direct_gap <= 0.01 or path_length / direct_gap > 1.18:
                         continue
-                    score = min(start_gap, end_gap) + target_gap + len(path) * 0.5
-                    candidates.append((score, path, near, current, dimension_segment))
+                    score = seed_gap + target_gap + len(path) * 4.0 + path_length * 0.03
+                    candidates.append((score, path, near, current, dimension_segment, projection))
                     break
             if len(path) >= 4:
                 continue
@@ -2791,12 +2868,18 @@ def _raw_dimension_leader_chain(
                         break
     if not candidates:
         return None
-    _score, path, near, far, dimension_segment = min(candidates, key=lambda item: item[0])
-    _target_gap, _position, projection = _distance_to_segment(
-        far,
-        dimension_segment[0],
-        dimension_segment[1],
+    _score, path, near, far, dimension_segment, projection = min(candidates, key=lambda item: item[0])
+    chosen_start_gap = _point_distance(near, label_center)
+    nearest_start_gap = min(
+        (
+            min(_point_distance(segment[0], label_center), _point_distance(segment[1], label_center))
+            for segment in segments
+            if 8.0 <= _point_distance(segment[0], segment[1]) <= 120.0
+        ),
+        default=chosen_start_gap,
     )
+    if nearest_start_gap <= 12.0 and chosen_start_gap - nearest_start_gap > 12.0:
+        return None
     leader = {
         "index": -1,
         "start": [round(near[0], 2), round(near[1], 2)],
@@ -2805,6 +2888,13 @@ def _raw_dimension_leader_chain(
         "merged_indices": [],
         "arrowhead_points": [[round(far[0], 2), round(far[1], 2)]],
         "source": "raw_drawing_leader_chain",
+        "segments": [
+            [
+                [round(segment[0][0], 2), round(segment[0][1], 2)],
+                [round(segment[1][0], 2), round(segment[1][1], 2)],
+            ]
+            for segment in path
+        ],
     }
     dimension_stroke = {
         "index": -2,
@@ -4109,6 +4199,37 @@ def _stroke_points(stroke: dict[str, Any]) -> tuple[fitz.Point, fitz.Point] | No
     return fitz.Point(float(start[0]), float(start[1])), fitz.Point(float(end[0]), float(end[1]))
 
 
+def _draw_leader_stroke(
+    page: fitz.Page,
+    leader: dict[str, Any] | None,
+    *,
+    color: tuple[float, float, float],
+    width: float,
+) -> tuple[fitz.Point, fitz.Point] | None:
+    if not isinstance(leader, dict):
+        return None
+    points = _stroke_points(leader)
+    segments = leader.get("segments")
+    drew_segments = False
+    if isinstance(segments, list):
+        for segment in segments:
+            if not isinstance(segment, list) or len(segment) != 2:
+                continue
+            try:
+                page.draw_line(
+                    fitz.Point(float(segment[0][0]), float(segment[0][1])),
+                    fitz.Point(float(segment[1][0]), float(segment[1][1])),
+                    color=color,
+                    width=width,
+                )
+                drew_segments = True
+            except (TypeError, ValueError, IndexError):
+                continue
+    if points is not None and not drew_segments:
+        page.draw_line(points[0], points[1], color=color, width=width)
+    return points
+
+
 def _stroke_key(stroke: dict[str, Any]) -> tuple[float, float, float, float] | None:
     points = _stroke_points(stroke)
     if points is None:
@@ -4188,9 +4309,7 @@ def save_local_dimension_filter_pdf(
                         )
             if dimension.get("attachment_kind") == "leader_to_dimension_arrow":
                 leader = dimension.get("leader_stroke")
-                leader_points = _stroke_points(leader) if isinstance(leader, dict) else None
-                if leader_points is not None:
-                    marked.draw_line(leader_points[0], leader_points[1], color=lead_color, width=2.8)
+                _draw_leader_stroke(marked, leader if isinstance(leader, dict) else None, color=lead_color, width=2.8)
             projection = dimension.get("final_ray_line") or dimension.get("final_projection_line")
             if not isinstance(projection, list) or len(projection) != 2:
                 continue
@@ -4340,9 +4459,9 @@ def save_dimension_lead_detection_pdf(
                 if has_lead:
                     target_overlays.append((dimension_points[0], dimension_points[1], suspect_target, resolution))
 
-            leader_points = _stroke_points(dimension.get("leader_stroke")) if isinstance(dimension.get("leader_stroke"), dict) else None
+            leader = dimension.get("leader_stroke") if isinstance(dimension.get("leader_stroke"), dict) else None
+            leader_points = _draw_leader_stroke(marked, leader, color=leader_color, width=3.0)
             if leader_points is not None:
-                marked.draw_line(leader_points[0], leader_points[1], color=leader_color, width=3.0)
                 marked.draw_circle(leader_points[1], 3.2, color=leader_color, fill=leader_color, width=1.0)
 
             for stroke in dimension.get("extension_strokes") or []:
@@ -4543,9 +4662,7 @@ def save_final_contour_rays_pdf(
                         )
             if dimension.get("attachment_kind") == "leader_to_dimension_arrow":
                 leader = dimension.get("leader_stroke")
-                leader_points = _stroke_points(leader) if isinstance(leader, dict) else None
-                if leader_points is not None:
-                    marked.draw_line(leader_points[0], leader_points[1], color=lead_color, width=2.8)
+                _draw_leader_stroke(marked, leader if isinstance(leader, dict) else None, color=lead_color, width=2.8)
             projection = dimension.get("final_ray_line") or dimension.get("final_projection_line")
             if not isinstance(projection, list) or len(projection) != 2:
                 continue
