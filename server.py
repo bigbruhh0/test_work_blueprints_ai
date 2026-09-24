@@ -26,6 +26,7 @@ from src.dimension_mapping import (
     run_dimension_mapping,
     save_clean_graph_pdf,
     save_clean_local_markup_pdf,
+    save_dimension_lead_detection_pdf,
     save_local_dimension_filter_pdf,
     save_final_contour_rays_pdf,
     save_pipeline_length_diagnostic_pdf,
@@ -48,6 +49,7 @@ load_dotenv(ROOT / ".env")
 
 PIPELINE_STEPS = [
     ("local_processing", "Локальная обработка"),
+    ("lead_detection", "Поиск lead-стрелок размеров"),
     ("pipeline_length", "Расчет длины трубопровода"),
     ("dimension_review", "Карта размеров + проверка провайдером"),
 ]
@@ -55,6 +57,7 @@ PIPELINE_STEPS = [
 # Расширяемый реестр конфигураций запуска. stop_stage -> ключ + человекочитаемая метка.
 RUN_KIND_BY_STAGE = {
     "local_processing": ("local_processing", "Локальная обработка"),
+    "lead_detection": ("lead_detection", "Поиск lead-стрелок размеров"),
     "prepare": ("local_prepare", "Локальная обработка"),
     "dimensions": ("dimension_mapping", "Локальная обработка"),
     "pipeline_length": ("pipeline_length", "Расчет длины трубопровода"),
@@ -645,8 +648,8 @@ def create_run(body: AnalyzeBody) -> dict[str, Any]:
     if not document:
         raise HTTPException(404, "Документ не найден")
     stop_stage = (body.stop_stage or "dimension_review").strip().lower()
-    if stop_stage not in {"local_processing", "prepare", "dimensions", "pipeline_length", "dimension_review"}:
-        raise HTTPException(400, "stop_stage: local_processing|pipeline_length|dimension_review")
+    if stop_stage not in {"local_processing", "prepare", "dimensions", "lead_detection", "pipeline_length", "dimension_review"}:
+        raise HTTPException(400, "stop_stage: local_processing|lead_detection|pipeline_length|dimension_review")
     if stop_stage in {"prepare", "dimensions"}:
         stop_stage = "local_processing"
     provider = (body.provider or ENV.get("AI_PROVIDER", "deepseek") or "deepseek").strip().lower()
@@ -749,7 +752,7 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                     _persist(run)
                     return
 
-            if stop_stage in {"local_processing", "dimensions", "pipeline_length", "dimension_review"}:
+            if stop_stage in {"local_processing", "dimensions", "lead_detection", "pipeline_length", "dimension_review"}:
                 page_run.stage = "dimensions"
                 page_run.status = "running"
                 page_run.events.append({"time": now(), "stage": "dimensions", "message": "локальная обработка: разметка и привязка размеров"})
@@ -757,14 +760,27 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                 dimensions_pdf = run_dir / f"{pdf_stem}_page{page_run.page_number}_dimensions_marked.pdf"
                 dimensions_json = run_dir / f"{pdf_stem}_page{page_run.page_number}_dimensions.json"
                 pipeline_length_mode = stop_stage == "pipeline_length"
+                lead_detection_mode = stop_stage == "lead_detection"
                 mapping = run_dimension_mapping(
                     pdf_path,
                     page_run.page_number,
                     dimensions_pdf,
                     dimensions_json,
-                    finalize=not pipeline_length_mode,
+                    finalize=not (pipeline_length_mode or lead_detection_mode),
                 )
                 mapping["coordinates"] = list(page_run.coordinates or [])
+                if lead_detection_mode:
+                    lead_pdf = run_dir / f"{pdf_stem}_page{page_run.page_number}_lead_detection.pdf"
+                    save_dimension_lead_detection_pdf(pdf_path, page_run.page_number, lead_pdf, mapping)
+                    page_run.analysis = {"lead_detection": mapping}
+                    page_run.files["dimensions_pdf"] = dimensions_pdf.name
+                    page_run.files["dimensions_json"] = dimensions_json.name
+                    page_run.files["lead_detection_pdf"] = lead_pdf.name
+                    page_run.stage = "lead_detection"
+                    page_run.status = "complete"
+                    page_run.events.append({"time": now(), "stage": "lead_detection", "message": "PDF диагностики lead-стрелок готов"})
+                    _persist(run)
+                    return
                 if pipeline_length_mode:
                     diagnostic_pdf = run_dir / f"{pdf_stem}_page{page_run.page_number}_pipeline_length_diagnostic.pdf"
                     save_pipeline_length_diagnostic_pdf(pdf_path, page_run.page_number, diagnostic_pdf, mapping)

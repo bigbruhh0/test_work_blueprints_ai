@@ -1340,6 +1340,34 @@ def _leader_target_endpoint(stroke: Any, label_center: tuple[float, float] | Non
     return endpoints[1] if label_gap_0 <= label_gap_1 else endpoints[0]
 
 
+def _leader_gap_follows_direction(
+    stroke: Any,
+    label_center: tuple[float, float] | None,
+    target_endpoint: tuple[float, float],
+    target_projection: tuple[float, float],
+    *,
+    min_cosine: float = 0.82,
+) -> bool:
+    gap_dx = target_projection[0] - target_endpoint[0]
+    gap_dy = target_projection[1] - target_endpoint[1]
+    gap_length = math.hypot(gap_dx, gap_dy)
+    if gap_length <= 1.0:
+        return True
+    endpoints = _stroke_endpoint_points(stroke)
+    if label_center is not None:
+        label_gaps = [_point_distance(endpoint, label_center) for endpoint in endpoints]
+        label_side = endpoints[0] if label_gaps[0] <= label_gaps[1] else endpoints[1]
+    else:
+        label_side = endpoints[0] if _point_distance(endpoints[1], target_endpoint) <= _point_distance(endpoints[0], target_endpoint) else endpoints[1]
+    lead_dx = target_endpoint[0] - label_side[0]
+    lead_dy = target_endpoint[1] - label_side[1]
+    lead_length = math.hypot(lead_dx, lead_dy)
+    if lead_length <= 0.01:
+        return False
+    cosine = (lead_dx * gap_dx + lead_dy * gap_dy) / (lead_length * gap_length)
+    return cosine >= min_cosine
+
+
 def _has_dimension_leader_arrowhead(
     stroke: dict[str, Any],
     label_center: tuple[float, float],
@@ -1388,6 +1416,10 @@ def _resolve_leader_target(
         )
         if min(target_gap, leader_endpoint_gap) > 22.0:
             continue
+        if target_gap > 1.0 and not _leader_gap_follows_direction(stroke, label_center, target_endpoint, target_projection):
+            continue
+        if candidate.length < 24.0 and target_gap > 1.0:
+            continue
         edge_distance = 0.0
         angle_bonus = 0.0
         if edge is not None:
@@ -1420,7 +1452,20 @@ def _resolve_leader_target(
     if not candidates:
         return None
     candidates.sort(key=lambda item: (item[0], item[1], item[2]))
-    return candidates[0][3], candidates[0][4]
+    target = candidates[0][3]
+    meta = candidates[0][4]
+    suspect_reasons = []
+    if float(meta.get("candidate_length_px") or 0.0) < 18.0:
+        suspect_reasons.append("target_line_too_short")
+    target_position = float(meta.get("target_position") or 0.0)
+    if target_position <= 0.08 or target_position >= 0.92:
+        suspect_reasons.append("target_hit_near_endpoint")
+    if float(meta.get("target_gap_px") or 0.0) > 12.0:
+        suspect_reasons.append("target_gap_too_large")
+    if suspect_reasons:
+        meta["suspect"] = True
+        meta["suspect_reasons"] = suspect_reasons
+    return target, meta
 
 
 def _fallback_leader_stroke_from_label(
@@ -1975,6 +2020,19 @@ def map_dimensions(pdf_path: str | Path, page_number: int, *, finalize: bool = T
                     "candidate_length_px": raw_dimension_stroke["length_px"],
                     "edge_distance_px": None,
                 }
+                raw_position = _distance_to_segment(
+                    tuple(raw_projection),
+                    tuple(raw_dimension_stroke["start"]),
+                    tuple(raw_dimension_stroke["end"]),
+                )[1]
+                suspect_reasons = []
+                if float(raw_dimension_stroke["length_px"] or 0.0) < 18.0:
+                    suspect_reasons.append("target_line_too_short")
+                if raw_position <= 0.08 or raw_position >= 0.92:
+                    suspect_reasons.append("target_hit_near_endpoint")
+                if suspect_reasons:
+                    mapped[-1]["leader_resolution"]["suspect"] = True
+                    mapped[-1]["leader_resolution"]["suspect_reasons"] = suspect_reasons
                 mapped[-1]["extension_strokes"] = _find_extension_strokes(
                     mapped[-1],
                     next((item for item in edges if item["id"] == mapped[-1].get("edge_id")), None),
@@ -2679,6 +2737,8 @@ def _raw_dimension_leader_chain(
     segments = _drawing_segments(page.get_drawings(), rectangles)
     if not segments:
         return None
+    target_search_px = 4.0
+    min_target_length_px = 28.0
     candidates: list[tuple[float, list[tuple[tuple[float, float], tuple[float, float]]], tuple[float, float], tuple[float, float], tuple[tuple[float, float], tuple[float, float]]]] = []
     for seed_index, seed in enumerate(segments):
         start, end = seed
@@ -2698,8 +2758,8 @@ def _raw_dimension_leader_chain(
                     segment
                     for index, segment in enumerate(segments)
                     if index not in used
-                    and _point_distance(segment[0], segment[1]) >= 20.0
-                    and _distance_to_segment(current, segment[0], segment[1])[0] <= 9.0
+                    and _point_distance(segment[0], segment[1]) >= min_target_length_px
+                    and _distance_to_segment(current, segment[0], segment[1])[0] <= target_search_px
                 ]
                 if dimension_candidates:
                     dimension_segment = min(
@@ -4219,6 +4279,114 @@ def save_local_dimension_filter_pdf(
         output.close()
 
 
+def save_dimension_lead_detection_pdf(
+    pdf_path: str | Path,
+    page_number: int,
+    output_pdf: str | Path,
+    mapping: dict[str, Any],
+) -> None:
+    """Show dimension-scoped lead detection for each numeric candidate."""
+    with fitz.open(str(pdf_path)) as document:
+        page = document[page_number - 1]
+        output = fitz.open()
+        marked = output.new_page(width=page.rect.width, height=page.rect.height)
+        marked.show_pdf_page(marked.rect, document, page_number - 1)
+
+        dimension_color = (0.0, 0.45, 0.95)
+        leader_color = (1.0, 0.78, 0.0)
+        debug_color = (0.05, 0.25, 1.0)
+        extension_color = (0.48, 0.22, 0.85)
+        label_color = (0.86, 0.08, 0.08)
+        no_lead_color = (0.65, 0.65, 0.65)
+        lead_target_color = (0.0, 0.68, 0.18)
+        suspect_color = (0.95, 0.05, 0.05)
+        target_overlays: list[tuple[fitz.Point, fitz.Point, bool, dict[str, Any]]] = []
+
+        for dimension in mapping.get("dimensions", []):
+            label_center = dimension.get("label_center")
+            if not isinstance(label_center, list) or len(label_center) < 2:
+                continue
+            center = fitz.Point(float(label_center[0]), float(label_center[1]))
+            has_lead = dimension.get("attachment_kind") == "leader_to_dimension_arrow" and isinstance(dimension.get("leader_stroke"), dict)
+            resolution = dimension.get("leader_resolution") or {}
+            suspect_target = bool(resolution.get("suspect"))
+            box_color = leader_color if has_lead else no_lead_color
+            marked.draw_rect(
+                fitz.Rect(center.x - 18, center.y - 11, center.x + 24, center.y + 11),
+                color=box_color,
+                fill=(1.0, 1.0, 1.0),
+                fill_opacity=0.55,
+                width=1.1,
+            )
+            status = "suspect target" if suspect_target else ("lead" if has_lead else "no lead")
+            label = f"{dimension.get('id', 'D?')} {dimension.get('text') or dimension.get('value')}: {status}"
+            marked.insert_text(center + (24, -8), label[:72], fontsize=7, fontname="helv", color=suspect_color if suspect_target else (label_color if has_lead else no_lead_color))
+
+            for debug_segment in dimension.get("debug_lead_segments") or []:
+                if isinstance(debug_segment, list) and len(debug_segment) == 2:
+                    try:
+                        marked.draw_line(
+                            fitz.Point(float(debug_segment[0][0]), float(debug_segment[0][1])),
+                            fitz.Point(float(debug_segment[1][0]), float(debug_segment[1][1])),
+                            color=debug_color,
+                            width=1.4,
+                        )
+                    except (TypeError, ValueError, IndexError):
+                        continue
+
+            dimension_points = _stroke_points(dimension.get("dimension_stroke")) if isinstance(dimension.get("dimension_stroke"), dict) else None
+            if dimension_points is not None:
+                marked.draw_line(dimension_points[0], dimension_points[1], color=dimension_color, width=2.2)
+                if has_lead:
+                    target_overlays.append((dimension_points[0], dimension_points[1], suspect_target, resolution))
+
+            leader_points = _stroke_points(dimension.get("leader_stroke")) if isinstance(dimension.get("leader_stroke"), dict) else None
+            if leader_points is not None:
+                marked.draw_line(leader_points[0], leader_points[1], color=leader_color, width=3.0)
+                marked.draw_circle(leader_points[1], 3.2, color=leader_color, fill=leader_color, width=1.0)
+
+            for stroke in dimension.get("extension_strokes") or []:
+                extension_points = _stroke_points(stroke) if isinstance(stroke, dict) else None
+                if extension_points is not None:
+                    marked.draw_line(extension_points[0], extension_points[1], color=extension_color, width=1.2)
+
+            target = resolution.get("target_projection") or resolution.get("leader_target_point")
+            if isinstance(target, list) and len(target) >= 2:
+                try:
+                    target_point = fitz.Point(float(target[0]), float(target[1]))
+                    marked.draw_circle(target_point, 4.0, color=suspect_color if suspect_target else (1.0, 0.15, 0.0), fill=suspect_color if suspect_target else (1.0, 0.15, 0.0), width=1.0)
+                    if suspect_target:
+                        marked.insert_text(target_point + (6, -5), ",".join(str(item) for item in resolution.get("suspect_reasons") or [])[:42], fontsize=6, fontname="helv", color=suspect_color)
+                except (TypeError, ValueError):
+                    pass
+
+        for start, end, suspect_target, resolution in target_overlays:
+            marked.draw_line(
+                start,
+                end,
+                color=suspect_color if suspect_target else lead_target_color,
+                width=3.8 if suspect_target else 3.3,
+                dashes="[4 3] 0" if suspect_target else None,
+            )
+            target = resolution.get("target_projection") or resolution.get("leader_target_point")
+            if isinstance(target, list) and len(target) >= 2:
+                try:
+                    target_point = fitz.Point(float(target[0]), float(target[1]))
+                    marked.draw_circle(target_point, 4.5, color=suspect_color if suspect_target else lead_target_color, fill=suspect_color if suspect_target else lead_target_color, width=1.0)
+                except (TypeError, ValueError):
+                    pass
+
+        marked.insert_text(
+            fitz.Point(28, 26),
+            f"DIMENSION LEAD DETECTION / page {page_number}  yellow=lead green=lead target red=suspect target blue=dimension purple=extension",
+            fontsize=10,
+            fontname="helv",
+            color=(1.0, 0.25, 0.0),
+        )
+        output.save(str(output_pdf))
+        output.close()
+
+
 def save_pipeline_length_diagnostic_pdf(
     pdf_path: str | Path,
     page_number: int,
@@ -4607,6 +4775,7 @@ __all__ = [
     "apply_local_dimension_filter",
     "save_dimension_mapping_pdf",
     "save_preprocess_annotation_pdf",
+    "save_dimension_lead_detection_pdf",
     "save_local_dimension_filter_pdf",
     "save_pipeline_length_diagnostic_pdf",
     "save_final_contour_rays_pdf",

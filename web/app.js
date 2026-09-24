@@ -6,6 +6,7 @@ const esc = (value) => String(value ?? '').replace(/[&<>"]/g, (c) => ({'&':'&amp
 const STAGE_LABELS = {
   prepare: 'Локальная подготовка + разметка',
   dimensions: 'Локальная подготовка + привязка размеров',
+  lead_detection: 'Поиск lead-стрелок размеров',
   pipeline_length: 'Расчет длины трубопровода',
   dimension_review: 'Карта размеров + проверка провайдером',
   done: 'Готово',
@@ -529,6 +530,7 @@ function renderRun(run) {
 
 const VIEWER_TABS = [
   { key: 'clean_local_markup_pdf', label: 'Локальная разметка' },
+  { key: 'lead_detection_pdf', label: 'Поиск lead-стрелок' },
   { key: 'local_dimension_filter_pdf', label: 'Локальная фильтрация размеров' },
   { key: 'pipeline_length_diagnostic_pdf', label: 'Расчет длины: базовая геометрия' },
   { key: 'final_contour_rays_pdf', label: 'Лучевые привязки финального контура' },
