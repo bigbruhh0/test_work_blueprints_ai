@@ -1,4 +1,4 @@
-const state = { document: null, runId: null, selected: new Set(), sourceMode: 'local', provider: 'deepseek', config: null, filesByLine: {}, tracesByLine: {}, graphsByLine: {}, selectedPage: {}, currentRun: null, feedback: {}, manualEdit: false, providerDecisionEdit: new Set(), three: null, viewers3d: new Set(), pollToken: 0 };
+const state = { document: null, runId: null, selected: new Set(), sourceMode: 'local', provider: 'deepseek', config: null, filesByLine: {}, tracesByLine: {}, graphsByLine: {}, selectedPage: {}, selectedResultTab: {}, currentRun: null, feedback: {}, manualEdit: false, providerDecisionEdit: new Set(), three: null, viewers3d: new Set(), pollToken: 0 };
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 const esc = (value) => String(value ?? '').replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -568,8 +568,12 @@ function viewerImageUrl(runId, lineId, filename) {
 function artifactLinks(lineId, pageResult, runId) {
   const files = pageResult.files || {};
   if (!Object.keys(files).length) return '';
+  const labels = {
+    pipeline_length_request_image: 'Изображение запроса AI',
+    local_markup_overview_pdf: 'Вся локальная разметка',
+  };
   return '<div class="row artifacts">' + Object.entries(files).map(function (pair) {
-    return '<a class="artifact-tag" href="' + artifactLinkUrl(runId, lineId, pair[1]) + '" download>⭳ ' + esc(pair[0]) + '</a>';
+    return '<a class="artifact-tag" href="' + artifactLinkUrl(runId, lineId, pair[1]) + '" download>⭳ ' + esc(labels[pair[0]] || pair[0]) + '</a>';
   }).join('') + '</div>';
 }
 
@@ -909,8 +913,10 @@ function pipelineAdjacentSheetBlock(line) {
     + '</tbody></table></div></details>';
 }
 
-function pipelineVertexCoordinatesBlock(line) {
-  const rows = pipelineVertexCoordinates(line);
+function pipelineVertexCoordinatesBlock(line, pageNumber) {
+  const rows = pipelineVertexCoordinates(line).filter(function (item) {
+    return pageNumber == null || Number(item.page) === Number(pageNumber);
+  });
   if (!rows.length) return '';
   const html = rows.map(function (item) {
     const vertex = item.vertex_id || item.id || '—';
@@ -929,10 +935,33 @@ function pipelineVertexCoordinatesBlock(line) {
       + '<td>' + esc(item.reason || '—') + '</td>'
       + '</tr>';
   }).join('');
-  return '<details class="notes collapsible-result pipeline-vertex-coordinates" open><summary>Координаты вершин от провайдера (' + rows.length + ')</summary>'
+  return '<details class="notes collapsible-result pipeline-vertex-coordinates" open><summary>Координаты вершин <span class="development-badge">Находится в разработке</span> (' + rows.length + ')</summary>'
     + '<div class="table-wrap"><table class="viewer-table pipeline-coordinates-table"><thead><tr><th>Вершина</th><th>X / Y / Z</th><th>Метод</th><th>Уверенность</th><th>Источник</th><th>Пояснение</th></tr></thead><tbody>'
     + html
     + '</tbody></table></div></details>';
+}
+
+function pipelinePageLengthSummary(line, pageNumber) {
+  const analysis = line.analysis && line.analysis.pipeline_length;
+  if (!analysis) return '';
+  const estimates = pipelineLengthEstimates(line).filter(function (row) { return Number(row.page) === Number(pageNumber); });
+  const provider = analysis.provider_result || {};
+  const localClean = estimates.filter(function (row) { return row.local_decision === 'include'; }).reduce(function (sum, row) { return sum + Number(row.value_mm || 0); }, 0);
+  const localDirty = estimates.filter(function (row) { return row.local_decision !== 'exclude'; }).reduce(function (sum, row) { return sum + Number(row.value_mm || 0); }, 0);
+  const providerRows = estimates.map(function (row) {
+    const decision = pipelineEffectiveCandidateDecision(line, row);
+    return { decision: decision, value: Number(row.value_mm || 0) };
+  });
+  const providerClean = providerRows.filter(function (row) { return row.decision === 'include'; }).reduce(function (sum, row) { return sum + row.value; }, 0);
+  const providerDirty = providerRows.filter(function (row) { return row.decision !== 'exclude'; }).reduce(function (sum, row) { return sum + row.value; }, 0);
+  const disputed = providerRows.filter(function (row) { return row.decision === 'ambiguous'; }).length;
+  return '<section class="pipeline-page-summary">'
+    + '<div class="pipeline-summary-grid">'
+    + '<div class="pipeline-total-card local"><small>Локальный расчет</small><strong>' + esc(formatMm(localClean)) + '</strong><span>грязная ' + esc(formatMm(localDirty)) + '</span></div>'
+    + '<div class="pipeline-total-card provider"><small>Результат провайдера</small><strong>' + esc(formatMm(providerClean)) + '</strong><span>грязная ' + esc(formatMm(providerDirty)) + '</span></div>'
+    + '<div class="pipeline-total-card trace"><small>Размеров</small><strong>' + esc(estimates.length) + '</strong><span>спорных: ' + esc(disputed) + '</span></div>'
+    + '<div class="pipeline-total-card manual"><small>Статус AI</small><strong>' + esc(provider && provider.candidate_assessments ? 'есть ответ' : 'ожидается') + '</strong><span>локальное решение сохраняется</span></div>'
+    + '</div></section>';
 }
 
 function pipelineProviderAssessment(provider, estimate) {
@@ -956,10 +985,6 @@ function pipelineLengthPageDetail(line, pageNumber) {
   const provider = analysis.provider_result || {};
   const manual = analysis.manual_confirmation || {};
   const pageResult = (line.page_results || []).find(function (page) { return Number(page.page_number) === Number(pageNumber); });
-  const diagnosticFile = pageResult && pageResult.files && pageResult.files.pipeline_length_diagnostic_pdf;
-  const diagnosticMarkup = diagnosticFile
-    ? '<details class="notes collapsible-result" open><summary>Изображение для проверки провайдера</summary><img class="viewer-frame" src="' + viewerImageUrl(state.runId, line.line_id, diagnosticFile) + '" alt="Диагностика расчета длины, лист ' + esc(pageNumber) + '"></details>'
-    : '';
   const estimates = pipelineLengthEstimates(line).filter(function (row) { return Number(row.page) === Number(pageNumber); });
   const payloadPages = line.provider_trace && line.provider_trace.payload && line.provider_trace.payload.pages;
   const payloadPage = Array.isArray(payloadPages) ? payloadPages.find(function (page) { return Number(page.page) === Number(pageNumber); }) : null;
@@ -1024,17 +1049,28 @@ function pipelineLengthPageDetail(line, pageNumber) {
       }).join('')
       + '</tbody></table></div></details>'
     : '';
-  return diagnosticMarkup + adjacentMarkup + unresolvedMarkup + '<section class="pipeline-length-page">'
-    + '<div class="pipeline-page-heading"><h2>Лист ' + esc(pageNumber) + '</h2><span>предварительная сумма ' + esc(formatMm(pageSummary.clean_length_mm ?? 0)) + '</span></div>'
+  const filesMarkup = pageResult ? artifactLinks(line.line_id, pageResult, state.runId) : '';
+  return '<section class="pipeline-length-page">'
+    + '<div class="pipeline-page-heading"><h2>Лист ' + esc(pageNumber) + '</h2><span>локальная сумма ' + esc(formatMm(pageSummary.clean_length_mm ?? 0)) + '</span></div>'
+    + pipelinePageLengthSummary(line, pageNumber)
+    + (state.graphsByLine[line.line_id] ? '<button type="button" class="secondary-button pipeline-3d-button" data-3d-line="' + esc(line.line_id) + '" data-3d-scope="page" data-3d-page="' + esc(pageNumber) + '">Показать 3D-граф <span class="development-badge">Находится в разработке</span></button>' : '')
     + '<div class="table-wrap pipeline-review-wrap"><table class="data-table pipeline-review-table"><thead><tr><th>Кандидат</th><th>Локальное решение</th><th>Подтверждение провайдера</th></tr></thead><tbody>'
     + (rows || '<tr><td colspan="3">Размерных кандидатов нет</td></tr>')
-    + '</tbody></table></div></section>'
-    + (pageResult ? viewerCard(line.line_id, pageResult, state.runId) : '');
+    + '</tbody></table></div>'
+    + adjacentMarkup
+    + unresolvedMarkup
+    + (pageResult ? pipelineLocalMarkupImage(line.line_id, pageResult, state.runId) : '')
+    + pipelineVertexCoordinatesBlock(line, pageNumber)
+    + pipelineHandwheelBlock(line, pageNumber)
+    + (pageResult ? pipelinePageAiBlock(line.line_id, pageResult, state.runId) : '')
+    + '<section class="pipeline-artifacts"><h3>Артефакты листа ' + esc(pageNumber) + '</h3>' + filesMarkup + '</section>'
+    + '</section>';
 }
 
-function pipelineHandwheelBlock(line) {
+function pipelineHandwheelBlock(line, pageNumber) {
   const rows = [];
   (line.page_results || []).forEach(function (page) {
+    if (pageNumber != null && Number(page.page_number) !== Number(pageNumber)) return;
     const annotations = page.analysis && page.analysis.pipeline_length_local && page.analysis.pipeline_length_local.handwheel_annotations;
     (annotations && annotations.handwheels || []).forEach(function (item) {
       rows.push('<tr><td>' + esc(page.page_number) + '</td><td>' + esc(item.id || 'HW') + '</td><td>' + esc(item.label || 'штурвал') + '</td><td>' + esc(item.arrow_found ? 'найден lead' : 'без lead') + '</td><td>' + esc(item.edge_id || '—') + '</td></tr>');
@@ -1043,6 +1079,39 @@ function pipelineHandwheelBlock(line) {
   return '<details class="notes collapsible-result" open><summary>Штурвалы (' + rows.length + ')</summary>'
     + (rows.length ? '<table class="viewer-table"><thead><tr><th>Лист</th><th>ID</th><th>Обозначение</th><th>Привязка</th><th>Базовое ребро</th></tr></thead><tbody>' + rows.join('') + '</tbody></table>' : '<p class="muted">Штурвалы не найдены.</p>')
     + '</details>';
+}
+
+function pipelineLocalMarkupImage(lineId, pageResult, runId) {
+  const files = pageResult && pageResult.files || {};
+  const file = files.local_markup_overview_pdf;
+  if (!file) return '<p class="muted">Изображение «Вся локальная разметка» недоступно.</p>';
+  return '<figure class="pipeline-local-markup-image"><figcaption>Вся локальная разметка · лист ' + esc(pageResult.page_number) + '</figcaption>'
+    + '<img class="viewer-frame" src="' + viewerImageUrl(runId, lineId, file) + '" alt="Вся локальная разметка, лист ' + esc(pageResult.page_number) + '"></figure>';
+}
+
+function pipelinePageAiBlock(lineId, pageResult, runId) {
+  const trace = pageResult && pageResult.provider_trace;
+  const files = pageResult && pageResult.files || {};
+  const requestImage = files.pipeline_length_request_image;
+  const imageMarkup = requestImage
+    ? '<details class="trace-section" open><summary>Изображение, отправленное модели</summary><div class="trace-content"><img class="viewer-frame" src="' + viewerImageUrl(runId, lineId, requestImage) + '" alt="Изображение запроса, лист ' + esc(pageResult.page_number) + '"></div></details>'
+    : '<p class="muted">Изображение не прикреплялось.</p>';
+  return '<details class="notes collapsible-result pipeline-ai-page" data-provider-key="page-ai-' + esc(lineId) + '-' + esc(pageResult.page_number) + '"><summary>AI запрос · лист ' + esc(pageResult.page_number) + '</summary>'
+    + (trace ? renderTrace(trace, imageMarkup) : '<p class="muted">Запрос к ИИ для этого листа не сохранен.</p>')
+    + '</details>';
+}
+
+function pipelineCommonResults(line) {
+  const images = (line.page_results || []).map(function (pageResult) {
+    return pipelineLocalMarkupImage(line.line_id, pageResult, state.runId);
+  }).join('');
+  return '<section class="pipeline-common-results">'
+    + pipelineLengthSummary(line)
+    + (state.graphsByLine[line.line_id] ? '<button type="button" class="secondary-button pipeline-3d-button" data-3d-line="' + esc(line.line_id) + '" data-3d-scope="all">Показать 3D-граф <span class="development-badge">Находится в разработке</span></button>' : '')
+    + pipelineAdjacentSheetBlock(line)
+    + pipelineVertexCoordinatesBlock(line)
+    + '<section class="notes collapsible-result pipeline-overview-images"><h3>Вся локальная разметка по листам</h3>' + (images || '<p class="muted">Изображения недоступны.</p>') + '</section>'
+    + '</section>';
 }
 
 function viewerCard(lineId, pageResult, runId) {
@@ -2084,84 +2153,37 @@ function renderResults(run) {
   const openProviderState = openProviderKeys(body);
   body.innerHTML = run.lines.map(function (line) {
     const pages = line.page_results || [];
-    let totalMain = 0;
-    let edgeCount = 0;
-    let totalBranches = 0;
-    let totalSkipped = 0;
-    let reviewCleanMain = 0;
-    let reviewDirtyMain = 0;
-    let reviewCleanBranch = 0;
-    let reviewDirtyBranch = 0;
-    let hasDimensionReview = false;
-    pages.forEach(function (pr) {
-      const a = pr.analysis;
-      if (!a) return;
-      if (a.dimension_review && a.dimension_review.lengths) {
-        hasDimensionReview = true;
-        const lengths = a.dimension_review.lengths;
-        reviewCleanMain += Number(lengths.main?.clean_length_mm || 0);
-        reviewDirtyMain += Number(lengths.main?.dirty_length_mm || 0);
-        reviewCleanBranch += Number(lengths.branch?.clean_length_mm || 0);
-        reviewDirtyBranch += Number(lengths.branch?.dirty_length_mm || 0);
-      }
-      const segs = (a.main_chain || {}).segments || [];
-      totalMain += segs.reduce(function (sum, segment) {
-        return sum + (typeof segment.value === 'number' ? segment.value : 0);
-      }, 0);
-      edgeCount += segs.length;
-      totalBranches += (a.branches || []).length;
-      totalSkipped += (a.skipped || []).length;
-    });
-    const selectedPage = state.selectedPage[line.line_id];
+    const pipeline = line.analysis && line.analysis.pipeline_length;
+    const multiPage = pages.length > 1;
+    const defaultTab = pipeline && multiPage ? 'overview' : (pages[0] ? String(pages[0].page_number) : 'overview');
+    const selectedTab = state.selectedResultTab[line.line_id] || defaultTab;
     const pageButtons = pages.map(function (pr) {
-      return '<button type="button" class="viewer-tab page-selector' + (selectedPage === pr.page_number ? ' on' : '') + '" data-line="' + esc(line.line_id) + '" data-page="' + pr.page_number + '">Лист ' + pr.page_number + '</button>';
+      const key = String(pr.page_number);
+      return '<button type="button" class="viewer-tab result-tab' + (selectedTab === key ? ' on' : '') + '" data-line="' + esc(line.line_id) + '" data-result-tab="' + esc(key) + '">Лист ' + pr.page_number + '</button>';
     }).join('');
-    const firstPage = selectedPage ? pages.find(function (p) { return p.page_number === selectedPage; }) || pages[0] : pages[0];
-    const lineProviderTrace = line.provider_trace
-      ? '<details class="notes collapsible-result line-provider-result"><summary>Ответ провайдера / AI запрос</summary><div class="line-provider-trace" data-line-provider-trace="' + esc(line.line_id) + '"><p class="muted">Загрузка ответа…</p></div></details>'
+    const overviewButton = pipeline && multiPage
+      ? '<button type="button" class="viewer-tab result-tab' + (selectedTab === 'overview' ? ' on' : '') + '" data-line="' + esc(line.line_id) + '" data-result-tab="overview">Общие результаты</button>'
       : '';
+    const selectedPage = Number(selectedTab);
+    const firstPage = pages.find(function (p) { return Number(p.page_number) === selectedPage; }) || pages[0];
+    const legacyProviderTrace = !pipeline && line.provider_trace
+      ? '<details class="notes collapsible-result line-provider-result"><summary>Ответ провайдера / AI запрос</summary>' + renderTrace(line.provider_trace, '') + '</details>'
+      : '';
+    const content = pipeline
+      ? (selectedTab === 'overview' && multiPage ? pipelineCommonResults(line) : (firstPage ? pipelineLengthPageDetail(line, firstPage.page_number) : '<p class="muted">Страниц нет</p>'))
+      : (firstPage ? pageDetailHtml(line.line_id, firstPage) : '<p class="muted">Страниц нет</p>');
     return '<div class="line-card">'
       + '<h3>' + esc(line.line_id) + ' <span class="group-item-meta">стр. ' + (line.pages || []).join(', ') + '</span></h3>'
-      + (state.graphsByLine[line.line_id]
-        ? '<section class="result-3d-block"><div class="panel-title"><span>ТОПОЛОГИЯ / ' + esc(line.line_id) + '</span><h2>3D-граф трубы</h2></div><div class="line-graph-3d" data-graph-3d-line="' + esc(line.line_id) + '"><div class="graph-3d-loading"><span class="spinner"></span> Загружаю 3D-сцену...</div></div></section>'
-        : '')
-      + (hasDimensionReview
-        ? '<div class="kpi">'
-          + '<div><span class="kpi-label">Основная линия · чистая / грязная</span><strong>' + reviewCleanMain + ' / ' + reviewDirtyMain + ' мм</strong></div>'
-          + '<div><span class="kpi-label">Ответвления · чистая / грязная</span><strong>' + reviewCleanBranch + ' / ' + reviewDirtyBranch + ' мм</strong></div>'
-          + '<div><span class="kpi-label">Рёбер</span><strong>' + edgeCount + '</strong></div>'
-          + '<div><span class="kpi-label">Листов</span><strong>' + pages.length + '</strong></div>'
-          + '</div>'
-        : '')
-      + lineProviderTrace
-      + (line.analysis && line.analysis.pipeline_length ? pipelineLengthSummary(line) + pipelineAdjacentSheetBlock(line) + pipelineVertexCoordinatesBlock(line) + pipelineHandwheelBlock(line) : '')
-      + '<div class="page-nav"><span class="page-nav-label">Листы</span><div class="row page-selector-row">' + pageButtons + '</div></div>'
-      + '<div class="page-content" data-line="' + esc(line.line_id) + '">'
-      + (firstPage
-        ? (line.analysis && line.analysis.pipeline_length ? pipelineLengthPageDetail(line, firstPage.page_number) : pageDetailHtml(line.line_id, firstPage))
-        : '<p class="muted">Страниц нет</p>')
-      + '</div>'
+      + '<div class="page-nav result-nav"><span class="page-nav-label">Результаты</span><div class="row page-selector-row">' + overviewButton + pageButtons + '</div></div>'
+      + legacyProviderTrace
+      + '<div class="page-content result-content" data-line="' + esc(line.line_id) + '">' + content + '</div>'
       + '</div>';
   }).join('<hr>');
-  $('#result-body').querySelectorAll('[data-line-provider-trace]').forEach(function (wrap) {
-    const lineId = wrap.getAttribute('data-line-provider-trace') || '';
-    const line = run.lines.find(function (item) { return item.line_id === lineId; });
-    if (!line || !line.provider_trace) return;
-    const overviewImages = (line.page_results || []).map(function (pr) {
-      const file = pr.files && pr.files.local_markup_overview_pdf;
-      if (!file) return '';
-      return '<figure class="trace-image"><figcaption>Лист ' + esc(pr.page_number) + '</figcaption>'
-        + '<img class="viewer-frame" src="' + viewerImageUrl(state.runId, line.line_id, file) + '" alt="Локальная разметка листа ' + esc(pr.page_number) + '"></figure>';
-    }).join('');
-    const overviewMarkup = overviewImages
-      ? '<details class="trace-section" open><summary>Наша локальная разметка (изображение)</summary><div class="trace-content">' + overviewImages + '</div></details>'
-      : '';
-    wrap.innerHTML = renderTrace(line.provider_trace, overviewMarkup);
+  body.insertAdjacentHTML('beforeend', '<dialog class="pipeline-3d-dialog" id="pipeline-3d-dialog"><div class="pipeline-3d-dialog-head"><h2 data-3d-dialog-title>3D-граф</h2><button type="button" class="secondary-button" data-3d-close>Закрыть</button></div><div class="pipeline-3d-dialog-body" data-3d-dialog-body></div></dialog>');
+  bindResultTabs();
+  bind3DButtons();
+  $('#result-body').querySelectorAll('.trace-block').forEach(function (wrap) {
     bindTraceControls(wrap.closest('.line-card'), wrap);
-  });
-  $('#result-body').querySelectorAll('[data-graph-3d-line]').forEach(function (container) {
-    const lineId = container.getAttribute('data-graph-3d-line') || '';
-    render3DGraph(container, state.graphsByLine[lineId]);
   });
   bindPageSelectors();
   bindPipelineProviderConfirmations();
@@ -2204,6 +2226,61 @@ function bindPipelineProviderConfirmations() {
         button.disabled = false;
         alert('Не удалось принять решение провайдера: ' + error.message);
       }
+    });
+  });
+}
+
+function graphForPage(graph, pageNumber) {
+  if (!graph) return null;
+  const page = String(pageNumber);
+  const nodes = (graph.nodes || []).filter(function (node) { return String(node.page || '') === page; });
+  const nodeIds = new Set(nodes.map(function (node) { return String(node.id); }));
+  const edges = (graph.edges || []).filter(function (edge) {
+    return String(edge.page || '') === page
+      && nodeIds.has(String(edge.from_node_id))
+      && nodeIds.has(String(edge.to_node_id));
+  });
+  return Object.assign({}, graph, { nodes: nodes, edges: edges, isolated_nodes: [] });
+}
+
+function bindResultTabs() {
+  $('#result-body').querySelectorAll('.result-tab').forEach(function (button) {
+    button.addEventListener('click', function () {
+      const lineId = button.dataset.line;
+      state.selectedResultTab[lineId] = button.dataset.resultTab || 'overview';
+      const line = (state.currentRun.lines || []).find(function (item) { return item.line_id === lineId; });
+      if (line) renderResults(state.currentRun);
+    });
+  });
+}
+
+function bind3DButtons() {
+  const dialog = $('#pipeline-3d-dialog');
+  if (!dialog) return;
+  const title = dialog.querySelector('[data-3d-dialog-title]');
+  const body = dialog.querySelector('[data-3d-dialog-body]');
+  const close = function () {
+    if (dialog.open) dialog.close();
+    body.replaceChildren();
+  };
+  dialog.querySelector('[data-3d-close]').addEventListener('click', close);
+  dialog.addEventListener('click', function (event) {
+    if (event.target === dialog) close();
+  });
+  $('#result-body').querySelectorAll('.pipeline-3d-button').forEach(function (button) {
+    button.addEventListener('click', async function () {
+      const lineId = button.dataset['3dLine'];
+      const line = (state.currentRun.lines || []).find(function (item) { return item.line_id === lineId; });
+      if (!line) return;
+      const scope = button.dataset['3dScope'];
+      const graph = scope === 'page'
+        ? graphForPage(state.graphsByLine[lineId], button.dataset['3dPage'])
+        : state.graphsByLine[lineId];
+      title.textContent = scope === 'page' ? '3D-граф · лист ' + button.dataset['3dPage'] : '3D-граф · ' + lineId;
+      body.innerHTML = '<div class="graph-3d-loading"><span class="spinner"></span> Загружаю 3D-сцену...</div>';
+      if (typeof dialog.showModal === 'function') dialog.showModal();
+      else dialog.setAttribute('open', '');
+      await render3DGraph(body, graph);
     });
   });
 }

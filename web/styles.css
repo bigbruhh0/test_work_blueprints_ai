@@ -1606,6 +1606,91 @@ select {
   text-transform: uppercase;
 }
 .page-selector-row { margin: 0; }
+.result-nav { margin-top: 12px; }
+.result-tab { white-space: nowrap; }
+.development-badge {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 6px;
+  border: 1px solid #d9c985;
+  border-radius: 999px;
+  background: #fff8d9;
+  color: #876b00;
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1;
+  padding: 4px 7px;
+  vertical-align: middle;
+}
+.pipeline-common-results,
+.pipeline-length-page { display: grid; gap: 10px; }
+.pipeline-3d-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  justify-self: start;
+  border: 1px solid #a9cdb8;
+  border-radius: 8px;
+  padding: 8px 11px;
+  font-size: 12px;
+  line-height: 1.2;
+}
+.pipeline-3d-button:hover {
+  background: #b0d9c2;
+  transform: none;
+}
+.pipeline-3d-button .development-badge {
+  margin-left: 0;
+  padding: 3px 6px;
+  font-size: 9px;
+  white-space: nowrap;
+}
+.pipeline-page-summary { margin: 0; }
+.pipeline-local-markup-image {
+  margin: 10px 0;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+  padding: 8px;
+}
+.pipeline-local-markup-image figcaption {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+.pipeline-local-markup-image .viewer-frame { max-height: 700px; cursor: zoom-in; }
+.pipeline-overview-images { background: #fbfdfb; border-color: #d9e7dc; }
+.pipeline-overview-images h3 { margin: 0 0 8px; font-size: 15px; }
+.pipeline-artifacts { margin-top: 4px; }
+.pipeline-artifacts h3 { margin: 0 0 8px; font-size: 14px; }
+.pipeline-ai-page { background: #f7faff; border-color: #c8d7f4; }
+.pipeline-ai-page .trace-content .viewer-frame { max-height: 700px; }
+.pipeline-3d-dialog {
+  width: min(1180px, calc(100vw - 40px));
+  height: min(820px, calc(100vh - 40px));
+  max-width: none;
+  max-height: none;
+  border: 1px solid #cbd9d0;
+  border-radius: 12px;
+  padding: 0;
+  background: #fff;
+  color: var(--ink);
+  box-shadow: 0 24px 80px rgba(15, 23, 42, .28);
+}
+.pipeline-3d-dialog::backdrop { background: rgba(15, 23, 42, .58); }
+.pipeline-3d-dialog-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid var(--line);
+  padding: 12px 16px;
+}
+.pipeline-3d-dialog-head h2 { margin: 0; font-size: 17px; }
+.pipeline-3d-dialog-body { height: calc(100% - 58px); padding: 10px; }
+.pipeline-3d-dialog-body .graph-3d-shell { height: 100%; }
+.pipeline-3d-dialog-body .graph-3d-canvas { min-height: 0; }
 
 .viewer { margin: 10px 0; }
 .viewer-tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }

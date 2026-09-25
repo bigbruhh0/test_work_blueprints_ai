@@ -36,7 +36,7 @@ from src.dimension_mapping import (
     save_skeleton_pdf,
 )
 from src.dimension_review import build_map_text, calculate_lengths, codex_login_command, codex_login_status, review_map_with_provider
-from src.pipeline_length import build_pipeline_length_page_payload, build_pipeline_length_payload, build_pipeline_length_provider_payload, build_pipeline_length_result, build_pipeline_length_text, calculate_provider_length_summary, merge_pipeline_length_provider_traces, run_pipeline_length_provider
+from src.pipeline_length import _render_pipeline_page_image, build_pipeline_length_page_payload, build_pipeline_length_payload, build_pipeline_length_provider_payload, build_pipeline_length_result, build_pipeline_length_text, calculate_provider_length_summary, merge_pipeline_length_provider_traces, run_pipeline_length_provider
 from src.eval_data import aggregate_eval_results, evaluate_line_for_prompt, list_eval_groups, summarize_prompt_eval_rows
 from src.pdf_groups import get_pdf_cache_status, prepare_pdf_groups
 from src.prepare_stage import run_prepare
@@ -1002,6 +1002,16 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                     page_payload_path.write_text(json.dumps(page_payload, ensure_ascii=False, indent=2), encoding="utf-8")
                     prompt_revision = prompts.load_prompt_revision("pipeline_length")
                     page_prompt_path.write_text(prompt_revision["text"], encoding="utf-8")
+                    request_image_path = line_dir / f"{page_prefix}_request_image.png"
+                    try:
+                        rendered_request_image = _render_pipeline_page_image(pdf_path, page_number)
+                        if rendered_request_image is not None:
+                            request_image_path.write_bytes(rendered_request_image[1])
+                            if page_run is not None:
+                                page_run.files["pipeline_length_request_image"] = request_image_path.name
+                    except Exception as image_error:  # noqa: BLE001
+                        rendered_request_image = None
+                        line.events.append({"time": now(), "stage": "pipeline_length", "message": f"лист {page_number}: не удалось сохранить изображение запроса: {image_error}"})
                     line.events.append({"time": now(), "stage": "pipeline_length", "message": f"лист {page.get('page')}: запрос провайдеру"})
                     _persist(run)
                     try:
