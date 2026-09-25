@@ -2433,6 +2433,530 @@ def _first_arrow_third(segment: dict[str, list[float]]) -> tuple[list[float], li
     ]
 
 
+COORDINATE_LEAD_MAX_GAP_PX = 30.0
+COORDINATE_LEAD_CENTER_MAX_GAP_PX = 95.0
+COORDINATE_LEAD_JOIN_PX = 3.5
+COORDINATE_LEAD_MAX_SEGMENTS = 14
+
+
+def _rect_union(first: Any, second: Any) -> fitz.Rect | None:
+    top_left = 1e9
+    top_side = 1e9
+    bottom_right = -1e9
+    bottom_side = -1e9
+    for value in (first, second):
+        if isinstance(value, list) and len(value) >= 4:
+            try:
+                top_left = min(top_left, float(value[0]))
+                top_side = min(top_side, float(value[1]))
+                bottom_right = max(bottom_right, float(value[2]))
+                bottom_side = max(bottom_side, float(value[3]))
+            except (TypeError, ValueError):
+                continue
+    if top_left > bottom_right or top_side > bottom_side:
+        return None
+    return fitz.Rect(top_left, top_side, bottom_right, bottom_side)
+
+
+def _rect_from_bbox(value: Any) -> fitz.Rect | None:
+    if isinstance(value, list) and len(value) >= 4:
+        try:
+            return fitz.Rect(float(value[0]), float(value[1]), float(value[2]), float(value[3]))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _rects_overlap(first: fitz.Rect, second: fitz.Rect, tolerance: float = 1.5) -> bool:
+    return not (
+        first.x1 < second.x0 - tolerance
+        or first.x0 > second.x1 + tolerance
+        or first.y1 < second.y0 - tolerance
+        or first.y0 > second.y1 + tolerance
+    )
+
+
+def _coordinate_ref_like(text: str) -> bool:
+    value = text.strip()
+    if not value:
+        return False
+    upper = value.upper()
+    if upper in {"X", "Y", "Z", "Z+", "Z-"}:
+        return False
+    if re.fullmatch(r"\d+(?:[.,]\d+)?", value):
+        return False
+    # Real coordinate refs normally carry letters, separators, or drawing
+    # notation.  This keeps coordinate values above a standalone Z+ from being
+    # mistaken for the upper reference of that lower coordinate.
+    return bool(re.search(r"[A-ZА-ЯЁ]", upper) or re.search(r"[-_/]", value))
+
+
+def _coordinate_lead_search_rect(
+    page: Any,
+    row: dict[str, Any],
+    fallback_rect: fitz.Rect,
+    group_rect: fitz.Rect,
+) -> tuple[fitz.Rect, str, list[str]]:
+    """Area from which a coordinate block lead may start.
+
+    Coordinate callouts usually start from the upper designation of the
+    coordinate block ("CM...", node label, drawing reference), not from the
+    individual X/Y/Z value rows.  Prefer the whole PDF text block when we can
+    identify it; otherwise expand upward from the coordinate row.
+    """
+    label_rect = _rect_from_bbox(row.get("label_bbox"))
+    value_rect = _rect_from_bbox(row.get("value_bbox"))
+    try:
+        words = page.get_text("words")
+    except Exception:
+        words = []
+
+    block_key = None
+    for word in words:
+        if len(word) < 7:
+            continue
+        text = str(word[4] or "").strip().upper()
+        if text != str(row.get("label") or "").strip().upper():
+            continue
+        word_rect = fitz.Rect(float(word[0]), float(word[1]), float(word[2]), float(word[3]))
+        if label_rect is not None and _rects_overlap(word_rect, label_rect):
+            block_key = (word[5],)
+            break
+
+    block_words: list[tuple[fitz.Rect, str, bool]] = []
+    if block_key is not None:
+        for word in words:
+            if len(word) < 7 or (word[5],) != block_key:
+                continue
+            text = str(word[4] or "").strip()
+            if not text:
+                continue
+            if not _coordinate_ref_like(text):
+                continue
+            word_rect = fitz.Rect(float(word[0]), float(word[1]), float(word[2]), float(word[3]))
+            if word_rect.y0 >= group_rect.y0 - 2.0 and word_rect.y1 <= group_rect.y1 + 2.0:
+                # These are the X/Y/Z rows themselves, not an upper reference.
+                continue
+            # Keep nearby rows above and inside the coordinate block, but avoid
+            # swallowing unrelated notes below the coordinate values.
+            if word_rect.y1 < group_rect.y0 - 55.0 or word_rect.y0 > group_rect.y1 + 8.0:
+                continue
+            if word_rect.x1 < group_rect.x0 - 35.0 or word_rect.x0 > group_rect.x1 + 45.0:
+                continue
+            ref_center_x = (word_rect.x0 + word_rect.x1) / 2.0
+            group_center_x = (group_rect.x0 + group_rect.x1) / 2.0
+            if abs(ref_center_x - group_center_x) > max(42.0, group_rect.width * 0.8):
+                continue
+            block_words.append((word_rect, text, True))
+
+    # Some PDFs split bold point references above coordinates into a separate
+    # text block.  Pull those nearby upper rows into the same coordinate callout
+    # area: they are often the real leader start, while X/Y/Z are just values.
+    for word in words:
+        if len(word) < 7:
+            continue
+        text = str(word[4] or "").strip()
+        if not text:
+            continue
+        if not _coordinate_ref_like(text):
+            continue
+        word_rect = fitz.Rect(float(word[0]), float(word[1]), float(word[2]), float(word[3]))
+        if word_rect.y1 < group_rect.y0 - 70.0 or word_rect.y1 > group_rect.y0 - 2.0:
+            continue
+        if word_rect.x1 < group_rect.x0 - 30.0 or word_rect.x0 > group_rect.x1 + 45.0:
+            continue
+        ref_center_x = (word_rect.x0 + word_rect.x1) / 2.0
+        group_center_x = (group_rect.x0 + group_rect.x1) / 2.0
+        if abs(ref_center_x - group_center_x) > max(42.0, group_rect.width * 0.8):
+            continue
+        if _rects_overlap(word_rect, fallback_rect, tolerance=0.0):
+            continue
+        block_words.append((word_rect, text, False))
+
+    if block_words:
+        rects = [item[0] for item in block_words]
+        rect = fitz.Rect(
+            min(item.x0 for item in rects),
+            min(item.y0 for item in rects),
+            max(item.x1 for item in rects),
+            max(item.y1 for item in rects),
+        )
+        if label_rect is not None:
+            rect.include_rect(label_rect)
+        if value_rect is not None:
+            rect.include_rect(value_rect)
+        refs = [
+            text
+            for _rect, text, from_same_block in sorted(block_words, key=lambda item: (item[0].y0, item[0].x0))
+            if not from_same_block or _rect.y1 < group_rect.y0 - 2.0
+        ]
+        rect.x0 -= 5.0
+        rect.y0 -= 6.0
+        # Coordinate leaders often start from a short blank gap to the right of
+        # the bold reference above X/Y/Z, not directly from the text ink bbox.
+        # Keep this wider only for proven coordinate callout blocks; the far
+        # end still has to hit a vertex and multi-sector chains still need an
+        # arrowhead.
+        rect.x1 += 28.0
+        rect.y1 += 6.0
+        return rect, "coordinate_callout_block", refs
+
+    rect = fitz.Rect(group_rect)
+    rect.x0 -= 5.0
+    rect.y0 -= 5.0
+    rect.x1 += 26.0
+    rect.y1 += 5.0
+    return rect, "coordinate_value_block", []
+
+
+def _leader_starts(
+    text_rect: fitz.Rect,
+    segments: list[tuple[tuple[float, float], tuple[float, float]]],
+) -> list[tuple[float, int, tuple[float, float], tuple[float, float]]]:
+    """Сегменты, начинающиеся около подписи: (gap, index, start, end), ближайший первым."""
+    starts: list[tuple[float, int, tuple[float, float], tuple[float, float]]] = []
+    for segment_index, (start, end) in enumerate(segments):
+        start_gap = _distance_to_rect(start, text_rect)
+        end_gap = _distance_to_rect(end, text_rect)
+        nearest_gap = min(start_gap, end_gap)
+        if nearest_gap > COORDINATE_LEAD_MAX_GAP_PX:
+            continue
+        if end_gap < start_gap:
+            start, end = end, start
+        starts.append((nearest_gap, segment_index, start, end))
+    starts.sort(key=lambda item: item[0])
+    return starts
+
+
+def _leader_starts_from_point(
+    center: tuple[float, float],
+    segments: list[tuple[tuple[float, float], tuple[float, float]]],
+    max_gap: float,
+) -> list[tuple[float, int, tuple[float, float], tuple[float, float]]]:
+    """Leader candidates ordered by nearest endpoint to a coordinate block center."""
+    starts: list[tuple[float, int, tuple[float, float], tuple[float, float]]] = []
+    for segment_index, (start, end) in enumerate(segments):
+        start_gap = math.hypot(start[0] - center[0], start[1] - center[1])
+        end_gap = math.hypot(end[0] - center[0], end[1] - center[1])
+        nearest_gap = min(start_gap, end_gap)
+        if nearest_gap > max_gap:
+            continue
+        if end_gap < start_gap:
+            start, end = end, start
+        starts.append((nearest_gap, segment_index, start, end))
+    starts.sort(key=lambda item: item[0])
+    return starts
+
+
+def _leader_chain_from_start(
+    text_rect: fitz.Rect,
+    segments: list[tuple[tuple[float, float], tuple[float, float]]],
+    segment_index: int,
+    start: tuple[float, float],
+    end: tuple[float, float],
+) -> tuple[list[tuple[tuple[float, float], tuple[float, float]]], bool]:
+    """Продолжить выноску от конкретного стартового сегмента (возможно многосегментную)."""
+    chains = _leader_chains_from_start(text_rect, segments, segment_index, start, end)
+    if not chains:
+        return [], False
+    chains.sort(key=lambda item: (item[1], len(item[0])), reverse=True)
+    return chains[0]
+
+
+def _leader_chains_from_start(
+    text_rect: fitz.Rect,
+    segments: list[tuple[tuple[float, float], tuple[float, float]]],
+    segment_index: int,
+    start: tuple[float, float],
+    end: tuple[float, float],
+    *,
+    max_paths: int = 80,
+) -> list[tuple[list[tuple[tuple[float, float], tuple[float, float]]], bool]]:
+    """Все разумные варианты цепочки от старта.
+
+    Старый вариант выбирал одно самое "наружное" продолжение. Для координатных
+    callout-стрелок это хрупко: стрелка часто разбита на два сектора, а рядом
+    могут лежать похожие штрихи текста/выносок. Поэтому для привязки к вершине
+    нужно проверить не один путь, а несколько вариантов.
+    """
+    rect_center = ((text_rect.x0 + text_rect.x1) / 2.0, (text_rect.y0 + text_rect.y1) / 2.0)
+
+    def outward(point: tuple[float, float]) -> float:
+        return math.hypot(point[0] - rect_center[0], point[1] - rect_center[1])
+
+    results: list[tuple[list[tuple[tuple[float, float], tuple[float, float]]], bool]] = []
+    stack: list[tuple[list[tuple[tuple[float, float], tuple[float, float]]], set[int]]] = [
+        ([(start, end)], {segment_index})
+    ]
+    while stack and len(results) < max_paths:
+        path, visited = stack.pop()
+        tip = path[-1][1]
+        arrow = _has_explicit_arrowhead(tip, path[-1], segments)
+        results.append((path, arrow))
+        if arrow or len(path) >= COORDINATE_LEAD_MAX_SEGMENTS:
+            continue
+        candidates: list[tuple[float, int, tuple[float, float], tuple[float, float]]] = []
+        for next_index, (next_start, next_end) in enumerate(segments):
+            if next_index in visited:
+                continue
+            start_distance = math.hypot(next_start[0] - tip[0], next_start[1] - tip[1])
+            end_distance = math.hypot(next_end[0] - tip[0], next_end[1] - tip[1])
+            if min(start_distance, end_distance) > COORDINATE_LEAD_JOIN_PX:
+                continue
+            if end_distance < start_distance:
+                next_start, next_end = next_end, next_start
+            candidates.append((outward(next_end), next_index, next_start, next_end))
+        candidates.sort(reverse=True)
+        for _outward, next_index, next_start, next_end in reversed(candidates[:5]):
+            stack.append((path + [(next_start, next_end)], visited | {next_index}))
+    return results
+
+
+def _leader_path_from_rect(
+    text_rect: fitz.Rect,
+    segments: list[tuple[tuple[float, float], tuple[float, float]]],
+    *,
+    require_arrowhead: bool = False,
+) -> tuple[list[tuple[tuple[float, float], tuple[float, float]]], bool]:
+    """Лучшая выноска от подписи (для тестов/общего случая)."""
+    best: tuple[float, list[tuple[tuple[float, float], tuple[float, float]]], bool] | None = None
+    for nearest_gap, segment_index, start, end in _leader_starts(text_rect, segments)[:8]:
+        path, arrow = _leader_chain_from_start(text_rect, segments, segment_index, start, end)
+        if arrow or not require_arrowhead:
+            if best is None or (arrow and not best[2]) or (arrow == best[2] and len(path) > len(best[1])):
+                best = (nearest_gap, path, arrow)
+        if arrow:
+            break
+    if best is None:
+        return [], False
+    return best[1], best[2]
+
+
+COORDINATE_LEAD_VERTEX_HIT_PX = 22.0
+
+
+def _pipe_segments(mapping: dict[str, Any]) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+    rows: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    for edge in mapping.get("edges") or []:
+        start = edge.get("start")
+        end = edge.get("end")
+        if isinstance(start, list) and isinstance(end, list) and len(start) >= 2 and len(end) >= 2:
+            rows.append(((float(start[0]), float(start[1])), (float(end[0]), float(end[1]))))
+    return rows
+
+
+def _lies_on_pipe(
+    segment: tuple[tuple[float, float], tuple[float, float]],
+    pipe_segments: list[tuple[tuple[float, float], tuple[float, float]]],
+    tolerance: float = 2.5,
+) -> bool:
+    start, end = segment
+    for pipe_start, pipe_end in pipe_segments:
+        if (
+            _distance_to_segment(start, pipe_start, pipe_end)[0] <= tolerance
+            and _distance_to_segment(end, pipe_start, pipe_end)[0] <= tolerance
+        ):
+            return True
+    return False
+
+
+def _lead_vertex_rows(mapping: dict[str, Any]) -> list[dict[str, Any]]:
+    """Вершины, к которым может прийти lead: финальные, иначе базовые."""
+    rows: list[dict[str, Any]] = []
+    for vertex in mapping.get("final_vertices") or []:
+        point = vertex.get("point")
+        if isinstance(point, list) and len(point) >= 2 and vertex.get("id"):
+            rows.append({"id": str(vertex["id"]), "point": [float(point[0]), float(point[1])]})
+    if rows:
+        return rows
+    for vertex in mapping.get("vertices") or []:
+        try:
+            rows.append({"id": str(vertex.get("id")), "point": [float(vertex["x"]), float(vertex["y"])]})
+        except (TypeError, ValueError):
+            continue
+    return rows
+
+
+def _nearest_lead_vertex(
+    tip: tuple[float, float],
+    vertices: list[dict[str, Any]],
+    max_gap: float,
+) -> tuple[dict[str, Any], float] | None:
+    best: tuple[dict[str, Any], float] | None = None
+    for vertex in vertices:
+        point = vertex.get("point")
+        if not point:
+            continue
+        gap = math.hypot(point[0] - tip[0], point[1] - tip[1])
+        if gap <= max_gap and (best is None or gap < best[1]):
+            best = (vertex, gap)
+    return best
+
+
+def _coordinate_group_rect(row: dict[str, Any], coordinates: list[dict[str, Any]]) -> fitz.Rect | None:
+    seed = _rect_union(row.get("label_bbox"), row.get("value_bbox"))
+    if seed is None:
+        return None
+    rect = fitz.Rect(seed)
+    for other in coordinates:
+        other_rect = _rect_union(other.get("label_bbox"), other.get("value_bbox"))
+        if other_rect is None:
+            continue
+        same_column = not (other_rect.x1 < seed.x0 - 8.0 or other_rect.x0 > seed.x1 + 8.0)
+        close_row = abs(((other_rect.y0 + other_rect.y1) / 2.0) - ((seed.y0 + seed.y1) / 2.0)) <= 55.0
+        if same_column and close_row:
+            rect.include_rect(other_rect)
+    return rect
+
+
+def _coordinate_lead_blocks(coordinates: list[dict[str, Any]]) -> dict[int, fitz.Rect]:
+    """Group X/Y/Z rows into coordinate blocks before looking for refs/leads."""
+    rows: list[tuple[int, fitz.Rect]] = []
+    for index, row in enumerate(coordinates):
+        rect = _rect_union(row.get("label_bbox"), row.get("value_bbox"))
+        if rect is not None:
+            rows.append((index, rect))
+    rows.sort(key=lambda item: (item[1].x0, item[1].y0))
+
+    blocks: list[list[tuple[int, fitz.Rect]]] = []
+    for index, rect in rows:
+        best_block: list[tuple[int, fitz.Rect]] | None = None
+        best_gap = 1e9
+        for block in blocks:
+            block_rect = fitz.Rect(
+                min(item.x0 for _idx, item in block),
+                min(item.y0 for _idx, item in block),
+                max(item.x1 for _idx, item in block),
+                max(item.y1 for _idx, item in block),
+            )
+            same_column = not (rect.x1 < block_rect.x0 - 8.0 or rect.x0 > block_rect.x1 + 8.0)
+            vertical_gap = max(block_rect.y0 - rect.y1, rect.y0 - block_rect.y1, 0.0)
+            if same_column and vertical_gap <= 18.0 and vertical_gap < best_gap:
+                best_block = block
+                best_gap = vertical_gap
+        if best_block is None:
+            blocks.append([(index, rect)])
+        else:
+            best_block.append((index, rect))
+
+    by_index: dict[int, fitz.Rect] = {}
+    for block in blocks:
+        block_rect = fitz.Rect(
+            min(item.x0 for _idx, item in block),
+            min(item.y0 for _idx, item in block),
+            max(item.x1 for _idx, item in block),
+            max(item.y1 for _idx, item in block),
+        )
+        for index, _rect in block:
+            by_index[index] = block_rect
+    return by_index
+
+
+def _coordinate_lead_rows(page: Any, mapping: dict[str, Any]) -> list[dict[str, Any]]:
+    """Координатные подписи (X/Y/Z) и их lead-стрелки, приходящие в вершину.
+
+    Перебираем начала выносок от ближайшего к подписи. Для каждого строим
+    возможно многосегментную цепочку; принимаем только если её дальний конец
+    попадает в вершину. Иначе пропускаем кандидата и ищем следующий.
+    """
+    coordinates = list(mapping.get("coordinates") or [])
+    if not coordinates:
+        mapping["coordinate_leads"] = []
+        return []
+    drawings = page.get_drawings()
+    rectangles = mark_pipeline.find_rectangles(page, page.rect)
+    pipe_segments = _pipe_segments(mapping)
+    segments = [
+        segment
+        for segment in _drawing_segments(drawings, rectangles)
+        if not _lies_on_pipe(segment, pipe_segments)
+    ]
+    vertices = _lead_vertex_rows(mapping)
+    block_rects = _coordinate_lead_blocks(coordinates)
+    rows: list[dict[str, Any]] = []
+    for index, row in enumerate(coordinates, start=1):
+        rect = _rect_union(row.get("label_bbox"), row.get("value_bbox"))
+        group_rect = block_rects.get(index - 1) or _coordinate_group_rect(row, coordinates)
+        search_rect: fitz.Rect | None = None
+        search_source = None
+        block_refs: list[str] = []
+        if rect is not None and group_rect is not None:
+            search_rect, search_source, block_refs = _coordinate_lead_search_rect(page, row, rect, group_rect)
+        coordinate_id = row.get("id") or f"C{index:03d}"
+        entry: dict[str, Any] = {
+            "id": coordinate_id,
+            "label": row.get("label"),
+            "value": row.get("value"),
+            "coordinate_block_refs": block_refs,
+            "label_bbox": row.get("label_bbox"),
+            "value_bbox": row.get("value_bbox"),
+            "bbox": [round(rect.x0, 2), round(rect.y0, 2), round(rect.x1, 2), round(rect.y1, 2)] if rect is not None else None,
+            "lead_search_bbox": [round(search_rect.x0, 2), round(search_rect.y0, 2), round(search_rect.x1, 2), round(search_rect.y1, 2)] if search_rect is not None else None,
+            "lead_search_source": search_source,
+            "arrow_found": False,
+            "arrow_has_arrowhead": False,
+            "arrow_start": None,
+            "arrow_end": None,
+            "arrow_segments": [],
+            "matched_vertex_id": None,
+            "matched_vertex_point": None,
+            "matched_vertex_gap_px": None,
+            "checked_start_count": 0,
+            "checked_path_count": 0,
+        }
+        if search_rect is not None:
+            block_center = ((search_rect.x0 + search_rect.x1) / 2.0, (search_rect.y0 + search_rect.y1) / 2.0)
+            entry["lead_search_center"] = [round(block_center[0], 2), round(block_center[1], 2)]
+            starts = _leader_starts_from_point(block_center, segments, COORDINATE_LEAD_CENTER_MAX_GAP_PX)
+            entry["checked_start_count"] = len(starts)
+            for _gap, segment_index, start, end in starts:
+                chains = _leader_chains_from_start(search_rect, segments, segment_index, start, end)
+                chains.sort(key=lambda item: (item[1], len(item[0])), reverse=True)
+                for path, arrow in chains:
+                    entry["checked_path_count"] += 1
+                    if not path:
+                        continue
+                    tip = path[-1][1]
+                    match = _nearest_lead_vertex(tip, vertices, COORDINATE_LEAD_VERTEX_HIT_PX)
+                    if match is None:
+                        # дальний конец не у вершины — это не наш lead, пропускаем кандидата
+                        continue
+                    if not arrow:
+                        # Coordinate lead must be proven by an arrowhead at the
+                        # vertex side.  Otherwise short dashed strokes and
+                        # construction lines near the coordinate block can look
+                        # like a plausible leader.
+                        continue
+                    vertex, vertex_gap = match
+                    entry["arrow_found"] = True
+                    entry["arrow_has_arrowhead"] = arrow
+                    entry["arrow_start"] = [round(path[0][0][0], 2), round(path[0][0][1], 2)]
+                    entry["arrow_end"] = [round(tip[0], 2), round(tip[1], 2)]
+                    entry["arrow_segments"] = [
+                        {
+                            "start": [round(segment[0][0], 2), round(segment[0][1], 2)],
+                            "end": [round(segment[1][0], 2), round(segment[1][1], 2)],
+                        }
+                        for segment in path
+                    ]
+                    entry["matched_vertex_id"] = vertex.get("id")
+                    point = vertex.get("point") or []
+                    if len(point) >= 2:
+                        entry["matched_vertex_point"] = [round(float(point[0]), 2), round(float(point[1]), 2)]
+                    entry["matched_vertex_gap_px"] = round(vertex_gap, 2)
+                    break
+                if entry["arrow_found"]:
+                    break
+        rows.append(entry)
+    mapping["coordinate_leads"] = rows
+    return rows
+
+
+def attach_coordinate_leads(page: Any, mapping: dict[str, Any]) -> list[dict[str, Any]]:
+    """Публичная обёртка: найти lead-стрелки координатных подписей и сохранить в mapping."""
+    return _coordinate_lead_rows(page, mapping)
+
+
 def _handwheel_details(
     page: Any,
     mapping: dict[str, Any],
@@ -4853,7 +5377,88 @@ def save_dimension_lead_detection_pdf(
         no_lead_color = (0.65, 0.65, 0.65)
         lead_target_color = (0.0, 0.68, 0.18)
         suspect_color = (0.95, 0.05, 0.05)
+        coordinate_color = (0.0, 0.62, 0.62)
+        coordinate_lead_color = (0.95, 0.45, 0.0)
+        coordinate_no_lead_color = (0.62, 0.62, 0.62)
         target_overlays: list[tuple[fitz.Point, fitz.Point, bool, dict[str, Any]]] = []
+
+        coordinate_leads = mapping.get("coordinate_leads") or _coordinate_lead_rows(page, mapping)
+        for row in coordinate_leads:
+            bbox = row.get("bbox")
+            if not isinstance(bbox, list) or len(bbox) < 4:
+                continue
+            rect = fitz.Rect(float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+            has_lead = bool(row.get("arrow_found"))
+            has_arrowhead = bool(row.get("arrow_has_arrowhead"))
+            box_color = coordinate_lead_color if has_lead else coordinate_no_lead_color
+            marked.draw_rect(rect, color=coordinate_color, fill=(1.0, 1.0, 1.0), fill_opacity=0.5, width=1.1)
+            search_bbox = row.get("lead_search_bbox")
+            if isinstance(search_bbox, list) and len(search_bbox) >= 4:
+                search_rect = fitz.Rect(
+                    float(search_bbox[0]),
+                    float(search_bbox[1]),
+                    float(search_bbox[2]),
+                    float(search_bbox[3]),
+                )
+                marked.draw_rect(
+                    search_rect,
+                    color=coordinate_lead_color if has_lead else coordinate_no_lead_color,
+                    width=0.7,
+                    dashes="[2 2] 0",
+                )
+            for segment in row.get("arrow_segments") or []:
+                start = segment.get("start")
+                end = segment.get("end")
+                if not start or not end or len(start) < 2 or len(end) < 2:
+                    continue
+                marked.draw_line(
+                    fitz.Point(float(start[0]), float(start[1])),
+                    fitz.Point(float(end[0]), float(end[1])),
+                    color=box_color,
+                    width=2.4,
+                )
+            arrow_end = row.get("arrow_end")
+            if isinstance(arrow_end, list) and len(arrow_end) >= 2:
+                target_point = fitz.Point(float(arrow_end[0]), float(arrow_end[1]))
+                marked.draw_circle(
+                    target_point,
+                    4.0 if has_arrowhead else 3.2,
+                    color=box_color,
+                    fill=box_color if has_arrowhead else None,
+                    width=1.2,
+                )
+            matched_vertex_point = row.get("matched_vertex_point")
+            if isinstance(matched_vertex_point, list) and len(matched_vertex_point) >= 2:
+                vertex_point = fitz.Point(float(matched_vertex_point[0]), float(matched_vertex_point[1]))
+                marked.draw_circle(
+                    vertex_point,
+                    5.2,
+                    color=lead_target_color,
+                    fill=lead_target_color,
+                    width=1.0,
+                )
+                marked.insert_text(
+                    vertex_point + (6, -6),
+                    str(row.get("matched_vertex_id") or "")[:24],
+                    fontsize=7,
+                    fontname="helv",
+                    color=lead_target_color,
+                )
+            label = f"{row.get('id')} {row.get('label')}={row.get('value')}: " + (
+                "lead" if has_lead else "no lead"
+            )
+            if row.get("matched_vertex_id"):
+                label = f"{row.get('id')} {row.get('label')}={row.get('value')}: -> {row.get('matched_vertex_id')}"
+            refs = row.get("coordinate_block_refs") or []
+            if refs:
+                label += " [" + " ".join(str(item) for item in refs[:3])[:24] + "]"
+            marked.insert_text(
+                fitz.Point(rect.x0, rect.y0 - 3),
+                label[:60],
+                fontsize=7,
+                fontname="helv",
+                color=coordinate_lead_color if has_lead else coordinate_no_lead_color,
+            )
 
         for dimension in mapping.get("dimensions", []):
             label_center = dimension.get("label_center")
@@ -4931,13 +5536,106 @@ def save_dimension_lead_detection_pdf(
 
         marked.insert_text(
             fitz.Point(28, 26),
-            f"DIMENSION LEAD DETECTION / page {page_number}  yellow=lead green=lead target red=suspect target blue=dimension purple=extension",
+            f"DIMENSION LEAD DETECTION / page {page_number}  yellow=lead green=lead target red=suspect target blue=dimension purple=extension teal/orange=coordinate lead",
             fontsize=10,
             fontname="helv",
             color=(1.0, 0.25, 0.0),
         )
         output.save(str(output_pdf))
         output.close()
+
+
+def _draw_coordinate_lead_overlay(
+    marked: Any,
+    page: Any,
+    mapping: dict[str, Any],
+) -> None:
+    coordinate_color = (0.0, 0.62, 0.62)
+    coordinate_lead_color = (0.95, 0.45, 0.0)
+    coordinate_no_lead_color = (0.62, 0.62, 0.62)
+    lead_target_color = (0.0, 0.68, 0.18)
+
+    coordinate_leads = mapping.get("coordinate_leads") or _coordinate_lead_rows(page, mapping)
+    for row in coordinate_leads:
+        bbox = row.get("bbox")
+        if not isinstance(bbox, list) or len(bbox) < 4:
+            continue
+        rect = fitz.Rect(float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+        has_lead = bool(row.get("arrow_found"))
+        has_arrowhead = bool(row.get("arrow_has_arrowhead"))
+        box_color = coordinate_lead_color if has_lead else coordinate_no_lead_color
+        marked.draw_rect(rect, color=coordinate_color, fill=(1.0, 1.0, 1.0), fill_opacity=0.45, width=1.1)
+        search_bbox = row.get("lead_search_bbox")
+        if isinstance(search_bbox, list) and len(search_bbox) >= 4:
+            search_rect = fitz.Rect(
+                float(search_bbox[0]),
+                float(search_bbox[1]),
+                float(search_bbox[2]),
+                float(search_bbox[3]),
+            )
+            marked.draw_rect(
+                search_rect,
+                color=box_color,
+                width=0.8,
+                dashes="[2 2] 0",
+            )
+        search_center = row.get("lead_search_center")
+        if isinstance(search_center, list) and len(search_center) >= 2:
+            center_point = fitz.Point(float(search_center[0]), float(search_center[1]))
+            marked.draw_circle(center_point, 2.8, color=box_color, fill=box_color, width=0.8)
+        for segment in row.get("arrow_segments") or []:
+            start = segment.get("start")
+            end = segment.get("end")
+            if not start or not end or len(start) < 2 or len(end) < 2:
+                continue
+            marked.draw_line(
+                fitz.Point(float(start[0]), float(start[1])),
+                fitz.Point(float(end[0]), float(end[1])),
+                color=box_color,
+                width=2.6,
+            )
+        arrow_end = row.get("arrow_end")
+        if isinstance(arrow_end, list) and len(arrow_end) >= 2:
+            target_point = fitz.Point(float(arrow_end[0]), float(arrow_end[1]))
+            marked.draw_circle(
+                target_point,
+                4.2 if has_arrowhead else 3.2,
+                color=box_color,
+                fill=box_color if has_arrowhead else None,
+                width=1.2,
+            )
+        matched_vertex_point = row.get("matched_vertex_point")
+        if isinstance(matched_vertex_point, list) and len(matched_vertex_point) >= 2:
+            vertex_point = fitz.Point(float(matched_vertex_point[0]), float(matched_vertex_point[1]))
+            marked.draw_circle(
+                vertex_point,
+                5.8,
+                color=lead_target_color,
+                fill=lead_target_color,
+                width=1.0,
+            )
+            marked.insert_text(
+                vertex_point + (6, -6),
+                str(row.get("matched_vertex_id") or "")[:24],
+                fontsize=7,
+                fontname="helv",
+                color=lead_target_color,
+            )
+        label = f"{row.get('id')} {row.get('label')}={row.get('value')}: " + (
+            "lead" if has_lead else "no lead"
+        )
+        if row.get("matched_vertex_id"):
+            label = f"{row.get('id')} {row.get('label')}={row.get('value')}: -> {row.get('matched_vertex_id')}"
+        refs = row.get("coordinate_block_refs") or []
+        if refs:
+            label += " [" + " ".join(str(item) for item in refs[:3])[:24] + "]"
+        marked.insert_text(
+            fitz.Point(rect.x0, rect.y0 - 3),
+            label[:64],
+            fontsize=7,
+            fontname="helv",
+            color=box_color,
+        )
 
 
 def save_pipeline_length_diagnostic_pdf(
@@ -5117,9 +5815,11 @@ def save_final_contour_rays_pdf(
             label = f"{dimension.get('id', 'D?')}: {from_vertex} - {to_vertex}"
             marked.insert_text(ray_end + (5, -4), label, fontsize=7, fontname="helv", color=ray_color)
 
+        _draw_coordinate_lead_overlay(marked, source_page, mapping)
+
         marked.insert_text(
             fitz.Point(18, 24),
-            f"FINAL CONTOUR RAYS / page {page_number}  yellow=lead  orange=ray  red=intersection",
+            f"FINAL CONTOUR RAYS / page {page_number}  yellow=lead orange=ray red=intersection teal/orange=coordinate lead",
             fontsize=9,
             fontname="helv",
             color=ray_color,
@@ -5327,6 +6027,7 @@ __all__ = [
     "save_dimension_mapping_pdf",
     "save_preprocess_annotation_pdf",
     "save_dimension_lead_detection_pdf",
+    "attach_coordinate_leads",
     "save_local_dimension_filter_pdf",
     "save_pipeline_length_diagnostic_pdf",
     "save_final_contour_rays_pdf",
