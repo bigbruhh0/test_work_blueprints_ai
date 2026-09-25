@@ -662,6 +662,7 @@ function pipelineVertexCoordinates(line) {
 }
 
 function pipelineVertexCoordinateKey(item) {
+  if (item.vertex_key) return String(item.vertex_key);
   const vertexId = String(item.vertex_id || item.id || '');
   if (vertexId.includes(':')) return vertexId;
   const page = item.page || item.from_page;
@@ -671,10 +672,42 @@ function pipelineVertexCoordinateKey(item) {
 function pipelineVertexCoordinateMap(line) {
   const map = new Map();
   pipelineVertexCoordinates(line).forEach(function (item) {
+    const confidence = item.confidence == null ? null : Number(item.confidence);
+    const hasXYZ = item.x != null && item.y != null && item.z != null;
+    if (!hasXYZ || (confidence != null && Number.isFinite(confidence) && confidence < 0.7)) return;
     const key = pipelineVertexCoordinateKey(item);
     if (key) map.set(key, item);
   });
   return map;
+}
+
+function pipelineLocalVertexCoordinateRows(line) {
+  const pages = line.provider_trace && line.provider_trace.payload && line.provider_trace.payload.pages;
+  if (Array.isArray(pages)) {
+    return pages.flatMap(function (page) {
+      return (page.local_vertex_coordinates || []).map(function (row) {
+        return Object.assign({ page: page.page }, row);
+      });
+    });
+  }
+  return (line.page_results || []).flatMap(function (page) {
+    const snapshot = page.analysis && page.analysis.pipeline_length_local;
+    return (snapshot && Array.isArray(snapshot.final_vertices) ? snapshot.final_vertices : []).map(function (vertex) {
+      const point = Array.isArray(vertex.point) ? vertex.point : [];
+      return {
+        vertex_id: vertex.id,
+        vertex_key: page.page_number + ':' + vertex.id,
+        page: page.page_number,
+        sheet_x: point[0],
+        sheet_y: point[1],
+        x: null,
+        y: null,
+        z: null,
+        confidence: 0,
+        method: 'не определено',
+      };
+    });
+  });
 }
 
 function pipelineLengthSummary(line) {
@@ -699,6 +732,12 @@ function pipelineLengthSummary(line) {
   const branches = Array.isArray(lengths.branches) ? lengths.branches : [];
   const manualAccepted = (manual.candidate_ids || []).length;
   const manualKept = (manual.keep_local_candidate_ids || []).length;
+  const localCoordinateRows = pipelineLocalVertexCoordinateRows(line);
+  const providerCoordinateMap = pipelineVertexCoordinateMap(line);
+  const coordinateReady = localCoordinateRows.filter(function (row) {
+    return providerCoordinateMap.has(String(row.vertex_key || (row.page + ':' + row.vertex_id)));
+  }).length;
+  const coordinateUnknown = Math.max(0, localCoordinateRows.length - coordinateReady);
   const handwheelCount = (line.page_results || []).reduce(function (total, page) {
     const snapshot = page.analysis && page.analysis.pipeline_length_local;
     const annotations = snapshot && snapshot.handwheel_annotations;
@@ -716,8 +755,10 @@ function pipelineLengthSummary(line) {
     + '<span>Штурвалы: <b>' + esc(handwheelCount) + '</b></span>'
     + '<span>Спорные: <b>' + esc(disputes.length) + '</b></span>'
     + '<span>Смежные: <b>' + esc(intermediate.length) + '</b></span>'
+    + '<span>3D координаты: <b>' + esc(coordinateReady) + '/' + esc(localCoordinateRows.length) + '</b></span>'
     + '<span>Автоприменение: <b>нет</b></span>'
     + '</div>'
+    + (coordinateUnknown ? '<p class="pipeline-note"><b>Координаты / 3D готовность:</b> ' + esc(coordinateUnknown) + ' вершин требуют проверки координат.</p>' : '')
     + (branches.length ? '<div class="pipeline-chip-row">' + branches.map(function (branch) { return '<span class="pipeline-chip">' + esc(branch.branch_id || 'BR') + ' · ' + esc(formatMm(branch.clean_length_mm)) + '</span>'; }).join('') + '</div>' : '')
     + (disputes.length ? '<p class="pipeline-note"><b>Требуют внимания:</b> ' + esc(disputes.map(function (item) { return item.candidate_id; }).join(', ')) + '</p>' : '')
     + (intermediate.length ? '<p class="pipeline-note"><b>Смежные расстояния:</b> найдены провайдером, детали ниже.</p>' : '')
@@ -808,6 +849,10 @@ function pipelineLengthPageDetail(line, pageNumber) {
     ? '<details class="notes collapsible-result" open><summary>Изображение для проверки провайдера</summary><img class="viewer-frame" src="' + viewerImageUrl(state.runId, line.line_id, diagnosticFile) + '" alt="Диагностика расчета длины, лист ' + esc(pageNumber) + '"></details>'
     : '';
   const estimates = pipelineLengthEstimates(line).filter(function (row) { return Number(row.page) === Number(pageNumber); });
+  const payloadPages = line.provider_trace && line.provider_trace.payload && line.provider_trace.payload.pages;
+  const payloadPage = Array.isArray(payloadPages) ? payloadPages.find(function (page) { return Number(page.page) === Number(pageNumber); }) : null;
+  const unresolvedLocal = payloadPage && Array.isArray(payloadPage.unresolved_dimensions) ? payloadPage.unresolved_dimensions : [];
+  const unresolvedProvider = Array.isArray(provider.unresolved_reviews) ? provider.unresolved_reviews : [];
   const adjacentForPage = pipelineAdjacentSheetItems(line).filter(function (item) {
     return Number(item.page || item.from_page) === Number(pageNumber);
   });
@@ -851,7 +896,21 @@ function pipelineLengthPageDetail(line, pageNumber) {
         return '<li><b>' + esc(pipelineAdjacentKindLabel(item._kind)) + '</b>: ' + esc(pipelineAdjacentPageLabel(item)) + (value != null ? ' · ' + esc(formatMm(value)) : '') + (item.reason || item.explanation ? '<br><span class="muted">' + esc(item.reason || item.explanation) + '</span>' : '') + '</li>';
       }).join('') + '</ul></details>'
     : '';
-  return diagnosticMarkup + adjacentMarkup + '<section class="pipeline-length-page">'
+  const unresolvedMarkup = unresolvedLocal.length
+    ? '<details class="notes collapsible-result pipeline-unresolved-block" open><summary>Не попали на отрезки (' + unresolvedLocal.length + ')</summary>'
+      + '<div class="table-wrap"><table class="viewer-table"><thead><tr><th>Кандидат</th><th>Локальная причина</th><th>Провайдер</th></tr></thead><tbody>'
+      + unresolvedLocal.map(function (row) {
+        const key = String(row.candidate_key || row.candidate_id || '');
+        const review = unresolvedProvider.find(function (item) {
+          return String(item.candidate_key || item.candidate_id || '') === key || String(item.candidate_id || '').endsWith(':' + String(row.candidate_id || ''));
+        }) || {};
+        return '<tr><td><b>' + esc(key || row.candidate_id || '—') + '</b><br><span class="muted">' + esc(formatMm(row.value_mm)) + '</span></td>'
+          + '<td>' + esc(row.final_interval_reason || row.reason || '—') + '</td>'
+          + '<td>' + esc(review.status || 'нет ответа') + '<br><span class="muted">' + esc(review.reason || review.suggested_action || '') + '</span></td></tr>';
+      }).join('')
+      + '</tbody></table></div></details>'
+    : '';
+  return diagnosticMarkup + adjacentMarkup + unresolvedMarkup + '<section class="pipeline-length-page">'
     + '<div class="pipeline-page-heading"><h2>Лист ' + esc(pageNumber) + '</h2><span>предварительная сумма ' + esc(formatMm(pageSummary.clean_length_mm ?? 0)) + '</span></div>'
     + '<div class="table-wrap pipeline-review-wrap"><table class="data-table pipeline-review-table"><thead><tr><th>Кандидат</th><th>Локальное решение</th><th>Подтверждение провайдера</th></tr></thead><tbody>'
     + (rows || '<tr><td colspan="3">Размерных кандидатов нет</td></tr>')
@@ -1075,6 +1134,65 @@ function combinedGraphForLine(line) {
     const value = segment.value ?? segment.length_mm ?? segment.length;
     if (from != null && to != null && value != null) dimensions.set(String(from) + '->' + String(to), value);
   };
+  const payloadPages = line.provider_trace && line.provider_trace.payload && line.provider_trace.payload.pages;
+  let usedFinalPayloadGraph = false;
+  if (Array.isArray(payloadPages)) {
+    payloadPages.forEach(function (page) {
+      const pageNumber = page.page;
+      (Array.isArray(page.final_vertices || page.vertices) ? (page.final_vertices || page.vertices) : []).forEach(function (vertex) {
+        const localId = String(vertex.id || vertex.vertex_id || '');
+        if (!localId) return;
+        const id = String(pageNumber) + ':' + localId;
+        const localCoordinates = vertex.local_coordinates || {};
+        const providerCoordinate = providerCoordinates.get(id) || providerCoordinates.get(localId);
+        const hasProviderXYZ = providerCoordinate && providerCoordinate.x != null && providerCoordinate.y != null && providerCoordinate.z != null;
+        const node = Object.assign({}, vertex, {
+          id: id,
+          local_vertex_id: localId,
+          page: pageNumber,
+          pages: [pageNumber],
+          x: hasProviderXYZ ? providerCoordinate.x : (localCoordinates.x ?? vertex.x ?? vertex.sheet_x),
+          y: hasProviderXYZ ? providerCoordinate.y : (localCoordinates.y ?? vertex.y ?? vertex.sheet_y),
+          z: hasProviderXYZ ? providerCoordinate.z : (localCoordinates.z ?? vertex.z ?? 0),
+          sheet_x: vertex.sheet_x,
+          sheet_y: vertex.sheet_y,
+          coordinate_source: hasProviderXYZ ? 'provider' : (localCoordinates.method || 'sheet_position'),
+          coordinate_confidence: hasProviderXYZ ? providerCoordinate.confidence : (localCoordinates.confidence || 0),
+          coordinate_unknown: !hasProviderXYZ,
+          coordinate_reason: hasProviderXYZ ? providerCoordinate.reason : (localCoordinates.reason || 'координаты X/Y/Z не подтверждены'),
+        });
+        nodes.set(id, node);
+      });
+      (Array.isArray(page.final_edges || page.edges) ? (page.final_edges || page.edges) : []).forEach(function (edge) {
+        const fromLocal = String(edge.from_vertex || '');
+        const toLocal = String(edge.to_vertex || '');
+        if (!fromLocal || !toLocal) return;
+        const from = String(pageNumber) + ':' + fromLocal;
+        const to = String(pageNumber) + ':' + toLocal;
+        if (!nodes.has(from) || !nodes.has(to) || from === to) return;
+        const key = from + '->' + to;
+        if (edges.has(key)) {
+          duplicates.push({ from_node_id: from, to_node_id: to, page: pageNumber });
+          return;
+        }
+        edges.set(key, Object.assign({}, edge, {
+          id: String(pageNumber) + ':' + String(edge.id || edge.edge_id || ('F' + (edges.size + 1))),
+          from_node_id: from,
+          to_node_id: to,
+          page: pageNumber,
+          dimension_mm: edge.length_mm ?? edge.value,
+          is_handwheel_segment: !!edge.is_handwheel_segment,
+        }));
+      });
+    });
+    usedFinalPayloadGraph = nodes.size > 0 || edges.size > 0;
+  }
+  if (usedFinalPayloadGraph) {
+    const connected = new Set();
+    edges.forEach(function (edge) { connected.add(edge.from_node_id); connected.add(edge.to_node_id); });
+    nodes.forEach(function (_node, id) { if (!connected.has(id)) isolated.add(id); });
+    return { nodes: Array.from(nodes.values()), edges: Array.from(edges.values()), duplicate_edges: duplicates, isolated_nodes: Array.from(isolated) };
+  }
   (line.page_results || []).forEach(function (pageResult) {
     const graph = pageResult.analysis && pageResult.analysis.graph;
     const analysis = pageResult.analysis || {};
@@ -1306,12 +1424,24 @@ async function render3DGraph(container, graph) {
     }
     const nodeGeometry = new THREE.SphereGeometry(0.16, 18, 12);
     const nodeMaterial = new THREE.MeshStandardMaterial({ color: 0x176044, roughness: 0.55 });
+    const unknownGeometry = new THREE.SphereGeometry(0.195, 18, 12);
+    const unknownMaterial = new THREE.MeshStandardMaterial({ color: 0xf59e0b, roughness: 0.5, emissive: 0x7c2d12, emissiveIntensity: 0.4 });
+    let unknownCount = 0;
     graph.nodes.forEach(function (node) {
-      const mesh = new THREE.Mesh(nodeGeometry, nodeMaterial);
+      const isUnknown = !!node.coordinate_unknown;
+      if (isUnknown) unknownCount += 1;
+      const mesh = new THREE.Mesh(isUnknown ? unknownGeometry : nodeGeometry, isUnknown ? unknownMaterial : nodeMaterial);
       mesh.position.copy(positions.get(String(node.id)));
       mesh.userData.label = String(node.id);
+      mesh.userData.coordinate_unknown = isUnknown;
       scene.add(mesh);
     });
+    if (unknownCount) {
+      const note = document.createElement('span');
+      note.className = 'graph-3d-unknown-note';
+      note.textContent = 'Оранжевые вершины: ' + unknownCount + ' без координат X/Y/Z';
+      toolbar.insertBefore(note, toolbar.firstChild);
+    }
     const grid = new THREE.GridHelper(14, 14, 0xc7d7ce, 0xe0e9e4);
     grid.position.y = -4.1;
     scene.add(grid);

@@ -761,12 +761,14 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                 dimensions_json = run_dir / f"{pdf_stem}_page{page_run.page_number}_dimensions.json"
                 pipeline_length_mode = stop_stage == "pipeline_length"
                 lead_detection_mode = stop_stage == "lead_detection"
+                # pipeline_length must run on the finalized local contour (VE/HG/F-*),
+                # so only lead_detection keeps the pre-final snapshot.
                 mapping = run_dimension_mapping(
                     pdf_path,
                     page_run.page_number,
                     dimensions_pdf,
                     dimensions_json,
-                    finalize=not (pipeline_length_mode or lead_detection_mode),
+                    finalize=not lead_detection_mode,
                 )
                 mapping["coordinates"] = list(page_run.coordinates or [])
                 if lead_detection_mode:

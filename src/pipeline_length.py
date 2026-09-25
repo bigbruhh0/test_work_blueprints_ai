@@ -53,52 +53,184 @@ def _base_edges(mapping: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-def _dimension_row(dimension: dict[str, Any], page_number: int) -> dict[str, Any]:
-    edge_id = dimension.get("edge_id")
+def _compact_point(value: Any) -> list[float] | None:
+    if not isinstance(value, list) or len(value) < 2:
+        return None
+    return [round(float(value[0]), 2), round(float(value[1]), 2)]
+
+
+def _dimension_geometry(dimension: dict[str, Any]) -> dict[str, Any]:
     dimension_stroke = dimension.get("dimension_stroke") or {}
     leader_stroke = dimension.get("leader_stroke") or {}
     extension_strokes = dimension.get("extension_strokes") or []
+    resolution = dimension.get("leader_resolution") or {}
     return {
-        "id": dimension.get("id"),
-        "candidate_key": f"{page_number}:{dimension.get('id')}",
+        "dimension_stroke": {
+            "start": dimension_stroke.get("start"),
+            "end": dimension_stroke.get("end"),
+            "length_px": dimension_stroke.get("length_px"),
+            "merged_indices": dimension_stroke.get("merged_indices"),
+        } if dimension_stroke else None,
+        "leader_stroke": {
+            "start": leader_stroke.get("start"),
+            "end": leader_stroke.get("end"),
+            "length_px": leader_stroke.get("length_px"),
+        } if leader_stroke else None,
+        "leader_resolution": {
+            "target_projection": resolution.get("target_projection"),
+            "target_gap_px": resolution.get("target_gap_px"),
+            "suspect": resolution.get("suspect"),
+            "suspect_reasons": resolution.get("suspect_reasons"),
+        } if resolution else None,
+        "extension_strokes": [
+            {
+                "start": stroke.get("start"),
+                "end": stroke.get("end"),
+                "pipe_edge_id": stroke.get("pipe_edge_id"),
+                "target_endpoint": stroke.get("target_endpoint"),
+                "target_gap_px": stroke.get("target_gap_px"),
+                "parallel_score": stroke.get("parallel_score"),
+            }
+            for stroke in extension_strokes[:3]
+            if isinstance(stroke, dict)
+        ],
+        "attachment_kind": dimension.get("attachment_kind"),
+        "attachment_source": dimension.get("attachment_source"),
+        "final_ray_origin": dimension.get("final_ray_origin"),
+        "final_ray_origin_kind": dimension.get("final_ray_origin_kind"),
+        "final_contact_point": dimension.get("final_contact_point"),
+    }
+
+
+def _dimension_row(dimension: dict[str, Any], page_number: int) -> dict[str, Any]:
+    candidate_id = dimension.get("id")
+    candidate_key = f"{page_number}:{candidate_id}"
+    final_edge_id = dimension.get("final_interval_id")
+    source_edge_id = dimension.get("edge_id")
+    return {
+        "id": candidate_id,
+        "candidate_key": candidate_key,
         "page": page_number,
         "value_mm": float(dimension.get("value", 0.0)),
         "text": dimension.get("text", ""),
         "bbox": dimension.get("bbox"),
         "label_center": dimension.get("label_center"),
-        "edge_id": edge_id,
-        "edge_candidates": ([{"edge_id": edge_id, "source": "local_dimension_mapping"}] if edge_id else []),
+        "edge_id": final_edge_id,
+        "final_edge_id": final_edge_id,
+        "source_edge_id": source_edge_id,
+        "final_from_vertex": dimension.get("final_from_vertex"),
+        "final_to_vertex": dimension.get("final_to_vertex"),
+        "final_interval_status": dimension.get("final_interval_status"),
+        "final_interval_reason": dimension.get("final_interval_reason"),
+        "edge_candidates": ([{"edge_id": final_edge_id, "source": "final_dimension_mapping"}] if final_edge_id else []),
         "status": dimension.get("status"),
         "hints": dimension.get("hints", []),
-        "geometry": {
-            "dimension_stroke": {
-                "start": dimension_stroke.get("start"),
-                "end": dimension_stroke.get("end"),
-                "length_px": dimension_stroke.get("length_px"),
-            } if dimension_stroke else None,
-            "leader_stroke": {
-                "start": leader_stroke.get("start"),
-                "end": leader_stroke.get("end"),
-                "length_px": leader_stroke.get("length_px"),
-            } if leader_stroke else None,
-            "extension_strokes": [
-                {
-                    "start": stroke.get("start"),
-                    "end": stroke.get("end"),
-                    "pipe_edge_id": stroke.get("pipe_edge_id"),
-                    "target_endpoint": stroke.get("target_endpoint"),
-                }
-                for stroke in extension_strokes[:2]
-            ],
-            "attachment_kind": dimension.get("attachment_kind"),
-            "attachment_source": dimension.get("attachment_source"),
-        },
+        "geometry": _dimension_geometry(dimension),
         "local_decision": {
             "decision": dimension.get("local_filter_decision"),
             "reason": dimension.get("local_filter_reason"),
             "conflict_with": dimension.get("local_filter_conflict_with"),
         },
     }
+
+
+def _local_vertex_coordinates(vertex: dict[str, Any], page_number: int) -> dict[str, Any]:
+    vertex_id = str(vertex.get("id") or "")
+    point = _compact_point(vertex.get("point"))
+    return {
+        "vertex_id": vertex_id,
+        "vertex_key": f"{page_number}:{vertex_id}",
+        "page": page_number,
+        "sheet_x": point[0] if point else vertex.get("x"),
+        "sheet_y": point[1] if point else vertex.get("y"),
+        "x": None,
+        "y": None,
+        "z": None,
+        "confidence": 0.0,
+        "method": "не определено",
+        "reason": "нет надежной локальной X/Y/Z привязки",
+        "source_coordinate_labels": [],
+    }
+
+
+def _final_vertex_rows(mapping: dict[str, Any], page_number: int) -> list[dict[str, Any]]:
+    rows = []
+    for vertex in mapping.get("final_vertices") or []:
+        vertex_id = vertex.get("id")
+        if not vertex_id:
+            continue
+        point = _compact_point(vertex.get("point"))
+        rows.append(
+            {
+                "id": vertex_id,
+                "vertex_key": f"{page_number}:{vertex_id}",
+                "page": page_number,
+                "point": point,
+                "sheet_x": point[0] if point else None,
+                "sheet_y": point[1] if point else None,
+                "vertex_source": vertex.get("vertex_source"),
+                "source": vertex.get("source"),
+                "edge_id": vertex.get("edge_id") or vertex.get("pipe_edge_id"),
+                "dimension_ids": vertex.get("dimension_ids") or [],
+                "replaces_vertex_ids": vertex.get("replaces_vertex_ids") or vertex.get("replaced_vertex_ids") or [],
+                "handwheel_id": vertex.get("handwheel_id"),
+                "glyph_id": vertex.get("glyph_id"),
+                "local_coordinates": _local_vertex_coordinates(vertex, page_number),
+            }
+        )
+    return rows
+
+
+def _final_edge_rows(mapping: dict[str, Any], page_number: int) -> list[dict[str, Any]]:
+    groups = {str(row.get("edge_id")): row for row in mapping.get("final_edge_candidate_groups") or [] if row.get("edge_id")}
+    rows = []
+    for edge in mapping.get("final_contour") or []:
+        edge_id = edge.get("id")
+        if not edge_id:
+            continue
+        group = groups.get(str(edge_id)) or {}
+        rows.append(
+            {
+                "id": edge_id,
+                "edge_key": f"{page_number}:{edge_id}",
+                "page": page_number,
+                "from_vertex": edge.get("from_vertex"),
+                "to_vertex": edge.get("to_vertex"),
+                "path_points": edge.get("path_points") or [edge.get("start"), edge.get("end")],
+                "pixel_length": edge.get("pixel_length"),
+                "is_handwheel_segment": bool(edge.get("is_handwheel_segment")),
+                "element_type": edge.get("element_type") or ("valve" if edge.get("is_handwheel_segment") else "pipe"),
+                "handwheel_ids": edge.get("handwheel_ids") or [],
+                "bridge_source": edge.get("bridge_source"),
+                "candidates": [
+                    {
+                        **candidate,
+                        "candidate_key": f"{page_number}:{candidate.get('candidate_id')}",
+                    }
+                    for candidate in group.get("candidates") or []
+                ],
+            }
+        )
+    return rows
+
+
+def _unresolved_dimension_rows(dimensions: list[dict[str, Any]], page_number: int) -> list[dict[str, Any]]:
+    return [
+        {
+            "candidate_id": row.get("id"),
+            "candidate_key": f"{page_number}:{row.get('id')}",
+            "value_mm": row.get("value"),
+            "text": row.get("text"),
+            "local_decision": row.get("local_filter_decision"),
+            "status": row.get("status"),
+            "final_interval_status": row.get("final_interval_status") or "unresolved",
+            "final_interval_reason": row.get("final_interval_reason") or row.get("local_filter_reason"),
+            "bbox": row.get("bbox"),
+            "label_center": row.get("label_center"),
+        }
+        for row in dimensions
+        if row.get("final_interval_status") != "resolved" or not row.get("final_interval_id")
+    ]
 
 
 def _coordinate_rows(mapping: dict[str, Any]) -> list[dict[str, Any]]:
@@ -116,8 +248,66 @@ def _coordinate_rows(mapping: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+_CROSS_SHEET_REF_PATTERN = re.compile(
+    # "СМ ... ЛИСТ 2" / "ЛИСТ № 2"; "Лист 200X300X6" (материал) отсекается тем,
+    # что за номером листа не может идти цифра или знак размера "X".
+    r"ЛИСТ\s*[:№]?\s*(?:№\s*)?(\d+)(?![\dXx×])",
+    flags=re.IGNORECASE | re.UNICODE,
+)
+
+
+def _cross_sheet_text_refs(
+    dimensions: list[dict[str, Any]],
+    page_number: int,
+    connections: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+
+    def push(
+        source_type: str,
+        candidate_id: Any,
+        text: Any,
+        bbox: Any,
+        label_center: Any,
+        target_sheet: Any = None,
+    ) -> None:
+        value = str(text or "")
+        match = _CROSS_SHEET_REF_PATTERN.search(value)
+        if not match:
+            return
+        rows.append(
+            {
+                "page": page_number,
+                "target_page": int(target_sheet) if str(target_sheet or "").isdigit() else int(match.group(1)),
+                "source_text": value,
+                "source_type": source_type,
+                "candidate_id": candidate_id,
+                "candidate_key": f"{page_number}:{candidate_id}" if candidate_id else None,
+                "bbox": bbox,
+                "label_center": label_center,
+                "reason": "явная ссылка со словом ЛИСТ",
+            }
+        )
+
+    for dimension in dimensions:
+        push("dimension", dimension.get("id"), dimension.get("text"), dimension.get("bbox"), dimension.get("label_center"))
+    for connection in connections or []:
+        push(
+            "connection",
+            connection.get("id"),
+            connection.get("label"),
+            connection.get("bbox"),
+            connection.get("center"),
+            connection.get("target_sheet"),
+        )
+    return rows
+
+
 def build_pipeline_length_page(mapping: dict[str, Any], page_number: int) -> dict[str, Any]:
-    dimensions = [_dimension_row(row, page_number) for row in mapping.get("dimensions") or []]
+    raw_dimensions = list(mapping.get("dimensions") or [])
+    dimensions = [_dimension_row(row, page_number) for row in raw_dimensions]
+    final_vertices = _final_vertex_rows(mapping, page_number)
+    final_edges = _final_edge_rows(mapping, page_number)
     annotations = mapping.get("handwheel_annotations") or {}
     handwheels = [
         {
@@ -127,23 +317,39 @@ def build_pipeline_length_page(mapping: dict[str, Any], page_number: int) -> dic
             "edge_id": row.get("edge_id"),
             "arrow_found": row.get("arrow_found"),
             "arrow_end": row.get("arrow_end"),
+            "glyph_id": row.get("glyph_id"),
         }
         for row in annotations.get("handwheels") or []
     ]
+    handwheel_vertices = {}
+    for vertex in final_vertices:
+        handwheel_id = vertex.get("handwheel_id")
+        if handwheel_id:
+            handwheel_vertices.setdefault(str(handwheel_id), []).append(vertex.get("id"))
+    for row in handwheels:
+        if row.get("id"):
+            row["endpoint_vertices"] = handwheel_vertices.get(str(row["id"]), [])
     glyphs = [
         {
             "id": row.get("id"),
             "center": row.get("center"),
             "matched_source": row.get("matched_source"),
+            "symbol_points": row.get("symbol_points"),
         }
         for row in annotations.get("glyphs") or []
     ]
     return {
         "page": page_number,
-        "vertices": _base_vertices(mapping),
-        "edges": _base_edges(mapping),
+        "vertices": final_vertices,
+        "edges": final_edges,
+        "final_vertices": final_vertices,
+        "final_edges": final_edges,
+        "local_vertex_coordinates": [row["local_coordinates"] for row in final_vertices],
+        "debug_source_vertices": _base_vertices(mapping),
+        "debug_source_edges": _base_edges(mapping),
         "coordinates": _coordinate_rows(mapping),
         "dimensions": dimensions,
+        "unresolved_dimensions": _unresolved_dimension_rows(raw_dimensions, page_number),
         "local_decisions": [
             dict(row)
             for row in mapping.get("local_decisions") or [
@@ -161,6 +367,11 @@ def build_pipeline_length_page(mapping: dict[str, Any], page_number: int) -> dic
         ],
         "connections": list(mapping.get("connections") or []),
         "discarded_numbers": [],
+        "cross_sheet_text_refs": _cross_sheet_text_refs(
+            raw_dimensions,
+            page_number,
+            mapping.get("connections") or [],
+        ),
         "handwheels": handwheels,
         "handwheel_glyphs": glyphs,
     }
@@ -222,6 +433,11 @@ def calculate_local_length_summary(payload: dict[str, Any]) -> dict[str, Any]:
                 "value_mm": value,
                 "local_decision": decision,
                 "edge_id": row.get("edge_id"),
+                "final_edge_id": row.get("final_edge_id") or row.get("edge_id"),
+                "final_from_vertex": row.get("final_from_vertex"),
+                "final_to_vertex": row.get("final_to_vertex"),
+                "final_interval_status": row.get("final_interval_status"),
+                "final_interval_reason": row.get("final_interval_reason"),
                 "reason": (row.get("local_decision") or {}).get("reason"),
             })
             if decision == "include":
@@ -266,16 +482,21 @@ def build_pipeline_length_text(payload: dict[str, Any]) -> str:
     ]
     for page in payload.get("pages") or []:
         lines.append(f"PAGE {page.get('page')}:")
-        lines.append("VERTICES: " + ", ".join(str(vertex.get("id")) for vertex in page.get("vertices") or []))
-        for edge in page.get("edges") or []:
-            lines.append(f"EDGE {edge.get('id')} {edge.get('from_vertex') or edge.get('from_node_id')} -> {edge.get('to_vertex') or edge.get('to_node_id')} pixel_length={edge.get('pixel_length')}")
+        lines.append("FINAL_VERTICES: " + ", ".join(str(vertex.get("id")) for vertex in page.get("final_vertices") or page.get("vertices") or []))
+        for edge in page.get("final_edges") or page.get("edges") or []:
+            candidate_ids = ",".join(str(candidate.get("candidate_key") or candidate.get("candidate_id")) for candidate in edge.get("candidates") or [])
+            lines.append(f"FINAL_EDGE {edge.get('edge_key') or edge.get('id')} {edge.get('from_vertex')} -> {edge.get('to_vertex')} type={edge.get('element_type')} handwheel={edge.get('is_handwheel_segment')} candidates={candidate_ids}")
         for dimension in page.get("dimensions") or []:
             local = dimension.get("local_decision") or {}
-            lines.append(f"CANDIDATE {dimension.get('candidate_key')} local_id={dimension.get('id')} value_mm={dimension.get('value_mm')} edge={dimension.get('edge_id')} local={local.get('decision')} reason={local.get('reason')}")
+            lines.append(f"CANDIDATE {dimension.get('candidate_key')} local_id={dimension.get('id')} value_mm={dimension.get('value_mm')} final_edge={dimension.get('final_edge_id') or dimension.get('edge_id')} final_status={dimension.get('final_interval_status')} local={local.get('decision')} reason={local.get('reason')}")
+        for dimension in page.get("unresolved_dimensions") or []:
+            lines.append(f"UNRESOLVED {dimension.get('candidate_key')} value_mm={dimension.get('value_mm')} reason={dimension.get('final_interval_reason')}")
         for coordinate in page.get("coordinates") or []:
             lines.append(f"COORDINATE {coordinate.get('id')} {coordinate.get('label')}={coordinate.get('value')} label_bbox={coordinate.get('label_bbox')} value_bbox={coordinate.get('value_bbox')}")
+        for link in page.get("cross_sheet_text_refs") or []:
+            lines.append(f"CROSS_SHEET_REF page={link.get('page')} target={link.get('target_page')} text={link.get('source_text')} bbox={link.get('bbox')}")
         for handwheel in page.get("handwheels") or []:
-            lines.append(f"HANDWHEEL {handwheel.get('id')} label={handwheel.get('label')} edge={handwheel.get('edge_id')} arrow_end={handwheel.get('arrow_end')}")
+            lines.append(f"HANDWHEEL {handwheel.get('id')} label={handwheel.get('label')} endpoints={handwheel.get('endpoint_vertices')} edge={handwheel.get('edge_id')} arrow_end={handwheel.get('arrow_end')}")
         for glyph in page.get("handwheel_glyphs") or []:
             lines.append(f"HANDWHEEL_GLYPH {glyph.get('id')} center={glyph.get('center')} source={glyph.get('matched_source')}")
     return "\n".join(lines) + "\n"
@@ -450,9 +671,22 @@ def _normalize_page_answer(answer: dict[str, Any], page_number: Any) -> dict[str
     assessments = []
     for item in normalized.get("candidate_assessments") or []:
         row = dict(item)
-        row["candidate_id"] = _prefix_page_id(page_number, row.get("candidate_id"))
+        candidate_id = row.get("candidate_id") or row.get("candidate_key")
+        row["candidate_id"] = _prefix_page_id(page_number, candidate_id)
+        row["candidate_key"] = _prefix_page_id(page_number, row.get("candidate_key") or candidate_id)
+        if row.get("target_final_edge_id"):
+            row["target_final_edge_id"] = _prefix_page_id(page_number, row.get("target_final_edge_id"))
         assessments.append(row)
     normalized["candidate_assessments"] = assessments
+
+    unresolved_reviews = []
+    for item in normalized.get("unresolved_reviews") or []:
+        row = dict(item)
+        candidate_id = row.get("candidate_id") or row.get("candidate_key")
+        row["candidate_id"] = _prefix_page_id(page_number, candidate_id)
+        row["candidate_key"] = _prefix_page_id(page_number, row.get("candidate_key") or candidate_id)
+        unresolved_reviews.append(row)
+    normalized["unresolved_reviews"] = unresolved_reviews
 
     edge_routes = []
     for item in normalized.get("edge_routes") or []:
@@ -502,6 +736,7 @@ def _normalize_page_answer(answer: dict[str, Any], page_number: Any) -> dict[str
         vertex_id = row.get("vertex_id") or row.get("id")
         if vertex_id:
             row["vertex_id"] = _prefix_page_id(page_number, vertex_id)
+            row["vertex_key"] = _prefix_page_id(page_number, row.get("vertex_key") or vertex_id)
             row.setdefault("local_vertex_id", vertex_id)
         row.setdefault("page", page_number)
         vertex_coordinates.append(row)
@@ -518,6 +753,7 @@ def merge_pipeline_length_provider_traces(
         "edge_routes": [],
         "branch_routes": [],
         "route_segments": [],
+        "unresolved_reviews": [],
         "cross_sheet_links": [],
         "intermediate_distances": [],
         "vertex_coordinates": [],
@@ -538,7 +774,7 @@ def merge_pipeline_length_provider_traces(
         page_payload = trace.get("payload") or {}
         page_number = ((page_payload.get("pages") or [{}])[0] or {}).get("page")
         answer = _normalize_page_answer(trace.get("answer") or {}, page_number)
-        for key in ("candidate_assessments", "edge_routes", "branch_routes", "route_segments", "cross_sheet_links", "intermediate_distances", "vertex_coordinates"):
+        for key in ("candidate_assessments", "edge_routes", "branch_routes", "route_segments", "unresolved_reviews", "cross_sheet_links", "intermediate_distances", "vertex_coordinates"):
             combined_answer[key].extend(answer.get(key) or [])
         response_raw["page_responses"].append({
             "page": page_number,
