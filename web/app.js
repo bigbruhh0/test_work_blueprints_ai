@@ -599,7 +599,7 @@ function pipelineLengthEstimates(line) {
         candidate_key: row.candidate_key || (page.page + ':' + row.id),
         page: page.page,
         value_mm: row.value_mm,
-        edge_id: row.edge_id,
+        edge_id: row.edge_id || row.final_edge_id,
         local_decision: decision.decision,
         reason: decision.reason,
       };
@@ -955,10 +955,23 @@ function pipelinePageLengthSummary(line, pageNumber) {
   const providerClean = providerRows.filter(function (row) { return row.decision === 'include'; }).reduce(function (sum, row) { return sum + row.value; }, 0);
   const providerDirty = providerRows.filter(function (row) { return row.decision !== 'exclude'; }).reduce(function (sum, row) { return sum + row.value; }, 0);
   const disputed = providerRows.filter(function (row) { return row.decision === 'ambiguous'; }).length;
+  const branchCandidateIds = new Set((provider.branch_routes || []).flatMap(function (route) {
+    return (route.candidate_ids || []).map(String);
+  }));
+  const isBranch = function (row) {
+    const key = String(row.candidate_key || '');
+    const id = String(row.candidate_id || '');
+    return branchCandidateIds.has(key) || branchCandidateIds.has(id);
+  };
+  const localBranch = estimates.filter(function (row) { return isBranch(row) && row.local_decision === 'include'; }).reduce(function (sum, row) { return sum + Number(row.value_mm || 0); }, 0);
+  const providerBranch = estimates.reduce(function (sum, row) {
+    return isBranch(row) && pipelineEffectiveCandidateDecision(line, row) === 'include' ? sum + Number(row.value_mm || 0) : sum;
+  }, 0);
   return '<section class="pipeline-page-summary">'
     + '<div class="pipeline-summary-grid">'
     + '<div class="pipeline-total-card local"><small>Локальный расчет</small><strong>' + esc(formatMm(localClean)) + '</strong><span>грязная ' + esc(formatMm(localDirty)) + '</span></div>'
     + '<div class="pipeline-total-card provider"><small>Результат провайдера</small><strong>' + esc(formatMm(providerClean)) + '</strong><span>грязная ' + esc(formatMm(providerDirty)) + '</span></div>'
+    + '<div class="pipeline-total-card branch"><small>Ответвления</small><strong>' + esc(formatMm(localBranch)) + '</strong><span>провайдер: ' + esc(formatMm(providerBranch)) + '</span></div>'
     + '<div class="pipeline-total-card trace"><small>Размеров</small><strong>' + esc(estimates.length) + '</strong><span>спорных: ' + esc(disputed) + '</span></div>'
     + '<div class="pipeline-total-card manual"><small>Статус AI</small><strong>' + esc(provider && provider.candidate_assessments ? 'есть ответ' : 'ожидается') + '</strong><span>локальное решение сохраняется</span></div>'
     + '</div></section>';

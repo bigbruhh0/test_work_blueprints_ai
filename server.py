@@ -7,7 +7,7 @@ import shutil
 import threading
 import uuid
 import zipfile
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -990,7 +990,7 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                 text_path.write_text(build_pipeline_length_text(provider_payload), encoding="utf-8")
                 line.events.append({"time": now(), "stage": "pipeline_length", "message": f"отправка payload провайдеру по листам ({provider})"})
                 _persist(run)
-                page_traces = []
+                provider_page_contexts = []
                 for page in payload.get("pages") or []:
                     page_payload = build_pipeline_length_page_payload(payload, page)
                     page_number = page.get("page")
@@ -1012,8 +1012,30 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                     except Exception as image_error:  # noqa: BLE001
                         rendered_request_image = None
                         line.events.append({"time": now(), "stage": "pipeline_length", "message": f"лист {page_number}: не удалось сохранить изображение запроса: {image_error}"})
-                    line.events.append({"time": now(), "stage": "pipeline_length", "message": f"лист {page.get('page')}: запрос провайдеру"})
+                    provider_page_contexts.append({
+                        "page": page,
+                        "page_payload": page_payload,
+                        "page_number": page_number,
+                        "page_run": page_run,
+                        "page_payload_path": page_payload_path,
+                        "page_prompt_path": page_prompt_path,
+                        "page_response_path": page_response_path,
+                        "prompt_revision": prompt_revision,
+                    })
+                    if page_run is not None:
+                        page_run.events.append({"time": now(), "stage": "pipeline_length", "message": f"лист {page_number}: запрос поставлен в очередь"})
+                        page_run.stage = "pipeline_length"
+                        page_run.status = "running"
                     _persist(run)
+                def request_provider_page(context: dict[str, Any]) -> dict[str, Any]:
+                    page = context["page"]
+                    page_payload = context["page_payload"]
+                    page_number = context["page_number"]
+                    page_run = context["page_run"]
+                    page_payload_path = context["page_payload_path"]
+                    page_prompt_path = context["page_prompt_path"]
+                    page_response_path = context["page_response_path"]
+                    prompt_revision = context["prompt_revision"]
                     try:
                         page_trace = run_pipeline_length_provider(
                             page_payload,
@@ -1038,7 +1060,6 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                             "prompt_sha256": prompt_revision["sha256"],
                             "prompt_source": prompt_revision["source"],
                         }
-                        line.events.append({"time": now(), "stage": "pipeline_length", "message": f"лист {page_number}: ошибка провайдера: {error_text}"})
                     page_response_path.write_text(json.dumps(page_trace, ensure_ascii=False, indent=2), encoding="utf-8")
                     if page_run is not None:
                         page_run.provider_trace = page_trace
@@ -1056,13 +1077,31 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                         if page_trace.get("error"):
                             page_run.status = "error"
                             page_run.error = page_trace["error"]
-                    page_traces.append(page_trace)
-                    line.events.append({
-                        "time": now(),
-                        "stage": "pipeline_length",
-                        "message": f"лист {page.get('page')}: ответ получен за {page_trace.get('elapsed_seconds')} с",
-                    })
-                    _persist(run)
+                    return page_trace
+
+                provider_workers = max(1, int(os.getenv("PIPELINE_PROVIDER_WORKERS", str(max_workers))))
+                page_traces = [None] * len(provider_page_contexts)
+                with ThreadPoolExecutor(max_workers=min(provider_workers, max(1, len(provider_page_contexts)))) as provider_executor:
+                    future_to_index = {
+                        provider_executor.submit(request_provider_page, context): index
+                        for index, context in enumerate(provider_page_contexts)
+                    }
+                    for future in as_completed(future_to_index):
+                        index = future_to_index[future]
+                        context = provider_page_contexts[index]
+                        page_trace = future.result()
+                        page_traces[index] = page_trace
+                        page_number = context["page_number"]
+                        if page_trace.get("error"):
+                            line.events.append({"time": now(), "stage": "pipeline_length", "message": f"лист {page_number}: ошибка провайдера: {page_trace['error']}"})
+                        else:
+                            line.events.append({
+                                "time": now(),
+                                "stage": "pipeline_length",
+                                "message": f"лист {page_number}: ответ получен за {page_trace.get('elapsed_seconds')} с",
+                            })
+                        _persist(run)
+                page_traces = [trace or {"answer": {}, "error": "Пустой результат страницы", "status": "error"} for trace in page_traces]
                 trace = merge_pipeline_length_provider_traces(provider_payload, page_traces)
                 line.events.append({"time": now(), "stage": "pipeline_length", "message": "ответы провайдера по листам собраны, разбор результата"})
                 result = build_pipeline_length_result(payload, trace["answer"])

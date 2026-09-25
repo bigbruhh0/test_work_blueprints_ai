@@ -1593,9 +1593,10 @@ def calculate_provider_length_summary(
                 continue
             seen_candidates.add(key)
             review = assessments.get(key) or assessments.get(str(row.get("id")))
-            decision = (row.get("local_decision") or {}).get("decision")
+            local_decision = row.get("local_decision")
+            decision = local_decision.get("decision") if isinstance(local_decision, dict) else local_decision
             if key in kept_local_by_user or str(row.get("id")) in kept_local_by_user:
-                decision = (row.get("local_decision") or {}).get("decision")
+                decision = local_decision.get("decision") if isinstance(local_decision, dict) else local_decision
             elif key in accepted_by_user or str(row.get("id")) in accepted_by_user:
                 decision = (review or {}).get("proposed_decision") or decision
             elif review and review.get("proposed_decision"):
