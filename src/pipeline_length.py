@@ -134,9 +134,132 @@ def _dimension_row(dimension: dict[str, Any], page_number: int) -> dict[str, Any
     }
 
 
-def _local_vertex_coordinates(vertex: dict[str, Any], page_number: int) -> dict[str, Any]:
+def _coordinate_number(value: Any, label: Any = None) -> float | None:
+    try:
+        number = float(str(value).replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+    if str(label or "").strip().upper() == "Z-":
+        return -abs(number)
+    return number
+
+
+def _coordinate_axis(label: Any) -> str | None:
+    normalized = str(label or "").strip().upper()
+    if normalized == "X":
+        return "x"
+    if normalized == "Y":
+        return "y"
+    if normalized in {"Z", "Z+", "Z-"}:
+        return "z"
+    return None
+
+
+def _coordinate_lead_payload(row: dict[str, Any], page_number: int) -> dict[str, Any]:
+    return {
+        "id": row.get("id"),
+        "coordinate_key": f"{page_number}:{row.get('id')}" if row.get("id") else None,
+        "page": page_number,
+        "label": row.get("label"),
+        "value": row.get("value"),
+        "bbox": row.get("bbox"),
+        "label_bbox": row.get("label_bbox"),
+        "value_bbox": row.get("value_bbox"),
+        "coordinate_block_refs": row.get("coordinate_block_refs") or [],
+        "lead_search_bbox": row.get("lead_search_bbox"),
+        "lead_search_center": row.get("lead_search_center"),
+        "lead_search_source": row.get("lead_search_source"),
+        "arrow_found": bool(row.get("arrow_found")),
+        "arrow_has_arrowhead": bool(row.get("arrow_has_arrowhead")),
+        "arrow_start": row.get("arrow_start"),
+        "arrow_end": row.get("arrow_end"),
+        "arrow_segments": row.get("arrow_segments") or [],
+        "matched_vertex_id": row.get("matched_vertex_id"),
+        "matched_vertex_point": row.get("matched_vertex_point"),
+        "matched_vertex_gap_px": row.get("matched_vertex_gap_px"),
+    }
+
+
+def _coordinate_lead_rows(mapping: dict[str, Any], page_number: int) -> list[dict[str, Any]]:
+    return [_coordinate_lead_payload(row, page_number) for row in mapping.get("coordinate_leads") or []]
+
+
+def _vertex_coordinate_lookup(mapping: dict[str, Any], page_number: int) -> dict[str, dict[str, Any]]:
+    lookup: dict[str, dict[str, Any]] = {}
+    for row in mapping.get("coordinate_leads") or []:
+        vertex_id = row.get("matched_vertex_id")
+        if not vertex_id:
+            continue
+        vertex_key = str(vertex_id)
+        entry = lookup.setdefault(
+            vertex_key,
+            {
+                "vertex_id": vertex_key,
+                "vertex_key": f"{page_number}:{vertex_key}",
+                "page": page_number,
+                "x": None,
+                "y": None,
+                "z": None,
+                "confidence": 0.0,
+                "method": "coordinate_lead",
+                "reason": "координатный блок привязан lead-стрелкой к вершине",
+                "source_coordinate_labels": [],
+                "coordinate_refs": [],
+                "coordinate_leads": [],
+                "coordinate_conflicts": [],
+            },
+        )
+        axis = _coordinate_axis(row.get("label"))
+        value = _coordinate_number(row.get("value"), row.get("label"))
+        if axis and value is not None:
+            current_value = entry.get(axis)
+            if current_value is None:
+                entry[axis] = value
+            elif abs(float(current_value) - value) > 1e-6:
+                entry["coordinate_conflicts"].append(
+                    {
+                        "axis": axis,
+                        "kept_value": current_value,
+                        "ignored_value": value,
+                        "source": row.get("id"),
+                        "reason": "ось уже заполнена более ранним координатным блоком",
+                    }
+                )
+        label = row.get("label")
+        raw_value = row.get("value")
+        if label and raw_value is not None:
+            source_label = f"{label}={raw_value}"
+            if source_label not in entry["source_coordinate_labels"]:
+                entry["source_coordinate_labels"].append(source_label)
+        for ref in row.get("coordinate_block_refs") or []:
+            if ref not in entry["coordinate_refs"]:
+                entry["coordinate_refs"].append(ref)
+        entry["coordinate_leads"].append(_coordinate_lead_payload(row, page_number))
+
+    for entry in lookup.values():
+        filled = sum(1 for axis in ("x", "y", "z") if entry.get(axis) is not None)
+        entry["confidence"] = 0.95 if filled == 3 else (0.7 if filled else 0.0)
+        if filled < 3:
+            entry["reason"] = "координатный lead найден, но набор X/Y/Z неполный"
+        if entry.get("coordinate_conflicts"):
+            entry["reason"] += "; есть конфликтующие повторные значения"
+    return lookup
+
+
+def _local_vertex_coordinates(
+    vertex: dict[str, Any],
+    page_number: int,
+    coordinate_lookup: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     vertex_id = str(vertex.get("id") or "")
     point = _compact_point(vertex.get("point"))
+    matched = (coordinate_lookup or {}).get(vertex_id)
+    if matched:
+        return {
+            **matched,
+            "sheet_x": point[0] if point else vertex.get("x"),
+            "sheet_y": point[1] if point else vertex.get("y"),
+        }
     return {
         "vertex_id": vertex_id,
         "vertex_key": f"{page_number}:{vertex_id}",
@@ -150,10 +273,14 @@ def _local_vertex_coordinates(vertex: dict[str, Any], page_number: int) -> dict[
         "method": "не определено",
         "reason": "нет надежной локальной X/Y/Z привязки",
         "source_coordinate_labels": [],
+        "coordinate_refs": [],
+        "coordinate_leads": [],
+        "coordinate_conflicts": [],
     }
 
 
 def _final_vertex_rows(mapping: dict[str, Any], page_number: int) -> list[dict[str, Any]]:
+    coordinate_lookup = _vertex_coordinate_lookup(mapping, page_number)
     rows = []
     for vertex in mapping.get("final_vertices") or []:
         vertex_id = vertex.get("id")
@@ -175,7 +302,8 @@ def _final_vertex_rows(mapping: dict[str, Any], page_number: int) -> list[dict[s
                 "replaces_vertex_ids": vertex.get("replaces_vertex_ids") or vertex.get("replaced_vertex_ids") or [],
                 "handwheel_id": vertex.get("handwheel_id"),
                 "glyph_id": vertex.get("glyph_id"),
-                "local_coordinates": _local_vertex_coordinates(vertex, page_number),
+                "coordinate_refs": coordinate_lookup.get(str(vertex_id), {}).get("coordinate_refs", []),
+                "local_coordinates": _local_vertex_coordinates(vertex, page_number, coordinate_lookup),
             }
         )
     return rows
@@ -348,6 +476,7 @@ def build_pipeline_length_page(mapping: dict[str, Any], page_number: int) -> dic
         "debug_source_vertices": _base_vertices(mapping),
         "debug_source_edges": _base_edges(mapping),
         "coordinates": _coordinate_rows(mapping),
+        "coordinate_leads": _coordinate_lead_rows(mapping, page_number),
         "dimensions": dimensions,
         "unresolved_dimensions": _unresolved_dimension_rows(raw_dimensions, page_number),
         "local_decisions": [

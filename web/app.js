@@ -529,6 +529,7 @@ function renderRun(run) {
 }
 
 const VIEWER_TABS = [
+  { key: 'local_markup_overview_pdf', label: 'Вся локальная разметка' },
   { key: 'clean_local_markup_pdf', label: 'Локальная разметка' },
   { key: 'lead_detection_pdf', label: 'Поиск lead-стрелок' },
   { key: 'local_dimension_filter_pdf', label: 'Локальная фильтрация размеров' },
@@ -547,6 +548,7 @@ const VIEWER_TABS = [
   { key: 'dimension_review_json', label: 'Решение провайдера (JSON)' },
 ];
 const PRIMARY_VIEWER_KEYS = new Set([
+  'local_markup_overview_pdf',
   'clean_local_markup_pdf',
   'dimensions_json',
   'dimension_map_pdf',
@@ -914,7 +916,8 @@ function pipelineLengthPageDetail(line, pageNumber) {
     + '<div class="pipeline-page-heading"><h2>Лист ' + esc(pageNumber) + '</h2><span>предварительная сумма ' + esc(formatMm(pageSummary.clean_length_mm ?? 0)) + '</span></div>'
     + '<div class="table-wrap pipeline-review-wrap"><table class="data-table pipeline-review-table"><thead><tr><th>Кандидат</th><th>Локальное решение</th><th>Подтверждение провайдера</th></tr></thead><tbody>'
     + (rows || '<tr><td colspan="3">Размерных кандидатов нет</td></tr>')
-    + '</tbody></table></div></section>';
+    + '</tbody></table></div></section>'
+    + (pageResult ? viewerCard(line.line_id, pageResult, state.runId) : '');
 }
 
 function pipelineHandwheelBlock(line) {
@@ -1005,7 +1008,7 @@ function parseNumbersTxt(text) {
   return sections;
 }
 
-function renderTrace(trace) {
+function renderTrace(trace, imageMarkup) {
   if (!trace) return '<p class="muted">Запросов к ИИ не было.</p>';
   const pretty = function (value) {
     if (value == null) return '';
@@ -1030,6 +1033,7 @@ function renderTrace(trace) {
     + section('Payload', payloadPretty)
     + section('Ответ (raw)', responsePretty)
     + (answerPretty ? section('Ответ (parsed)', answerPretty) : '')
+    + (imageMarkup || '')
     + '<button type="button" class="trace-back-button" aria-label="Вернуться к выбору AI запроса">↑ AI запрос</button>'
     + '</div>';
 }
@@ -1505,7 +1509,11 @@ async function showViewerTab(card, tabKey) {
   const key = pageKey(lineId, pageNumber);
   const files = state.filesByLine[key] || {};
   if (tabKey === 'ai_trace') {
-    wrap.innerHTML = renderTrace(state.tracesByLine[key]);
+    const overviewFile = files['local_markup_overview_pdf'];
+    const imageMarkup = overviewFile
+      ? '<details class="trace-section" open><summary>Локальная разметка (изображение)</summary><div class="trace-content"><img class="viewer-frame" src="' + viewerImageUrl(runId, lineId, overviewFile) + '" alt="Локальная разметка листа ' + esc(pageNumber) + '"></div></details>'
+      : '';
+    wrap.innerHTML = renderTrace(state.tracesByLine[key], imageMarkup);
     bindTraceControls(card, wrap);
     return;
   }
@@ -1961,7 +1969,16 @@ function renderResults(run) {
     const lineId = wrap.getAttribute('data-line-provider-trace') || '';
     const line = run.lines.find(function (item) { return item.line_id === lineId; });
     if (!line || !line.provider_trace) return;
-    wrap.innerHTML = renderTrace(line.provider_trace);
+    const overviewImages = (line.page_results || []).map(function (pr) {
+      const file = pr.files && pr.files.local_markup_overview_pdf;
+      if (!file) return '';
+      return '<figure class="trace-image"><figcaption>Лист ' + esc(pr.page_number) + '</figcaption>'
+        + '<img class="viewer-frame" src="' + viewerImageUrl(state.runId, line.line_id, file) + '" alt="Локальная разметка листа ' + esc(pr.page_number) + '"></figure>';
+    }).join('');
+    const overviewMarkup = overviewImages
+      ? '<details class="trace-section" open><summary>Наша локальная разметка (изображение)</summary><div class="trace-content">' + overviewImages + '</div></details>'
+      : '';
+    wrap.innerHTML = renderTrace(line.provider_trace, overviewMarkup);
     bindTraceControls(wrap.closest('.line-card'), wrap);
   });
   $('#result-body').querySelectorAll('[data-graph-3d-line]').forEach(function (container) {

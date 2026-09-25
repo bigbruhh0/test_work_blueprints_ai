@@ -102,7 +102,37 @@ def test_pipeline_length_payload_uses_final_vertices_and_edges():
         "connections": [
             {"id": "CN-1", "label": "СМ. CO-0031 ЛИСТ 2", "target_sheet": "2", "bbox": [1, 1, 2, 2], "center": [1.5, 1.5]},
         ],
-        "coordinates": [],
+        "coordinates": [
+            {"id": "C001", "label": "X", "value": "226150"},
+            {"id": "C002", "label": "Y", "value": "45700"},
+            {"id": "C003", "label": "Z+", "value": "773"},
+        ],
+        "coordinate_leads": [
+            {
+                "id": "C001", "label": "X", "value": "226150",
+                "coordinate_block_refs": ["4137-14-002-LC-0039 BB7"],
+                "arrow_found": True, "arrow_has_arrowhead": True,
+                "arrow_start": [12, 22], "arrow_end": [30, 40],
+                "arrow_segments": [{"start": [12, 22], "end": [30, 40]}],
+                "matched_vertex_id": "VE-07", "matched_vertex_point": [30, 40],
+            },
+            {
+                "id": "C002", "label": "Y", "value": "45700",
+                "coordinate_block_refs": ["4137-14-002-LC-0039 BB7"],
+                "arrow_found": True, "arrow_has_arrowhead": True,
+                "arrow_start": [12, 22], "arrow_end": [30, 40],
+                "arrow_segments": [{"start": [12, 22], "end": [30, 40]}],
+                "matched_vertex_id": "VE-07", "matched_vertex_point": [30, 40],
+            },
+            {
+                "id": "C003", "label": "Z+", "value": "773",
+                "coordinate_block_refs": ["4137-14-002-LC-0039 BB7"],
+                "arrow_found": True, "arrow_has_arrowhead": True,
+                "arrow_start": [12, 22], "arrow_end": [30, 40],
+                "arrow_segments": [{"start": [12, 22], "end": [30, 40]}],
+                "matched_vertex_id": "VE-07", "matched_vertex_point": [30, 40],
+            },
+        ],
         "handwheel_annotations": {"handwheels": [{"id": "HW-001", "label": "ШТУРВАЛ"}], "glyphs": []},
     }
     payload = build_pipeline_length_payload("L-1", "drawing.pdf", [(216, mapping)])
@@ -115,12 +145,44 @@ def test_pipeline_length_payload_uses_final_vertices_and_edges():
     assert page["final_edges"][1]["candidates"][0]["candidate_key"] == "216:D010"
     assert page["debug_source_vertices"] == []
     assert page["debug_source_edges"] == []
+    ve07 = next(row for row in page["final_vertices"] if row["id"] == "VE-07")
+    assert ve07["coordinate_refs"] == ["4137-14-002-LC-0039 BB7"]
+    assert ve07["local_coordinates"]["x"] == 226150
+    assert ve07["local_coordinates"]["y"] == 45700
+    assert ve07["local_coordinates"]["z"] == 773
+    assert ve07["local_coordinates"]["confidence"] == 0.95
+    assert page["local_vertex_coordinates"][1]["source_coordinate_labels"] == ["X=226150", "Y=45700", "Z+=773"]
+    assert page["coordinate_leads"][0]["matched_vertex_id"] == "VE-07"
     dimension = next(row for row in page["dimensions"] if row["id"] == "D010")
     assert dimension["final_edge_id"] == "F-VE-07-HG-03-A"
     assert dimension["final_from_vertex"] == "VE-07"
     assert dimension["final_to_vertex"] == "HG-03-A"
     assert [row["candidate_id"] for row in page["unresolved_dimensions"]] == ["D001"]
     assert page["unresolved_dimensions"][0]["final_interval_reason"] == "extension_projection_misses_pipe"
+
+
+def test_pipeline_length_coordinates_do_not_overwrite_existing_axis_with_partial_block():
+    mapping = {
+        "final_vertices": [{"id": "VE-01", "point": [10.0, 20.0]}],
+        "final_contour": [],
+        "dimensions": [],
+        "connections": [],
+        "coordinates": [],
+        "coordinate_leads": [
+            {"id": "C001", "label": "X", "value": "100", "matched_vertex_id": "VE-01", "arrow_found": True},
+            {"id": "C002", "label": "Y", "value": "200", "matched_vertex_id": "VE-01", "arrow_found": True},
+            {"id": "C003", "label": "Z+", "value": "300", "matched_vertex_id": "VE-01", "arrow_found": True},
+            {"id": "C004", "label": "Z+", "value": "999", "matched_vertex_id": "VE-01", "arrow_found": True},
+        ],
+    }
+
+    payload = build_pipeline_length_payload("L-1", "drawing.pdf", [(216, mapping)])
+    coordinates = payload["pages"][0]["final_vertices"][0]["local_coordinates"]
+
+    assert coordinates["x"] == 100
+    assert coordinates["y"] == 200
+    assert coordinates["z"] == 300
+    assert coordinates["coordinate_conflicts"][0]["ignored_value"] == 999
 
 
 def test_local_processing_snapshot_payload_keeps_base_only_as_debug():

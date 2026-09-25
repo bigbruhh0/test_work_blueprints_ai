@@ -6015,6 +6015,218 @@ def run_dimension_mapping(
     return mapping
 
 
+def save_local_markup_overview_pdf(
+    pdf_path: str | Path,
+    page_number: int,
+    output_pdf: str | Path,
+    mapping: dict[str, Any],
+) -> None:
+    """Единая вкладка локальной разметки: вершины, координаты с lead, размеры с привязкой, штурвалы."""
+    with fitz.open(str(pdf_path)) as document:
+        page = document[page_number - 1]
+        output = fitz.open()
+        marked = output.new_page(width=page.rect.width, height=page.rect.height)
+        marked.show_pdf_page(marked.rect, document, page_number - 1)
+
+        edge_by_id = {str(edge.get("id")): edge for edge in mapping.get("final_contour") or [] if edge.get("id")}
+
+        def edge_midpoint(edge: dict[str, Any]) -> tuple[float, float] | None:
+            points = edge.get("path_points") or [edge.get("start"), edge.get("end")]
+            points = [point for point in points if isinstance(point, list) and len(point) >= 2]
+            if not points:
+                return None
+            start = points[0]
+            end = points[-1]
+            return ((float(start[0]) + float(end[0])) / 2.0, (float(start[1]) + float(end[1])) / 2.0)
+
+        annotation = mapping.get("handwheel_annotations") or {}
+        handwheel_glyphs = mapping.get("handwheel_glyphs") or annotation.get("glyphs") or []
+        handwheels = annotation.get("handwheels") or mapping.get("handwheels") or []
+
+        # 1) штурвалы: розовые метки + lead-стрелки
+        glyph_color = (1.0, 0.35, 0.8)
+        for glyph in handwheel_glyphs:
+            corners = glyph.get("corners") or []
+            if len(corners) != 4:
+                continue
+            points = [fitz.Point(float(corner[0]), float(corner[1])) for corner in corners]
+            points.append(points[0])
+            marked.draw_polyline(points, color=glyph_color, width=1.6)
+        handwheel_color = (0.14, 0.39, 0.92)
+        for item in handwheels:
+            arrow_end = item.get("arrow_end")
+            if isinstance(arrow_end, list) and len(arrow_end) >= 2:
+                center = fitz.Point(float(arrow_end[0]), float(arrow_end[1]))
+                marked.draw_circle(center, 4.6, color=handwheel_color, fill=handwheel_color, fill_opacity=0.9, width=1.0)
+                marked.insert_text(center + (7, 7), str(item.get("id") or "HW"), fontsize=7.5, fontname="helv", color=handwheel_color)
+
+        # 2) финальные отрезки (F-*): обычная труба vs арматура/штурвал
+        pipe_edge_color = (0.0, 0.62, 0.25)
+        valve_edge_color = (0.95, 0.15, 0.55)
+        for edge in mapping.get("final_contour") or []:
+            if not edge.get("id"):
+                continue
+            raw_points = edge.get("path_points") or [edge.get("start"), edge.get("end")]
+            edge_points = [
+                fitz.Point(float(point[0]), float(point[1]))
+                for point in raw_points
+                if isinstance(point, list) and len(point) >= 2
+            ]
+            if len(edge_points) < 2:
+                continue
+            is_valve = bool(edge.get("is_handwheel_segment")) or str(edge.get("element_type")) == "valve"
+            edge_color = valve_edge_color if is_valve else pipe_edge_color
+            for point_index in range(len(edge_points) - 1):
+                marked.draw_line(
+                    edge_points[point_index],
+                    edge_points[point_index + 1],
+                    color=edge_color,
+                    width=3.4 if is_valve else 2.0,
+                )
+            midpoint = edge_midpoint(edge)
+            if midpoint is not None:
+                marked.insert_text(
+                    fitz.Point(midpoint[0] + 4, midpoint[1] - 4),
+                    str(edge.get("id"))[:26],
+                    fontsize=6.5,
+                    fontname="helv",
+                    color=edge_color,
+                )
+
+        # 3) размеры: штрих, выносные, lead и луч привязки к финальному отрезку
+        dimension_color = (0.0, 0.45, 0.95)
+        extension_color = (0.48, 0.22, 0.85)
+        leader_color = (1.0, 0.78, 0.0)
+        binding_color = (0.0, 0.62, 0.18)
+        unresolved_color = (0.9, 0.45, 0.05)
+        decision_colors = {"include": (0.0, 0.62, 0.2), "exclude": (0.88, 0.06, 0.05), "ambiguous": (0.95, 0.62, 0.05)}
+        rendered: set[tuple[float, float, float, float]] = set()
+        for dimension in mapping.get("dimensions") or []:
+            decision = dimension.get("local_filter_decision") or "ambiguous"
+            stroke_color = decision_colors.get(decision, dimension_color)
+            dimension_points = _stroke_points(dimension.get("dimension_stroke")) if isinstance(dimension.get("dimension_stroke"), dict) else None
+            if dimension_points is not None:
+                marked.draw_line(dimension_points[0], dimension_points[1], color=stroke_color, width=2.4)
+            leader = dimension.get("leader_stroke") if isinstance(dimension.get("leader_stroke"), dict) else None
+            _draw_leader_stroke(marked, leader, color=leader_color, width=2.6)
+            for stroke in dimension.get("extension_strokes") or []:
+                key = _stroke_key(stroke) if isinstance(stroke, dict) else None
+                extension_points = _stroke_points(stroke) if isinstance(stroke, dict) else None
+                if key is None or extension_points is None or key in rendered:
+                    continue
+                rendered.add(key)
+                marked.draw_line(extension_points[0], extension_points[1], color=extension_color, width=1.1)
+
+            label_center = dimension.get("label_center")
+            if not isinstance(label_center, list) or len(label_center) < 2:
+                continue
+            center = fitz.Point(float(label_center[0]), float(label_center[1]))
+            final_edge_id = dimension.get("final_interval_id")
+            edge = edge_by_id.get(str(final_edge_id)) if final_edge_id else None
+            midpoint = edge_midpoint(edge) if edge else None
+            if midpoint is not None:
+                target = fitz.Point(float(midpoint[0]), float(midpoint[1]))
+                marked.draw_line(center, target, color=binding_color, width=1.4, dashes="[4 3] 0")
+                marked.draw_circle(target, 3.4, color=binding_color, fill=binding_color, width=1.0)
+                text = (
+                    f"{dimension.get('id')} {dimension.get('value')} [{decision}] -> {final_edge_id}"
+                    f" ({dimension.get('final_from_vertex')}→{dimension.get('final_to_vertex')})"
+                )
+                marked.insert_text(center + (16, -10), text[:70], fontsize=7, fontname="helv", color=stroke_color)
+            else:
+                text = f"{dimension.get('id')} {dimension.get('value') or ''} [{decision}]: unresolved ({dimension.get('final_interval_reason') or dimension.get('status') or 'нет отрезка'})"
+                marked.insert_text(center + (16, -10), text[:70], fontsize=7, fontname="helv", color=unresolved_color)
+
+        # 3) координатные подписи с их lead
+        coordinate_color = (0.0, 0.62, 0.62)
+        coordinate_lead_color = (0.95, 0.45, 0.0)
+        coordinate_no_lead_color = (0.62, 0.62, 0.62)
+        for row in _coordinate_lead_rows(page, mapping):
+            bbox = row.get("bbox")
+            if isinstance(bbox, list) and len(bbox) >= 4:
+                marked.draw_rect(
+                    fitz.Rect(float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])),
+                    color=coordinate_color,
+                    fill=(1.0, 1.0, 1.0),
+                    fill_opacity=0.45,
+                    width=1.1,
+                )
+            has_lead = bool(row.get("arrow_found"))
+            color = coordinate_lead_color if has_lead else coordinate_no_lead_color
+            for segment in row.get("arrow_segments") or []:
+                start = segment.get("start")
+                end = segment.get("end")
+                if not start or not end or len(start) < 2 or len(end) < 2:
+                    continue
+                marked.draw_line(
+                    fitz.Point(float(start[0]), float(start[1])),
+                    fitz.Point(float(end[0]), float(end[1])),
+                    color=color,
+                    width=2.4,
+                )
+            arrow_end = row.get("arrow_end")
+            if isinstance(arrow_end, list) and len(arrow_end) >= 2:
+                point = fitz.Point(float(arrow_end[0]), float(arrow_end[1]))
+                marked.draw_circle(point, 4.0, color=color, fill=color if has_lead else None, width=1.2)
+            if isinstance(bbox, list) and len(bbox) >= 4:
+                label = f"{row.get('id')} {row.get('label')}={row.get('value')}"
+                if row.get("matched_vertex_id"):
+                    label += f" -> {row.get('matched_vertex_id')}"
+                marked.insert_text(fitz.Point(float(bbox[0]), float(bbox[1]) - 3), label[:56], fontsize=7, fontname="helv", color=color)
+
+        # 4) финальные вершины: VE (фиолетовые) и HG (синие), единый размер
+        vertex_style = {
+            "extension": (0.45, 0.05, 0.75),
+            "handwheel": (0.14, 0.39, 0.92),
+        }
+        for vertex in mapping.get("final_vertices") or []:
+            point = vertex.get("point")
+            if not isinstance(point, list) or len(point) < 2:
+                continue
+            center = fitz.Point(float(point[0]), float(point[1]))
+            color = vertex_style.get(str(vertex.get("vertex_source")), (0.1, 0.1, 0.1))
+            marked.draw_circle(center, 10.5, color=(1.0, 1.0, 1.0), fill=(1.0, 1.0, 1.0), fill_opacity=0.75, width=0.8)
+            marked.draw_circle(center, 6.5, color=color, fill=None, width=2.2)
+            marked.draw_line(center + (-4.5, 0), center + (4.5, 0), color=color, width=1.6)
+            marked.draw_line(center + (0, -4.5), center + (0, 4.5), color=color, width=1.6)
+            label_point = center + (11, -11)
+            marked.draw_rect(
+                fitz.Rect(label_point.x - 2, label_point.y - 9, label_point.x + 44, label_point.y + 4),
+                color=(1.0, 1.0, 1.0),
+                fill=(1.0, 1.0, 1.0),
+                fill_opacity=0.85,
+                width=0,
+            )
+            marked.insert_text(label_point, str(vertex.get("id") or "V?"), fontsize=8, fontname="helv", color=color)
+
+        # 5) межлистовые ссылки "СМ ... ЛИСТ N" (то, что уходит в cross_sheet_text_refs)
+        cross_sheet_color = (0.78, 0.30, 0.67)
+        cross_pattern = re.compile(r"ЛИСТ\s*[:№]?\s*(?:№\s*)?(\d+)(?![\dXx×])", flags=re.IGNORECASE | re.UNICODE)
+        for connection in mapping.get("connections") or []:
+            label = str(connection.get("label") or "")
+            if not cross_pattern.search(label):
+                continue
+            bbox = connection.get("bbox")
+            if isinstance(bbox, list) and len(bbox) >= 4:
+                marked.draw_rect(
+                    fitz.Rect(float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])),
+                    color=cross_sheet_color,
+                    width=1.6,
+                )
+                marker = fitz.Point(float(bbox[0]), float(bbox[1]) - 4)
+                marked.insert_text(marker, f"CROSS_SHEET {label[:48]}", fontsize=7, fontname="helv", color=cross_sheet_color)
+
+        marked.insert_text(
+            fitz.Point(24, 26),
+            "LOCAL MARKUP OVERVIEW: violet=VE blue=HG/pink=handwheel orange=coordinate lead blue-dim=dimension purple=extension yellow=lead green=edge binding magenta=valve/cross-sheet",
+            fontsize=9,
+            fontname="helv",
+            color=(0.05, 0.18, 0.14),
+        )
+        output.save(str(output_pdf))
+        output.close()
+
+
 __all__ = [
     "map_dimensions",
     "run_dimension_mapping",
@@ -6028,6 +6240,7 @@ __all__ = [
     "save_preprocess_annotation_pdf",
     "save_dimension_lead_detection_pdf",
     "attach_coordinate_leads",
+    "save_local_markup_overview_pdf",
     "save_local_dimension_filter_pdf",
     "save_pipeline_length_diagnostic_pdf",
     "save_final_contour_rays_pdf",

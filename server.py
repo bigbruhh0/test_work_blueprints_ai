@@ -23,11 +23,13 @@ from pydantic import BaseModel
 from src import db as run_db
 from src.dimension_mapping import (
     _handwheel_details,
+    attach_coordinate_leads,
     run_dimension_mapping,
     save_clean_graph_pdf,
     save_clean_local_markup_pdf,
     save_dimension_lead_detection_pdf,
     save_local_dimension_filter_pdf,
+    save_local_markup_overview_pdf,
     save_final_contour_rays_pdf,
     save_pipeline_length_diagnostic_pdf,
     save_preprocess_annotation_pdf,
@@ -784,12 +786,20 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                     _persist(run)
                     return
                 if pipeline_length_mode:
+                    with fitz.open(str(pdf_path)) as source_document:
+                        attach_coordinate_leads(
+                            source_document[page_run.page_number - 1],
+                            mapping,
+                        )
                     diagnostic_pdf = run_dir / f"{pdf_stem}_page{page_run.page_number}_pipeline_length_diagnostic.pdf"
                     save_pipeline_length_diagnostic_pdf(pdf_path, page_run.page_number, diagnostic_pdf, mapping)
+                    overview_pdf = run_dir / f"{pdf_stem}_page{page_run.page_number}_local_markup_overview.pdf"
+                    save_local_markup_overview_pdf(pdf_path, page_run.page_number, overview_pdf, mapping)
                     page_run.analysis = {"pipeline_length_local": mapping}
                     page_run.files["dimensions_pdf"] = dimensions_pdf.name
                     page_run.files["dimensions_json"] = dimensions_json.name
                     page_run.files["pipeline_length_diagnostic_pdf"] = diagnostic_pdf.name
+                    page_run.files["local_markup_overview_pdf"] = overview_pdf.name
                     page_run.stage = "pipeline_length"
                     page_run.status = "local_complete"
                     page_run.events.append({"time": now(), "stage": "pipeline_length", "message": "локальный снимок готов, ожидается общий расчет по линии"})
