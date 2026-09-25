@@ -603,6 +603,41 @@ function pipelineLengthEstimates(line) {
   });
 }
 
+function pipelineManualSets(line) {
+  const analysis = line.analysis && line.analysis.pipeline_length;
+  const manual = (analysis && analysis.manual_confirmation) || {};
+  return {
+    accepted: new Set((manual.candidate_ids || []).map(String)),
+    keptLocal: new Set((manual.keep_local_candidate_ids || []).map(String)),
+  };
+}
+
+function pipelineProviderAssessmentMap(line) {
+  const analysis = line.analysis && line.analysis.pipeline_length;
+  const provider = (analysis && analysis.provider_result) || {};
+  const map = new Map();
+  (Array.isArray(provider.candidate_assessments) ? provider.candidate_assessments : []).forEach(function (item) {
+    const keys = [item.candidate_key, item.candidate_id].filter(Boolean).map(String);
+    keys.forEach(function (key) { map.set(key, item); });
+  });
+  return map;
+}
+
+function pipelineEffectiveCandidateDecision(line, candidate) {
+  const candidateKey = String(candidate.candidate_key || candidate.candidate_id || candidate.id || '');
+  const localId = String(candidate.candidate_id || candidate.id || '').split(':').pop();
+  const localDecision = candidate.local_decision || candidate.decision || 'ambiguous';
+  const manual = pipelineManualSets(line);
+  const assessments = pipelineProviderAssessmentMap(line);
+  const assessment = assessments.get(candidateKey) || assessments.get(localId);
+  if (manual.keptLocal.has(candidateKey) || manual.keptLocal.has(localId)) return localDecision;
+  if (manual.accepted.has(candidateKey) || manual.accepted.has(localId)) return (assessment && assessment.proposed_decision) || localDecision;
+  if (assessment && assessment.proposed_decision) return assessment.proposed_decision;
+  if (assessment && assessment.assessment === 'accepted') return assessment.local_decision || localDecision;
+  if (assessment && (assessment.assessment === 'disputed' || assessment.assessment === 'insufficient')) return 'ambiguous';
+  return localDecision;
+}
+
 function formatMm(value) {
   if (value == null || value === '') return '—';
   const number = Number(value);
@@ -672,22 +707,93 @@ function pipelineVertexCoordinateKey(item) {
 }
 
 function pipelineVertexCoordinateMap(line) {
+  const pages = line.provider_trace && line.provider_trace.payload && line.provider_trace.payload.pages;
+  const providerRows = pipelineVertexCoordinates(line);
+  const byKey = new Map(providerRows.map(function (item) {
+    return [pipelineVertexCoordinateKey(item), item];
+  }));
+  const localByKey = new Map();
+  (Array.isArray(pages) ? pages : []).forEach(function (page) {
+    pipelineProviderPageVertexRows(page).forEach(function (vertex) {
+      const local = vertex.local_coordinates || {};
+      if (local.x != null && local.y != null && local.z != null) {
+        localByKey.set(String(page.page) + ':' + String(vertex.id), local);
+      }
+    });
+  });
+  const invalidProviderKeys = new Set();
+  (Array.isArray(pages) ? pages : []).forEach(function (page) {
+    const dimensionsByKey = new Map((page.dimensions || []).map(function (dimension) {
+      return [String(dimension.candidate_key || ''), dimension];
+    }));
+    const coordsFor = function (vertexId) {
+      const key = String(page.page) + ':' + String(vertexId);
+      const local = localByKey.get(key);
+      if (local) return [Number(local.x), Number(local.y), Number(local.z)];
+      const provider = byKey.get(key);
+      if (!provider || provider.x == null || provider.y == null || provider.z == null) return null;
+      return [Number(provider.x), Number(provider.y), Number(provider.z)];
+    };
+    (page.final_edges || []).forEach(function (edge) {
+      const from = coordsFor(edge.from_vertex);
+      const to = coordsFor(edge.to_vertex);
+      if (!from || !to) return;
+      const edgeCandidates = (edge.candidate_keys || []).map(function (key) {
+        return dimensionsByKey.get(String(key));
+      }).filter(Boolean);
+      const value = edgeCandidates
+        .filter(function (candidate) { return candidate.local_decision === 'include'; })
+        .map(function (candidate) { return Number(candidate.value_mm ?? candidate.value ?? candidate.length_mm); })
+        .find(Number.isFinite);
+      if (!Number.isFinite(value) || value <= 0) return;
+      const distance = Math.hypot(from[0] - to[0], from[1] - to[1], from[2] - to[2]);
+      const tolerance = Math.max(8, value * 0.15);
+      if (Math.abs(distance - value) > tolerance) {
+        [edge.from_vertex, edge.to_vertex].forEach(function (vertexId) {
+          const key = String(page.page) + ':' + String(vertexId);
+          if (!localByKey.has(key) && byKey.has(key)) invalidProviderKeys.add(key);
+        });
+      }
+    });
+  });
   const map = new Map();
-  pipelineVertexCoordinates(line).forEach(function (item) {
+  providerRows.forEach(function (item) {
+    const key = pipelineVertexCoordinateKey(item);
     const confidence = item.confidence == null ? null : Number(item.confidence);
     const hasXYZ = item.x != null && item.y != null && item.z != null;
-    if (!hasXYZ || (confidence != null && Number.isFinite(confidence) && confidence < 0.7)) return;
-    const key = pipelineVertexCoordinateKey(item);
-    if (key) map.set(key, item);
+    // A complete provider coordinate is usable for geometry even when its
+    // confidence is below the review threshold. The UI marks it as uncertain;
+    // it must not silently fall back to sheet pixels or Z=0.
+    if (!hasXYZ || !key || invalidProviderKeys.has(key)) return;
+    map.set(key, item);
   });
   return map;
+}
+
+function pipelineProviderPageVertexRows(page) {
+  const reconstruction = page && page.coordinate_reconstruction;
+  if (!reconstruction) return page && (page.final_vertices || page.vertices) || [];
+  return ['known_vertices', 'partial_vertices', 'unknown_vertices'].flatMap(function (group) {
+    return (reconstruction[group] || []).map(function (row) {
+      return {
+        id: row.vertex_id,
+        vertex_key: row.vertex_key,
+        point: row.sheet_point,
+        role: row.role,
+        handwheel_id: row.handwheel_id,
+        coordinate_refs: row.coordinate_refs || [],
+        local_coordinates: row,
+      };
+    });
+  });
 }
 
 function pipelineLocalVertexCoordinateRows(line) {
   const pages = line.provider_trace && line.provider_trace.payload && line.provider_trace.payload.pages;
   if (Array.isArray(pages)) {
     return pages.flatMap(function (page) {
-      return (page.local_vertex_coordinates || []).map(function (row) {
+      return pipelineProviderPageVertexRows(page).map(function (vertex) {
+        const row = vertex.local_coordinates || {};
         return Object.assign({ page: page.page }, row);
       });
     });
@@ -737,7 +843,11 @@ function pipelineLengthSummary(line) {
   const localCoordinateRows = pipelineLocalVertexCoordinateRows(line);
   const providerCoordinateMap = pipelineVertexCoordinateMap(line);
   const coordinateReady = localCoordinateRows.filter(function (row) {
-    return providerCoordinateMap.has(String(row.vertex_key || (row.page + ':' + row.vertex_id)));
+    const key = String(row.vertex_key || (row.page + ':' + row.vertex_id));
+    const localConfidence = Number(row.confidence || 0);
+    const hasLocalXYZ = row.x != null && row.y != null && row.z != null
+      && (!Number.isFinite(localConfidence) || localConfidence >= 0.7);
+    return hasLocalXYZ || providerCoordinateMap.has(key);
   }).length;
   const coordinateUnknown = Math.max(0, localCoordinateRows.length - coordinateReady);
   const handwheelCount = (line.page_results || []).reduce(function (total, page) {
@@ -853,7 +963,9 @@ function pipelineLengthPageDetail(line, pageNumber) {
   const estimates = pipelineLengthEstimates(line).filter(function (row) { return Number(row.page) === Number(pageNumber); });
   const payloadPages = line.provider_trace && line.provider_trace.payload && line.provider_trace.payload.pages;
   const payloadPage = Array.isArray(payloadPages) ? payloadPages.find(function (page) { return Number(page.page) === Number(pageNumber); }) : null;
-  const unresolvedLocal = payloadPage && Array.isArray(payloadPage.unresolved_dimensions) ? payloadPage.unresolved_dimensions : [];
+  const unresolvedLocal = payloadPage && Array.isArray(payloadPage.dimensions)
+    ? payloadPage.dimensions.filter(function (row) { return row.is_unresolved; })
+    : [];
   const unresolvedProvider = Array.isArray(provider.unresolved_reviews) ? provider.unresolved_reviews : [];
   const adjacentForPage = pipelineAdjacentSheetItems(line).filter(function (item) {
     return Number(item.page || item.from_page) === Number(pageNumber);
@@ -907,7 +1019,7 @@ function pipelineLengthPageDetail(line, pageNumber) {
           return String(item.candidate_key || item.candidate_id || '') === key || String(item.candidate_id || '').endsWith(':' + String(row.candidate_id || ''));
         }) || {};
         return '<tr><td><b>' + esc(key || row.candidate_id || '—') + '</b><br><span class="muted">' + esc(formatMm(row.value_mm)) + '</span></td>'
-          + '<td>' + esc(row.final_interval_reason || row.reason || '—') + '</td>'
+          + '<td>' + esc(row.unresolved_reason || row.final_interval_reason || row.reason || '—') + '</td>'
           + '<td>' + esc(review.status || 'нет ответа') + '<br><span class="muted">' + esc(review.reason || review.suggested_action || '') + '</span></td></tr>';
       }).join('')
       + '</tbody></table></div></details>'
@@ -1029,6 +1141,8 @@ function renderTrace(trace, imageMarkup) {
   };
   return '<div class="trace-block">'
     + '<p class="muted">' + meta + '</p>'
+    + (trace.error ? '<div class="badge error trace-error">Ошибка запроса: ' + esc(trace.error) + '</div>' : '')
+    + ((trace.errors || []).length ? '<div class="badge error trace-error">Ошибки по листам:<br>' + trace.errors.map(function (item) { return 'стр. ' + esc(item.page) + ': ' + esc(item.error); }).join('<br>') + '</div>' : '')
     + section('Prompt', trace.prompt || '')
     + section('Payload', payloadPretty)
     + section('Ответ (raw)', responsePretty)
@@ -1143,27 +1257,36 @@ function combinedGraphForLine(line) {
   if (Array.isArray(payloadPages)) {
     payloadPages.forEach(function (page) {
       const pageNumber = page.page;
-      (Array.isArray(page.final_vertices || page.vertices) ? (page.final_vertices || page.vertices) : []).forEach(function (vertex) {
+      pipelineProviderPageVertexRows(page).forEach(function (vertex) {
         const localId = String(vertex.id || vertex.vertex_id || '');
         if (!localId) return;
         const id = String(pageNumber) + ':' + localId;
         const localCoordinates = vertex.local_coordinates || {};
         const providerCoordinate = providerCoordinates.get(id) || providerCoordinates.get(localId);
         const hasProviderXYZ = providerCoordinate && providerCoordinate.x != null && providerCoordinate.y != null && providerCoordinate.z != null;
+        const localConfidence = Number(localCoordinates.confidence || 0);
+        const hasLocalXYZ = localCoordinates.x != null && localCoordinates.y != null && localCoordinates.z != null
+          && (!Number.isFinite(localConfidence) || localConfidence >= 0.7);
+        const useProviderXYZ = !!hasProviderXYZ && !hasLocalXYZ;
+        const hasKnownXYZ = !!hasProviderXYZ || !!hasLocalXYZ;
         const node = Object.assign({}, vertex, {
           id: id,
           local_vertex_id: localId,
           page: pageNumber,
           pages: [pageNumber],
-          x: hasProviderXYZ ? providerCoordinate.x : (localCoordinates.x ?? vertex.x ?? vertex.sheet_x),
-          y: hasProviderXYZ ? providerCoordinate.y : (localCoordinates.y ?? vertex.y ?? vertex.sheet_y),
-          z: hasProviderXYZ ? providerCoordinate.z : (localCoordinates.z ?? vertex.z ?? 0),
+          // Sheet coordinates are drawing pixels, not model coordinates.
+          // Keep them available as metadata, but never use them as a partial
+          // 3D point when a provider/local XYZ tuple is absent.
+          x: hasLocalXYZ ? localCoordinates.x : (useProviderXYZ ? providerCoordinate.x : null),
+          y: hasLocalXYZ ? localCoordinates.y : (useProviderXYZ ? providerCoordinate.y : null),
+          z: hasLocalXYZ ? localCoordinates.z : (useProviderXYZ ? providerCoordinate.z : null),
           sheet_x: vertex.sheet_x,
           sheet_y: vertex.sheet_y,
-          coordinate_source: hasProviderXYZ ? 'provider' : (localCoordinates.method || 'sheet_position'),
-          coordinate_confidence: hasProviderXYZ ? providerCoordinate.confidence : (localCoordinates.confidence || 0),
-          coordinate_unknown: !hasProviderXYZ,
-          coordinate_reason: hasProviderXYZ ? providerCoordinate.reason : (localCoordinates.reason || 'координаты X/Y/Z не подтверждены'),
+          coordinate_source: hasLocalXYZ ? (localCoordinates.method || 'local') : (useProviderXYZ ? 'provider' : 'sheet_position'),
+          coordinate_confidence: hasLocalXYZ ? (localCoordinates.confidence || 0) : (useProviderXYZ ? providerCoordinate.confidence : 0),
+          coordinate_unknown: !hasKnownXYZ,
+          coordinate_uncertain: useProviderXYZ && Number(providerCoordinate.confidence) < 0.5,
+          coordinate_reason: hasLocalXYZ ? (localCoordinates.reason || 'локальные координаты') : (useProviderXYZ ? providerCoordinate.reason : 'координаты X/Y/Z не подтверждены'),
         });
         nodes.set(id, node);
       });
@@ -1179,12 +1302,25 @@ function combinedGraphForLine(line) {
           duplicates.push({ from_node_id: from, to_node_id: to, page: pageNumber });
           return;
         }
+        const dimensionsByKey = new Map((page.dimensions || []).map(function (dimension) {
+          return [String(dimension.candidate_key || ''), dimension];
+        }));
+        const edgeCandidates = Array.isArray(edge.candidates)
+          ? edge.candidates
+          : (edge.candidate_keys || []).map(function (key) { return dimensionsByKey.get(String(key)); }).filter(Boolean);
+        const includedCandidates = edgeCandidates.filter(function (candidate) {
+          return pipelineEffectiveCandidateDecision(line, candidate) === 'include';
+        });
+        const activeDimension = includedCandidates.length
+          ? includedCandidates.map(function (candidate) { return Number(candidate.value_mm ?? candidate.value ?? candidate.length_mm); }).find(Number.isFinite)
+          : null;
         edges.set(key, Object.assign({}, edge, {
           id: String(pageNumber) + ':' + String(edge.id || edge.edge_id || ('F' + (edges.size + 1))),
           from_node_id: from,
           to_node_id: to,
           page: pageNumber,
-          dimension_mm: edge.length_mm ?? edge.value,
+          dimension_mm: activeDimension ?? edge.length_mm ?? edge.value,
+          active_candidate_ids: includedCandidates.map(function (candidate) { return candidate.candidate_key || candidate.candidate_id || candidate.id; }).filter(Boolean),
           is_handwheel_segment: !!edge.is_handwheel_segment,
         }));
       });
@@ -1395,6 +1531,26 @@ async function render3DGraph(container, graph) {
     keyLight.position.set(5, 10, 8);
     scene.add(keyLight);
 
+    const pageColors = [0x2563eb, 0xdc2626, 0x16a34a, 0x9333ea, 0xea580c, 0x0891b2, 0xca8a04];
+    const pages = Array.from(new Set(graph.nodes.map(function (node) { return String(node.page || ''); }).filter(Boolean)));
+    const multiplePages = pages.length > 1;
+    const pageColor = function (page) {
+      const index = Math.max(0, pages.indexOf(String(page || '')));
+      return pageColors[index % pageColors.length];
+    };
+    const nodeLabel = function (node) {
+      const localId = String(node.local_vertex_id || node.id || '').split(':').pop();
+      return multiplePages && node.page ? localId + '_' + node.page : localId;
+    };
+    if (multiplePages) {
+      const legend = document.createElement('span');
+      legend.className = 'graph-3d-page-legend';
+      legend.innerHTML = pages.map(function (page) {
+        return '<span><i style="background:#' + pageColor(page).toString(16).padStart(6, '0') + '"></i>лист ' + esc(page) + '</span>';
+      }).join('');
+      toolbar.insertBefore(legend, toolbar.firstChild);
+    }
+
     const numeric = graph.nodes.map(function (node) { return [node.x, node.y, node.z == null || node.z === '' ? 0 : node.z].map(Number); }).filter(function (values) { return values.every(Number.isFinite); });
     const min = [0, 0, 0].map(function (_, axis) { return numeric.length ? Math.min.apply(null, numeric.map(function (v) { return v[axis]; })) : 0; });
     const max = [0, 0, 0].map(function (_, axis) { return numeric.length ? Math.max.apply(null, numeric.map(function (v) { return v[axis]; })) : 1; });
@@ -1402,48 +1558,69 @@ async function render3DGraph(container, graph) {
     const positions = new Map();
     graph.nodes.forEach(function (node, index) { positions.set(String(node.id), graphPoint(node, index, THREE, bounds)); });
 
-    const edgePositions = [];
+    const edgePositionsByPage = new Map();
     graph.edges.forEach(function (edge) {
       const from = positions.get(String(edge.from_node_id));
       const to = positions.get(String(edge.to_node_id));
-      if (from && to) {
-        edgePositions.push(from.x, from.y, from.z, to.x, to.y, to.z);
+      const fromNode = graph.nodes.find(function (node) { return String(node.id) === String(edge.from_node_id); });
+      const toNode = graph.nodes.find(function (node) { return String(node.id) === String(edge.to_node_id); });
+      // Do not draw a misleading 3D segment through an unresolved vertex.
+      if (from && to && fromNode && toNode && !fromNode.coordinate_unknown && !toNode.coordinate_unknown) {
+        const edgePage = String(edge.page || fromNode.page || '');
+        if (!edgePositionsByPage.has(edgePage)) edgePositionsByPage.set(edgePage, []);
+        edgePositionsByPage.get(edgePage).push(from.x, from.y, from.z, to.x, to.y, to.z);
         const direction = to.clone().sub(from);
         const length = direction.length();
         if (length > 0.001) {
-          scene.add(new THREE.ArrowHelper(direction.normalize(), from, length, 0xd97706, 0.28, 0.16));
+          scene.add(new THREE.ArrowHelper(direction.normalize(), from, length, pageColor(edgePage), 0.28, 0.16));
         }
         if (edge.dimension_mm != null && edge.dimension_mm !== '') {
-          const label = floatingLabel(String(edge.dimension_mm) + ' мм', '#9a5a00', THREE);
+          const label = floatingLabel(String(edge.dimension_mm) + ' мм', '#' + pageColor(edgePage).toString(16).padStart(6, '0'), THREE);
           label.position.copy(from).add(to).multiplyScalar(0.5);
           label.position.y += 0.3;
           scene.add(label);
         }
       }
     });
-    if (edgePositions.length) {
+    edgePositionsByPage.forEach(function (edgePositions, edgePage) {
       const geometry = new THREE.BufferGeometry();
       geometry.setAttribute('position', new THREE.Float32BufferAttribute(edgePositions, 3));
-      scene.add(new THREE.LineSegments(geometry, new THREE.LineBasicMaterial({ color: 0x27856a }))); 
-    }
+      scene.add(new THREE.LineSegments(geometry, new THREE.LineBasicMaterial({ color: pageColor(edgePage) })));
+    });
     const nodeGeometry = new THREE.SphereGeometry(0.16, 18, 12);
-    const nodeMaterial = new THREE.MeshStandardMaterial({ color: 0x176044, roughness: 0.55 });
     const unknownGeometry = new THREE.SphereGeometry(0.195, 18, 12);
     const unknownMaterial = new THREE.MeshStandardMaterial({ color: 0xf59e0b, roughness: 0.5, emissive: 0x7c2d12, emissiveIntensity: 0.4 });
     let unknownCount = 0;
+    let uncertainCount = 0;
     graph.nodes.forEach(function (node) {
       const isUnknown = !!node.coordinate_unknown;
       if (isUnknown) unknownCount += 1;
+      if (node.coordinate_uncertain) uncertainCount += 1;
+      const nodeMaterial = new THREE.MeshStandardMaterial({ color: pageColor(node.page), roughness: 0.55 });
       const mesh = new THREE.Mesh(isUnknown ? unknownGeometry : nodeGeometry, isUnknown ? unknownMaterial : nodeMaterial);
       mesh.position.copy(positions.get(String(node.id)));
       mesh.userData.label = String(node.id);
       mesh.userData.coordinate_unknown = isUnknown;
       scene.add(mesh);
+      if (nodeLabel(node)) {
+        const label = floatingLabel(nodeLabel(node), '#' + pageColor(node.page).toString(16).padStart(6, '0'), THREE);
+        label.position.copy(mesh.position);
+        label.position.y += 0.34;
+        label.scale.set(0.9, 0.22, 1);
+        scene.add(label);
+      }
+      if (node.coordinate_uncertain && !isUnknown) {
+        const marker = floatingLabel('?', '#b45309', THREE);
+        marker.position.copy(mesh.position);
+        marker.position.y += 0.42;
+        marker.scale.set(0.45, 0.45, 1);
+        scene.add(marker);
+      }
     });
-    if (unknownCount) {
+    if (unknownCount || uncertainCount) {
       const note = document.createElement('span');
       note.className = 'graph-3d-unknown-note';
-      note.textContent = 'Оранжевые вершины: ' + unknownCount + ' без координат X/Y/Z';
+      note.textContent = 'Без координат: ' + unknownCount + ' · требуют проверки confidence: ' + uncertainCount;
       toolbar.insertBefore(note, toolbar.firstChild);
     }
     const grid = new THREE.GridHelper(14, 14, 0xc7d7ce, 0xe0e9e4);

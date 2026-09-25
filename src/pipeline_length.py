@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -10,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import requests
+import fitz
 
 from . import prompts
 
@@ -17,8 +19,8 @@ from . import prompts
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DEEPSEEK_TIMEOUT_SECONDS = 180
 DEFAULT_CODEX_TIMEOUT_SECONDS = 300
-DEFAULT_PIPELINE_LENGTH_MAX_TOKENS = 8192
-MAX_PIPELINE_LENGTH_MAX_TOKENS = 16000
+DEFAULT_PIPELINE_LENGTH_MAX_TOKENS = 32000
+MAX_PIPELINE_LENGTH_MAX_TOKENS = 32000
 MAX_PROVIDER_TIMEOUT_SECONDS = 600
 MAX_PROVIDER_RESPONSE_BYTES = 4 * 1024 * 1024
 
@@ -311,6 +313,11 @@ def _final_vertex_rows(mapping: dict[str, Any], page_number: int) -> list[dict[s
 
 def _final_edge_rows(mapping: dict[str, Any], page_number: int) -> list[dict[str, Any]]:
     groups = {str(row.get("edge_id")): row for row in mapping.get("final_edge_candidate_groups") or [] if row.get("edge_id")}
+    dimensions_by_id = {
+        str(row.get("id")): row
+        for row in mapping.get("dimensions") or []
+        if row.get("id")
+    }
     rows = []
     for edge in mapping.get("final_contour") or []:
         edge_id = edge.get("id")
@@ -334,12 +341,81 @@ def _final_edge_rows(mapping: dict[str, Any], page_number: int) -> list[dict[str
                     {
                         **candidate,
                         "candidate_key": f"{page_number}:{candidate.get('candidate_id')}",
+                        "local_decision": candidate.get("local_decision")
+                        or (dimensions_by_id.get(str(candidate.get("candidate_id"))) or {}).get("local_filter_decision"),
+                        "local_reason": candidate.get("local_reason")
+                        or (dimensions_by_id.get(str(candidate.get("candidate_id"))) or {}).get("local_filter_reason"),
                     }
                     for candidate in group.get("candidates") or []
                 ],
             }
         )
     return rows
+
+
+def _coordinate_reconstruction_payload(
+    final_vertices: list[dict[str, Any]],
+    final_edges: list[dict[str, Any]],
+) -> dict[str, Any]:
+    known_vertices: list[dict[str, Any]] = []
+    partial_vertices: list[dict[str, Any]] = []
+    unknown_vertices: list[dict[str, Any]] = []
+    for vertex in final_vertices:
+        coordinates = vertex.get("local_coordinates") or {}
+        row = {
+            "vertex_id": vertex.get("id"),
+            "vertex_key": vertex.get("vertex_key"),
+            "sheet_point": vertex.get("point"),
+            "role": vertex.get("role"),
+            "handwheel_id": vertex.get("handwheel_id"),
+            "x": coordinates.get("x"),
+            "y": coordinates.get("y"),
+            "z": coordinates.get("z"),
+            "confidence": coordinates.get("confidence"),
+            "method": coordinates.get("method"),
+            "source_coordinate_labels": coordinates.get("source_coordinate_labels") or [],
+            "coordinate_refs": coordinates.get("coordinate_refs") or vertex.get("coordinate_refs") or [],
+        }
+        filled = sum(1 for axis in ("x", "y", "z") if row.get(axis) is not None)
+        if filled == 3:
+            known_vertices.append(row)
+        elif filled:
+            partial_vertices.append(row)
+        else:
+            unknown_vertices.append(row)
+
+    included_edges: list[dict[str, Any]] = []
+    for edge in final_edges:
+        candidates = [
+            candidate
+            for candidate in edge.get("candidates") or []
+            if candidate.get("local_decision") == "include"
+        ]
+        for candidate in candidates:
+            included_edges.append(
+                {
+                    "edge_id": edge.get("id"),
+                    "from_vertex": edge.get("from_vertex"),
+                    "to_vertex": edge.get("to_vertex"),
+                    "value_mm": candidate.get("value_mm") or candidate.get("value") or candidate.get("length_mm"),
+                }
+            )
+    return {
+        "task": (
+            "Восстанови координаты всех unknown/partial VE/HG по known_vertices, "
+            "included_edges, изображению и видимым направлениям трубы."
+        ),
+        "known_vertices": known_vertices,
+        "partial_vertices": partial_vertices,
+        "unknown_vertices": unknown_vertices,
+        "included_edges": included_edges,
+        "rules": [
+            "Верни vertex_coordinates для каждой final_vertices.",
+            "Локально известные X/Y/Z не меняй.",
+            "Для связанных unknown вершин вычисляй координаты через included_edges и направление на изображении.",
+            "Если есть несколько вариантов направления, выбери наиболее вероятный и снизь confidence.",
+        ],
+    }
 
 
 def _unresolved_dimension_rows(dimensions: list[dict[str, Any]], page_number: int) -> list[dict[str, Any]]:
@@ -473,6 +549,7 @@ def build_pipeline_length_page(mapping: dict[str, Any], page_number: int) -> dic
         "final_vertices": final_vertices,
         "final_edges": final_edges,
         "local_vertex_coordinates": [row["local_coordinates"] for row in final_vertices],
+        "coordinate_reconstruction": _coordinate_reconstruction_payload(final_vertices, final_edges),
         "debug_source_vertices": _base_vertices(mapping),
         "debug_source_edges": _base_edges(mapping),
         "coordinates": _coordinate_rows(mapping),
@@ -528,11 +605,12 @@ def build_pipeline_length_payload(
 def build_pipeline_length_page_payload(payload: dict[str, Any], page: dict[str, Any]) -> dict[str, Any]:
     """Return a provider-sized payload for one page with line context kept compact."""
     pages = payload.get("pages") or []
+    provider_page = _compact_pipeline_length_provider_page(page)
     return {
         "analysis_type": payload.get("analysis_type", "pipeline_length"),
         "line_id": payload.get("line_id"),
         "source_name": payload.get("source_name"),
-        "pages": [page],
+        "pages": [provider_page],
         "cross_page_context": {
             "line_id": payload.get("line_id"),
             "page_order": [item.get("page") for item in pages],
@@ -613,11 +691,19 @@ def build_pipeline_length_text(payload: dict[str, Any]) -> str:
         lines.append(f"PAGE {page.get('page')}:")
         lines.append("FINAL_VERTICES: " + ", ".join(str(vertex.get("id")) for vertex in page.get("final_vertices") or page.get("vertices") or []))
         for edge in page.get("final_edges") or page.get("edges") or []:
-            candidate_ids = ",".join(str(candidate.get("candidate_key") or candidate.get("candidate_id")) for candidate in edge.get("candidates") or [])
-            lines.append(f"FINAL_EDGE {edge.get('edge_key') or edge.get('id')} {edge.get('from_vertex')} -> {edge.get('to_vertex')} type={edge.get('element_type')} handwheel={edge.get('is_handwheel_segment')} candidates={candidate_ids}")
+            candidates = edge.get("candidates") or []
+            candidate_ids = ",".join(
+                str(candidate.get("candidate_key") or candidate.get("candidate_id"))
+                if isinstance(candidate, dict) else str(candidate)
+                for candidate in candidates
+            )
+            candidate_ids = candidate_ids or ",".join(str(item) for item in edge.get("candidate_keys") or [])
+            lines.append(f"FINAL_EDGE {edge.get('edge_key') or edge.get('edge_id') or edge.get('id')} {edge.get('from_vertex')} -> {edge.get('to_vertex')} type={edge.get('element_type')} handwheel={edge.get('is_handwheel_segment')} candidates={candidate_ids}")
         for dimension in page.get("dimensions") or []:
             local = dimension.get("local_decision") or {}
-            lines.append(f"CANDIDATE {dimension.get('candidate_key')} local_id={dimension.get('id')} value_mm={dimension.get('value_mm')} final_edge={dimension.get('final_edge_id') or dimension.get('edge_id')} final_status={dimension.get('final_interval_status')} local={local.get('decision')} reason={local.get('reason')}")
+            decision = local.get("decision") if isinstance(local, dict) else local
+            reason = local.get("reason") if isinstance(local, dict) else dimension.get("local_reason")
+            lines.append(f"CANDIDATE {dimension.get('candidate_key')} local_id={dimension.get('id')} value_mm={dimension.get('value_mm')} final_edge={dimension.get('final_edge_id') or dimension.get('edge_id')} final_status={dimension.get('final_interval_status')} local={decision} reason={reason}")
         for dimension in page.get("unresolved_dimensions") or []:
             lines.append(f"UNRESOLVED {dimension.get('candidate_key')} value_mm={dimension.get('value_mm')} reason={dimension.get('final_interval_reason')}")
         for coordinate in page.get("coordinates") or []:
@@ -670,12 +756,39 @@ def _provider_failure_details(raw: dict[str, Any], choice: dict[str, Any]) -> st
     return ", ".join(parts)
 
 
+def _render_pipeline_page_image(
+    pdf_path: Path | str | None,
+    page_number: int | str | None,
+    *,
+    scale: float = 1.5,
+) -> tuple[str, bytes] | None:
+    if pdf_path is None or page_number is None:
+        return None
+    source = Path(pdf_path)
+    if not source.exists():
+        return None
+    try:
+        page_index = max(0, int(page_number) - 1)
+    except (TypeError, ValueError):
+        return None
+    with fitz.open(str(source)) as document:
+        if document.page_count <= 0:
+            return None
+        page_index = max(0, min(page_index, document.page_count - 1))
+        pixmap = document[page_index].get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+        image_bytes = pixmap.tobytes("png")
+    image_data = base64.b64encode(image_bytes).decode("ascii")
+    return f"data:image/png;base64,{image_data}", image_bytes
+
+
 def run_pipeline_length_provider(
     payload: dict[str, Any],
     api_key: str,
     model: str,
     *,
     provider: str = "deepseek",
+    pdf_path: Path | str | None = None,
+    page_number: int | str | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     revision = prompts.load_prompt_revision("pipeline_length")
@@ -686,6 +799,22 @@ def run_pipeline_length_provider(
         + prompt
     )
     request_text = json.dumps(payload, ensure_ascii=False)
+    rendered_image = _render_pipeline_page_image(pdf_path, page_number)
+    user_content: Any = request_text
+    if rendered_image is not None:
+        image_url, _image_bytes = rendered_image
+        user_content = [
+            {
+                "type": "text",
+                "text": (
+                    "PAYLOAD_JSON ниже. Используй приложенное изображение листа вместе с "
+                    "coordinate_reconstruction, included_edges и final_edges, чтобы восстановить "
+                    "координаты всех VE/HG. Не придумывай уверенные координаты без основания.\n\n"
+                    + request_text
+                ),
+            },
+            {"type": "image_url", "image_url": {"url": image_url}},
+        ]
     provider = (provider or "deepseek").strip().lower()
     if provider == "deepseek":
         if not api_key:
@@ -707,10 +836,12 @@ def run_pipeline_length_provider(
                     "model": model,
                     "temperature": 0,
                     "max_tokens": max_tokens,
+                    "thinking": {"type": "enabled"},
+                    "reasoning_effort": "low",
                     "response_format": {"type": "json_object"},
                     "messages": [
                         {"role": "system", "content": provider_prompt},
-                        {"role": "user", "content": request_text},
+                        {"role": "user", "content": user_content},
                     ],
                 },
                 timeout=_bounded_timeout("PIPELINE_LENGTH_DEEPSEEK_TIMEOUT", DEFAULT_DEEPSEEK_TIMEOUT_SECONDS),
@@ -737,9 +868,11 @@ def run_pipeline_length_provider(
             "request_max_tokens": token_attempts[0],
             "attempts": attempt_index,
             "used_max_tokens": max_tokens,
+            "image_attached": rendered_image is not None,
         }
     elif provider == "codex_cli":
         with tempfile.TemporaryDirectory(prefix="codex-pipeline-length-") as temp_dir:
+            temp_path = Path(temp_dir)
             schema_path = Path(temp_dir) / "pipeline_length_response.schema.json"
             output_path = Path(temp_dir) / "last_message.json"
             schema_path.write_text(
@@ -750,9 +883,20 @@ def run_pipeline_length_provider(
                 "--sandbox", "read-only", "--ask-for-approval", "never", "--cd", str(Path.cwd()),
                 "--output-schema", str(schema_path), "--output-last-message", str(output_path), "-",
             ]
+            if rendered_image is not None:
+                image_path = temp_path / "page.png"
+                image_path.write_bytes(rendered_image[1])
+                command.extend(["--image", str(image_path)])
             response = subprocess.run(
                 command,
-                input=("SYSTEM_PROMPT:\n" + provider_prompt + "\n\nPAYLOAD_JSON:\n" + request_text),
+                input=(
+                    "SYSTEM_PROMPT:\n"
+                    + provider_prompt
+                    + "\n\nИспользуй приложенное изображение листа вместе с coordinate_reconstruction, "
+                    "included_edges и final_edges, чтобы восстановить координаты всех VE/HG.\n\n"
+                    "PAYLOAD_JSON:\n"
+                    + request_text
+                ),
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -765,7 +909,11 @@ def run_pipeline_length_provider(
             if response.returncode != 0:
                 raise RuntimeError(f"codex CLI завершился с ошибкой {response.returncode}: {(response.stderr or output_text)[:1200]}")
             answer = _parse_json(output_text)
-            trace = {"response_raw": {"stdout": response.stdout, "stderr": response.stderr, "returncode": response.returncode}, "provider": provider}
+            trace = {
+                "response_raw": {"stdout": response.stdout, "stderr": response.stderr, "returncode": response.returncode},
+                "provider": provider,
+                "image_attached": rendered_image is not None,
+            }
     else:
         raise RuntimeError(f"Неизвестный провайдер анализа: {provider}")
     usage = (trace.get("response_raw") or {}).get("usage") or {}
@@ -797,9 +945,12 @@ def _prefix_page_id(page_number: Any, value: Any) -> Any:
 
 def _normalize_page_answer(answer: dict[str, Any], page_number: Any) -> dict[str, Any]:
     normalized = dict(answer or {})
+    normalized.setdefault("schema_version", 1)
     assessments = []
     for item in normalized.get("candidate_assessments") or []:
         row = dict(item)
+        if isinstance(row.get("local_decision"), dict):
+            row["local_decision"] = row["local_decision"].get("decision")
         candidate_id = row.get("candidate_id") or row.get("candidate_key")
         row["candidate_id"] = _prefix_page_id(page_number, candidate_id)
         row["candidate_key"] = _prefix_page_id(page_number, row.get("candidate_key") or candidate_id)
@@ -878,6 +1029,7 @@ def merge_pipeline_length_provider_traces(
     page_traces: list[dict[str, Any]],
 ) -> dict[str, Any]:
     combined_answer: dict[str, Any] = {
+        "schema_version": 2,
         "candidate_assessments": [],
         "edge_routes": [],
         "branch_routes": [],
@@ -886,6 +1038,7 @@ def merge_pipeline_length_provider_traces(
         "cross_sheet_links": [],
         "intermediate_distances": [],
         "vertex_coordinates": [],
+        "errors": [],
         "lengths": {
             "main": {"clean_length_mm": 0.0, "dirty_length_mm": 0.0, "ambiguous_length_mm": 0.0},
             "branch": {"clean_length_mm": 0.0, "dirty_length_mm": 0.0, "ambiguous_length_mm": 0.0},
@@ -895,6 +1048,7 @@ def merge_pipeline_length_provider_traces(
         },
     }
     response_raw = {"page_responses": []}
+    errors = []
     elapsed = 0.0
     prompt_tokens = completion_tokens = total_tokens = 0
     has_prompt_tokens = has_completion_tokens = has_total_tokens = False
@@ -909,12 +1063,16 @@ def merge_pipeline_length_provider_traces(
             "page": page_number,
             "provider": trace.get("provider"),
             "model": trace.get("model"),
+            "image_attached": trace.get("image_attached"),
             "elapsed_seconds": trace.get("elapsed_seconds"),
             "prompt_tokens": trace.get("prompt_tokens"),
             "completion_tokens": trace.get("completion_tokens"),
             "total_tokens": trace.get("total_tokens"),
             "response_raw": trace.get("response_raw"),
+            "error": trace.get("error"),
         })
+        if trace.get("error"):
+            errors.append({"page": page_number, "error": trace["error"]})
         elapsed += float(trace.get("elapsed_seconds") or 0.0)
         if trace.get("prompt_tokens") is not None:
             prompt_tokens += int(trace.get("prompt_tokens") or 0)
@@ -925,12 +1083,14 @@ def merge_pipeline_length_provider_traces(
         if trace.get("total_tokens") is not None:
             total_tokens += int(trace.get("total_tokens") or 0)
             has_total_tokens = True
+    combined_answer["errors"] = errors
     return {
         "answer": combined_answer,
         "payload": payload,
         "page_traces": [
             {
                 "page": ((trace.get("payload") or {}).get("pages") or [{}])[0].get("page"),
+                "image_attached": trace.get("image_attached"),
                 "elapsed_seconds": trace.get("elapsed_seconds"),
                 "prompt_tokens": trace.get("prompt_tokens"),
                 "completion_tokens": trace.get("completion_tokens"),
@@ -945,11 +1105,14 @@ def merge_pipeline_length_provider_traces(
         "prompt_source": first_trace.get("prompt_source"),
         "model": first_trace.get("model"),
         "provider": first_trace.get("provider"),
+        "image_attached": any(bool(trace.get("image_attached")) for trace in page_traces),
         "elapsed_seconds": round(elapsed, 3),
         "prompt_tokens": prompt_tokens if has_prompt_tokens else None,
         "completion_tokens": completion_tokens if has_completion_tokens else None,
         "total_tokens": total_tokens if has_total_tokens else None,
         "response_raw": response_raw,
+        "errors": errors,
+        "error": "; ".join(f"стр. {item['page']}: {item['error']}" for item in errors) if errors else None,
     }
 
 
@@ -969,22 +1132,197 @@ def build_pipeline_length_result(payload: dict[str, Any], provider_answer: dict[
     }
 
 
+def _compact_pipeline_length_provider_page(page: dict[str, Any]) -> dict[str, Any]:
+    """Keep provider context useful without sending duplicated debug geometry."""
+    vertex_rows = []
+    for vertex in page.get("final_vertices") or page.get("vertices") or []:
+        local = vertex.get("local_coordinates") or {}
+        vertex_rows.append(
+            {
+                "id": vertex.get("id"),
+                "vertex_key": vertex.get("vertex_key"),
+                "point": vertex.get("point"),
+                "role": vertex.get("role"),
+                "handwheel_id": vertex.get("handwheel_id"),
+                "coordinate_refs": vertex.get("coordinate_refs") or [],
+                "local_coordinates": {
+                    key: local.get(key)
+                    for key in (
+                        "vertex_id",
+                        "vertex_key",
+                        "page",
+                        "x",
+                        "y",
+                        "z",
+                        "confidence",
+                        "method",
+                        "source_coordinate_labels",
+                        "coordinate_refs",
+                    )
+                    if local.get(key) is not None
+                },
+            }
+        )
+
+    edge_rows = []
+    for edge in page.get("final_edges") or page.get("edges") or []:
+        edge_id = edge.get("edge_key") or edge.get("edge_id") or edge.get("id")
+        candidate_keys = [
+            candidate.get("candidate_key") or candidate.get("candidate_id")
+            for candidate in edge.get("candidates") or []
+            if candidate.get("candidate_key") or candidate.get("candidate_id")
+        ]
+        edge_rows.append(
+            {
+                key: edge.get(key)
+                for key in (
+                    "from_vertex",
+                    "to_vertex",
+                    "element_type",
+                    "is_handwheel_segment",
+                    "bridge_source",
+                )
+                if edge.get(key) is not None
+            }
+            | {"edge_id": edge_id, "candidate_keys": candidate_keys}
+        )
+
+    dimensions = []
+    for row in page.get("dimensions") or []:
+        geometry = row.get("geometry") or {}
+        compact_geometry = {
+            "leader_resolution": geometry.get("leader_resolution"),
+            "attachment_kind": geometry.get("attachment_kind"),
+            "attachment_source": geometry.get("attachment_source"),
+            "final_ray_origin": geometry.get("final_ray_origin"),
+            "final_ray_origin_kind": geometry.get("final_ray_origin_kind"),
+            "final_contact_point": geometry.get("final_contact_point"),
+            "extension_strokes": [
+                {
+                    key: stroke.get(key)
+                    for key in ("start", "end", "pipe_edge_id", "target_endpoint", "parallel_score")
+                    if stroke.get(key) is not None
+                }
+                for stroke in (geometry.get("extension_strokes") or [])[:2]
+            ],
+        }
+        local = row.get("local_decision") or {}
+        decision = local.get("decision") if isinstance(local, dict) else local
+        unresolved = row.get("final_interval_status") != "resolved" or not row.get("final_edge_id")
+        final_edge_id = row.get("final_edge_id")
+        if final_edge_id and ":" not in str(final_edge_id):
+            final_edge_id = f"{page.get('page')}:{final_edge_id}"
+        dimensions.append({
+            "candidate_key": row.get("candidate_key"),
+            "value_mm": row.get("value_mm"),
+            "text": row.get("text"),
+            "bbox": row.get("bbox"),
+            "label_center": row.get("label_center"),
+            "final_edge_id": final_edge_id,
+            "final_interval_status": row.get("final_interval_status") or "unresolved",
+            "is_unresolved": unresolved,
+            "unresolved_reason": row.get("final_interval_reason") if unresolved else None,
+            "local_decision": decision,
+            "local_reason": local.get("reason") if isinstance(local, dict) else None,
+        })
+
+    coordinate_leads = []
+    for row in page.get("coordinate_leads") or []:
+        coordinate_leads.append(
+            {
+                key: row.get(key)
+                for key in (
+                    "id",
+                    "coordinate_key",
+                    "label",
+                    "value",
+                    "coordinate_block_refs",
+                    "arrow_found",
+                    "arrow_has_arrowhead",
+                    "arrow_start",
+                    "arrow_end",
+                    "matched_vertex_id",
+                    "matched_vertex_point",
+                    "matched_vertex_gap_px",
+                )
+                if row.get(key) is not None
+            }
+        )
+
+    connections = [
+        {
+            key: row.get(key)
+            for key in ("id", "label", "center", "bbox", "target_sheet", "source_text")
+            if row.get(key) is not None
+        }
+        for row in page.get("connections") or []
+        if isinstance(row, dict)
+    ]
+    reconstruction = dict(page.get("coordinate_reconstruction") or {})
+    reconstruction["included_edges"] = []
+    for edge in page.get("final_edges") or page.get("edges") or []:
+        edge_id = edge.get("edge_key") or edge.get("edge_id") or edge.get("id")
+        for candidate in edge.get("candidates") or []:
+            if candidate.get("local_decision") != "include":
+                continue
+            reconstruction["included_edges"].append({
+                "edge_id": edge_id if ":" in str(edge_id or "") else f"{page.get('page')}:{edge_id}",
+                "from_vertex": edge.get("from_vertex"),
+                "to_vertex": edge.get("to_vertex"),
+                "value_mm": candidate.get("value_mm") or candidate.get("value") or candidate.get("length_mm"),
+            })
+    return {
+        "page": page.get("page"),
+        "final_edges": edge_rows,
+        "coordinate_reconstruction": reconstruction,
+        "coordinates": [
+            {
+                "coordinate_id": row.get("id"),
+                "label": row.get("label"),
+                "value": row.get("value"),
+                "bbox": row.get("label_bbox") or row.get("value_bbox"),
+                "attached_vertex_id": row.get("attached_vertex_id"),
+            }
+            for row in page.get("coordinates") or []
+        ],
+        "dimensions": dimensions,
+    }
+
+
+def build_pipeline_length_provider_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Build the exact compact payload sent to the provider for all pages."""
+    pages = [
+        build_pipeline_length_page_payload(payload, page)["pages"][0]
+        for page in payload.get("pages") or []
+    ]
+    return {
+        "schema_version": 2,
+        "analysis_type": payload.get("analysis_type", "pipeline_length"),
+        "line_id": payload.get("line_id"),
+        "source_name": payload.get("source_name"),
+        "pages": pages,
+        "cross_page_context": {
+            "line_id": payload.get("line_id"),
+            "page_order": [page.get("page") for page in pages],
+            "available_connections": [],
+        },
+    }
 def calculate_provider_length_summary(
     payload: dict[str, Any],
     provider: dict[str, Any],
     manual_confirmation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Calculate a separate provider-side estimate from its candidate reviews."""
+    """Calculate provider-side totals after local/provider candidate decisions."""
     assessments = {
         str(item.get("candidate_id")): item
         for item in provider.get("candidate_assessments") or []
         if item.get("candidate_id")
     }
-    routes = {}
-    for item in provider.get("edge_routes") or []:
-        edge_id = item.get("edge_id")
-        if edge_id:
-            routes[str(edge_id)] = item.get("route_type")
+    routes = {
+        str(item.get("edge_id")): item.get("route_type")
+        for item in provider.get("edge_routes") or []
+        if item.get("edge_id")
+    }
     branch_specs = provider.get("branch_routes") or provider.get("branches") or []
     branch_by_candidate: dict[str, str] = {}
     branch_by_edge: dict[str, str] = {}
@@ -1043,10 +1381,7 @@ def calculate_provider_length_summary(
             route_type = routes.get(f"{page_number}:{edge_key}", routes.get(edge_key, "main"))
             branch_id = branch_by_candidate.get(key) or branch_by_candidate.get(str(row.get("id")))
             branch_id = branch_id or branch_by_edge.get(f"{page_number}:{edge_key}") or branch_by_edge.get(edge_key)
-            if branch_id:
-                bucket = branches[branch_id]
-            else:
-                bucket = totals["branch" if route_type == "branch" else "main"]
+            bucket = branches[branch_id] if branch_id else totals["branch" if route_type == "branch" else "main"]
             value = float(row.get("value_mm") or 0.0)
             if decision == "include":
                 bucket["clean_length_mm"] += value

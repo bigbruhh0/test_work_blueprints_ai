@@ -153,6 +153,11 @@ def test_pipeline_length_payload_uses_final_vertices_and_edges():
     assert ve07["local_coordinates"]["confidence"] == 0.95
     assert page["local_vertex_coordinates"][1]["source_coordinate_labels"] == ["X=226150", "Y=45700", "Z+=773"]
     assert page["coordinate_leads"][0]["matched_vertex_id"] == "VE-07"
+    reconstruction = page["coordinate_reconstruction"]
+    assert reconstruction["known_vertices"][0]["vertex_id"] == "VE-07"
+    assert reconstruction["unknown_vertices"][0]["vertex_id"] == "HG-01-A"
+    assert reconstruction["included_edges"][0]["edge_id"] == "F-VE-07-HG-03-A"
+    assert reconstruction["included_edges"][0]["value_mm"] == 203
     dimension = next(row for row in page["dimensions"] if row["id"] == "D010")
     assert dimension["final_edge_id"] == "F-VE-07-HG-03-A"
     assert dimension["final_from_vertex"] == "VE-07"

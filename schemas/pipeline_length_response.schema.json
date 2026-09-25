@@ -3,8 +3,9 @@
   "$id": "https://test-chertezh.local/schemas/pipeline_length_response.schema.json",
   "type": "object",
   "additionalProperties": true,
-  "required": ["candidate_assessments", "edge_routes", "cross_sheet_links", "intermediate_distances", "lengths"],
+  "required": ["candidate_assessments", "unresolved_reviews", "edge_routes", "vertex_coordinates"],
   "properties": {
+    "schema_version": {"type": "integer", "const": 2},
     "candidate_assessments": {"type": "array", "items": {"type": "object", "required": ["candidate_id", "assessment"], "additionalProperties": true, "properties": {
       "candidate_id": {"type": "string"},
       "candidate_key": {"type": "string"},

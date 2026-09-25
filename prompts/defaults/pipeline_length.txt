@@ -1,61 +1,40 @@
-Ты проверяешь локальную карту размеров трубопровода по одному листу. Отвечай только компактным JSON. Все reason/name пиши на русском.
-Не рассуждай пошагово. Не выводи markdown. reason должен быть коротким.
+Ты проверяешь локальную карту трубопровода на одном листе. Отвечай только компактным JSON на русском языке. Не выводи ход рассуждений или markdown.
 
-Вход уже содержит финальную локальную геометрию:
-- final_vertices / vertices: финальные вершины VE-* и HG-*.
-- final_edges / edges: финальные отрезки F-* между VE/HG.
-- dimensions: все размерные кандидаты, уже привязанные к final_edge_id или помеченные unresolved.
-- unresolved_dimensions: кандидаты, которые локально не удалось уверенно посадить на F-*.
-- coordinates: найденные координатные подписи X/Y/Z/Z+ на листе.
-- cross_sheet_text_refs: только явные ссылки со словом ЛИСТ.
+Вход страницы содержит только:
+- coordinate_reconstruction: единственный источник вершин и координат;
+- final_edges: финальная топология VE/HG и ссылки candidate_keys;
+- dimensions: каждый размер ровно один раз;
+- coordinates: компактные подписи X/Y/Z для сверки.
 
-Твои задачи:
+Правила:
 1. Для каждого dimensions[*] верни ровно одну candidate_assessment.
-2. Обычно соглашайся с local_decision. Меняй его только при явной ошибке: вложенный/дублирующий размер, размер штурвала, размер смежного листа, явное несоответствие final_edge_id.
-3. Если assessment="accepted", proposed_decision должен быть null.
-4. Если не согласен, assessment="disputed" и proposed_decision="include|exclude|ambiguous".
-5. Если данных недостаточно, assessment="insufficient" и proposed_decision="ambiguous".
-6. Для unresolved_dimensions верни unresolved_reviews: почему размер не попал на отрезок и что проверить.
-7. Размер штурвала определяй по final_edge.is_handwheel_segment, handwheels, HG-* и выносным линиям. В reason обязательно напиши "размер штурвала". Если такой размер не должен входить в длину трубы, предложи exclude.
-8. Найди ссылки на другой лист только если в тексте есть слово "ЛИСТ" и номер. Одиночное "СМ." без "ЛИСТ" игнорируй. Для явных ссылок заполни cross_sheet_links и при наличии числовой длины intermediate_distances kind="adjacent_sheet_length".
-9. Классифицируй final_edges как main/branch/handwheel/unknown. Не используй debug_source_edges для решений, они только для справки.
-10. Для каждого final_vertices[*] верни одну vertex_coordinates. Если X/Y/Z можно надежно взять из coordinates или вывести из явных координатных подписей и размеров, заполни. Если нет, оставь x/y/z=null, confidence=0, method="не определено", reason кратко.
-11. Не восстанавливай длины по пикселям, радиусам и геометрии. Длины считаются только по явно нанесенным размерам.
+2. Обычно соглашайся с local_decision. Меняй решение только при явной ошибке.
+3. Если dimension.is_unresolved=true или final_edge_id отсутствует, не создавай новое ребро и не подбирай гипотетическую привязку. Верни unresolved_review.
+4. Если для размера нет подходящего final_edge, верни unresolved_review. Не используй старые или отсутствующие рёбра.
+5. Проверяй привязку через final_edge_id и final_edges.from_vertex/to_vertex. Не дублируй решение из другого размера.
+6. is_handwheel_segment=true означает участок штурвала, а не трубопровод. Для такого размера обычно предложи exclude. Самостоятельно штурвалы не ищи.
+7. В coordinate_reconstruction сохраняй известные координаты known_vertices без изменений.
+8. Для partial_vertices и unknown_vertices восстанавливай X/Y/Z по included_edges, value_mm и направлению трубы на приложенном изображении.
+9. Для каждого included_edge расстояние между from_vertex и to_vertex должно быть близко к value_mm с допуском 15% или 8 мм. Две разные вершины, соединённые положительным размером, не могут иметь одинаковые координаты.
+10. Не используй пиксельные координаты как мировые X/Y/Z. sheet_point нужен только для ориентации на изображении.
+11. Верни vertex_coordinates для каждой вершины из known_vertices, partial_vertices и unknown_vertices. Известные координаты не меняй.
+12. Если цепочка включённых рёбер не позволяет определить координату, верни null с короткой причиной и низким confidence.
+13. branch_routes строятся только по edge_routes и final_edges. Новые рёбра не создавай.
 
-ID:
-- candidate_id используй как во входе: candidate_key, например "216:D001".
-- edge_id используй как во входе: edge_key или final_edge_id, например "216:F-VE-07-HG-03-A".
-- vertex_id в vertex_coordinates используй локальный ID "VE-07" или "HG-03-A"; vertex_key используй "216:VE-07".
-
-Верни минимальный JSON:
+Формат ответа:
 {
+  "schema_version": 2,
   "candidate_assessments": [
     {"candidate_id":"216:D001","candidate_key":"216:D001","local_decision":"include","assessment":"accepted","proposed_decision":null,"target_final_edge_id":"216:F-VE-01-VE-02","reason":"согласен"}
   ],
   "unresolved_reviews": [
-    {"candidate_id":"216:D009","candidate_key":"216:D009","status":"needs_manual_check","reason":"луч не попал на финальный отрезок","suggested_action":"проверить выносные линии"}
+    {"candidate_id":"216:D009","candidate_key":"216:D009","status":"needs_manual_check","reason":"размер не привязан к финальному ребру","suggested_action":"проверить локальную привязку"}
   ],
   "edge_routes": [
     {"edge_id":"216:F-VE-01-VE-02","route_type":"main","reason":"основной ход"}
   ],
-  "branch_routes": [
-    {"branch_id":"BR-01","name":"ответвление","junction_vertex_id":"VE-01","endpoint_vertex_id":"VE-09","edge_ids":["216:F-VE-03-VE-04"],"candidate_ids":["216:D004"],"reason":"явное ответвление"}
-  ],
-  "route_segments": [],
-  "cross_sheet_links": [
-    {"page":216,"target_page":217,"source_text":"СМ. ЛИСТ 2","bbox":[0,0,0,0],"reason":"явная ссылка ЛИСТ"}
-  ],
-  "intermediate_distances": [
-    {"kind":"adjacent_sheet_length","from_page":216,"to_page":217,"value_mm":0.0,"source":"216:D001","reason":"размер относится к другому листу","confidence":0.0}
-  ],
+  "branch_routes": [],
   "vertex_coordinates": [
-    {"vertex_id":"VE-01","vertex_key":"216:VE-01","page":216,"x":null,"y":null,"z":null,"source_coordinate_labels":[],"confidence":0.0,"method":"не определено","reason":"нет надежной координатной привязки"}
-  ],
-  "lengths": {
-    "main":{"clean_length_mm":0.0,"dirty_length_mm":0.0,"ambiguous_length_mm":0.0},
-    "branch":{"clean_length_mm":0.0,"dirty_length_mm":0.0,"ambiguous_length_mm":0.0},
-    "total_clean_length_mm":0.0,
-    "total_dirty_length_mm":0.0,
-    "total_ambiguous_length_mm":0.0
-  }
+    {"vertex_id":"VE-01","vertex_key":"216:VE-01","page":216,"x":26000,"y":86380,"z":22863,"source_coordinate_labels":["X=26000","Y=86380","Z+=22863"],"confidence":0.95,"method":"local_coordinate_lead","reason":"известно локально"}
+  ]
 }

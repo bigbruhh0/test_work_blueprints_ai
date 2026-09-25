@@ -20,7 +20,7 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from src import db as run_db
+from src import db as run_db, prompts
 from src.dimension_mapping import (
     _handwheel_details,
     attach_coordinate_leads,
@@ -36,7 +36,7 @@ from src.dimension_mapping import (
     save_skeleton_pdf,
 )
 from src.dimension_review import build_map_text, calculate_lengths, codex_login_command, codex_login_status, review_map_with_provider
-from src.pipeline_length import build_pipeline_length_page_payload, build_pipeline_length_payload, build_pipeline_length_result, build_pipeline_length_text, calculate_provider_length_summary, merge_pipeline_length_provider_traces, run_pipeline_length_provider
+from src.pipeline_length import build_pipeline_length_page_payload, build_pipeline_length_payload, build_pipeline_length_provider_payload, build_pipeline_length_result, build_pipeline_length_text, calculate_provider_length_summary, merge_pipeline_length_provider_traces, run_pipeline_length_provider
 from src.eval_data import aggregate_eval_results, evaluate_line_for_prompt, list_eval_groups, summarize_prompt_eval_rows
 from src.pdf_groups import get_pdf_cache_status, prepare_pdf_groups
 from src.prepare_stage import run_prepare
@@ -949,6 +949,7 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
             try:
                 line.events.append({"time": now(), "stage": "pipeline_length", "message": "сбор payload по всем листам линии"})
                 payload = build_pipeline_length_payload(line.line_id, run.source_name, local_pages)
+                provider_payload = build_pipeline_length_provider_payload(payload)
                 line.analysis = {
                     "pipeline_length": {
                         "payload_summary": {
@@ -962,16 +963,66 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                 payload_path = line_dir / f"{Path(run.source_name).stem}_{line.line_id}_pipeline_length_payload.json"
                 text_path = line_dir / f"{Path(run.source_name).stem}_{line.line_id}_pipeline_length.txt"
                 response_path = line_dir / f"{Path(run.source_name).stem}_{line.line_id}_pipeline_length_response.json"
-                payload_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-                text_path.write_text(build_pipeline_length_text(payload), encoding="utf-8")
+                payload_path.write_text(json.dumps(provider_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                text_path.write_text(build_pipeline_length_text(provider_payload), encoding="utf-8")
                 line.events.append({"time": now(), "stage": "pipeline_length", "message": f"отправка payload провайдеру по листам ({provider})"})
                 _persist(run)
                 page_traces = []
                 for page in payload.get("pages") or []:
                     page_payload = build_pipeline_length_page_payload(payload, page)
+                    page_number = page.get("page")
+                    page_run = line.page_results.get(int(page_number)) if str(page_number).isdigit() else None
+                    page_prefix = f"{Path(run.source_name).stem}_{line.line_id}_лист{page_number}_pipeline_length"
+                    page_payload_path = line_dir / f"{page_prefix}_payload.json"
+                    page_prompt_path = line_dir / f"{page_prefix}_prompt.txt"
+                    page_response_path = line_dir / f"{page_prefix}_response.json"
+                    page_payload_path.write_text(json.dumps(page_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                    prompt_revision = prompts.load_prompt_revision("pipeline_length")
+                    page_prompt_path.write_text(prompt_revision["text"], encoding="utf-8")
                     line.events.append({"time": now(), "stage": "pipeline_length", "message": f"лист {page.get('page')}: запрос провайдеру"})
                     _persist(run)
-                    page_trace = run_pipeline_length_provider(page_payload, api_key, model, provider=provider)
+                    try:
+                        page_trace = run_pipeline_length_provider(
+                            page_payload,
+                            api_key,
+                            model,
+                            provider=provider,
+                            pdf_path=pdf_path,
+                            page_number=page.get("page"),
+                        )
+                    except Exception as error:  # noqa: BLE001
+                        error_text = str(error)
+                        page_trace = {
+                            "answer": {"error": error_text},
+                            "error": error_text,
+                            "status": "error",
+                            "provider": provider,
+                            "model": model,
+                            "payload": page_payload,
+                            "prompt": prompt_revision["text"],
+                            "prompt_name": prompt_revision["name"],
+                            "prompt_version": prompt_revision["version"],
+                            "prompt_sha256": prompt_revision["sha256"],
+                            "prompt_source": prompt_revision["source"],
+                        }
+                        line.events.append({"time": now(), "stage": "pipeline_length", "message": f"лист {page_number}: ошибка провайдера: {error_text}"})
+                    page_response_path.write_text(json.dumps(page_trace, ensure_ascii=False, indent=2), encoding="utf-8")
+                    if page_run is not None:
+                        page_run.provider_trace = page_trace
+                        page_run.prompt_revision = {
+                            "name": prompt_revision["name"],
+                            "version": prompt_revision["version"],
+                            "sha256": prompt_revision["sha256"],
+                            "source": prompt_revision["source"],
+                        }
+                        page_run.files.update({
+                            "pipeline_length_payload_json": page_payload_path.name,
+                            "pipeline_length_prompt_txt": page_prompt_path.name,
+                            "pipeline_length_response_json": page_response_path.name,
+                        })
+                        if page_trace.get("error"):
+                            page_run.status = "error"
+                            page_run.error = page_trace["error"]
                     page_traces.append(page_trace)
                     line.events.append({
                         "time": now(),
@@ -979,7 +1030,7 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                         "message": f"лист {page.get('page')}: ответ получен за {page_trace.get('elapsed_seconds')} с",
                     })
                     _persist(run)
-                trace = merge_pipeline_length_provider_traces(payload, page_traces)
+                trace = merge_pipeline_length_provider_traces(provider_payload, page_traces)
                 line.events.append({"time": now(), "stage": "pipeline_length", "message": "ответы провайдера по листам собраны, разбор результата"})
                 result = build_pipeline_length_result(payload, trace["answer"])
                 response_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -992,9 +1043,16 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                 }
                 for page_run in line.page_results.values():
                     page_run.stage = "pipeline_length"
-                    page_run.status = "complete"
-                    page_run.events.append({"time": now(), "stage": "pipeline_length", "message": "расчет линии готов, предложения требуют ручного подтверждения"})
-                line.status = "complete"
+                    if page_run.error:
+                        page_run.status = "error"
+                        page_run.events.append({"time": now(), "stage": "pipeline_length", "message": f"ошибка провайдера сохранена вместе с payload и промптом: {page_run.error}"})
+                    else:
+                        page_run.status = "complete"
+                        page_run.events.append({"time": now(), "stage": "pipeline_length", "message": "расчет линии готов, предложения требуют ручного подтверждения"})
+                page_errors = [page_run.error for page_run in line.page_results.values() if page_run.error]
+                line.status = "error" if page_errors else "complete"
+                if page_errors:
+                    line.error = "; ".join(page_errors)
             except Exception as error:  # noqa: BLE001
                 line.status = "error"
                 line.error = str(error)
@@ -1573,16 +1631,18 @@ def export_review_data(run_id: str) -> StreamingResponse:
                     f"лист{_safe_export_part(page_number)}",
                 ])
                 files = page.get("files") or {}
-                markup_name = files.get("clean_local_markup_pdf")
+                # Review-data must contain the complete local annotation layer,
+                # including all diagnostic overlays, not the reduced clean view.
+                markup_name = files.get("local_markup_overview_pdf") or files.get("clean_local_markup_pdf")
                 markup_path = ARTIFACTS_DIR / run_id / line_id / markup_name if markup_name else None
                 if markup_path and markup_path.exists():
                     images = pdf_pages_to_png(markup_path, max_pages=1, zoom=1.6)
                     if images:
-                        archive.writestr(f"{prefix}_локальная-разметка_{timestamp}.png", images[0])
+                        archive.writestr(f"{prefix}_вся-локальная-разметка_{timestamp}.png", images[0])
                     else:
-                        archive.writestr(f"{prefix}_локальная-разметка-missing_{timestamp}.txt", "Не удалось отрисовать PDF разметки в PNG.")
+                        archive.writestr(f"{prefix}_вся-локальная-разметка-missing_{timestamp}.txt", "Не удалось отрисовать PDF разметки в PNG.")
                 else:
-                    archive.writestr(f"{prefix}_локальная-разметка-missing_{timestamp}.txt", "Файл локальной разметки не найден.")
+                    archive.writestr(f"{prefix}_вся-локальная-разметка-missing_{timestamp}.txt", "Файл полной локальной разметки не найден.")
 
                 review = ((page.get("analysis") or {}).get("dimension_review") or {})
                 trace = page.get("provider_trace") or {}

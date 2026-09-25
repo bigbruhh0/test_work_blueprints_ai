@@ -737,6 +737,9 @@ def _ray_segment_near_miss(
 
 
 EXTENSION_VERTEX_MAX_PROJECTION_PX = 90.0
+# A near-miss is allowed a little more room than its side tolerance, but a
+# distant near-miss is usually a ray hitting an unrelated contour segment.
+EXTENSION_VERTEX_MAX_NEAR_MISS_PROJECTION_PX = 32.0
 EXTENSION_VERTEX_MERGE_PX = 9.0
 EXTENSION_VERTEX_REPLACE_PX = 11.0
 EXTENSION_VERTEX_NEAR_MISS_PX = 16.0
@@ -904,6 +907,8 @@ def _extension_vertex_candidate_for_stroke(
             if near_candidate is None:
                 continue
             distance, point, side_gap = near_candidate
+            if distance > EXTENSION_VERTEX_MAX_NEAR_MISS_PROJECTION_PX:
+                continue
             score = (1, edge_rank, ray_priority, side_gap, abs(distance))
             row = (score, distance, point, side_gap, edge, option_start, ray_source)
             if best_hit is None or row[0] < best_hit[0]:
@@ -1058,6 +1063,8 @@ def compute_extension_vertices(mapping: dict[str, Any]) -> list[dict[str, Any]]:
                     if near_candidate is None:
                         continue
                     distance, point, side_gap = near_candidate
+                    if distance > EXTENSION_VERTEX_MAX_NEAR_MISS_PROJECTION_PX:
+                        continue
                     score = (1, edge_rank, ray_priority, side_gap, abs(distance))
                     row = (score, distance, point, side_gap, edge, option_start, ray_source, option_direction)
                     if best_hit is None or row[0] < best_hit[0]:
@@ -3325,6 +3332,78 @@ EDGE_SPLIT_MIN_PART_PX = 2.0
 FINAL_VERTEX_ON_CONTOUR_PX = 14.0
 
 
+def _drop_unanchored_extension_vertices(mapping: dict[str, Any]) -> None:
+    """Drop extension vertices that do not sit on a detected pipe vertex.
+
+    A real dimension endpoint is anchored either on an existing pipe vertex
+    (corner/junction/endpoint) or on a handwheel.  An extension vertex that
+    matches no detected vertex is a projection artefact -- typically a piece
+    of the pipe contour used as an extension line on a dimension whose other
+    side lies directly on the contour.  Keeping it only injects a bogus node
+    and splits a straight run.
+    """
+    final_vertices = mapping.get("final_vertices") or []
+    source_vertices = mapping.get("vertices") or []
+    if not final_vertices or not source_vertices:
+        return
+    anchors = [
+        (float(vertex.get("x", 0.0)), float(vertex.get("y", 0.0)))
+        for vertex in source_vertices
+    ]
+    kept: list[dict[str, Any]] = []
+    for vertex in final_vertices:
+        if vertex.get("handwheel_id") or vertex.get("vertex_source") == "handwheel":
+            kept.append(vertex)
+            continue
+        point = vertex.get("point")
+        if not (isinstance(point, list) and len(point) >= 2):
+            kept.append(vertex)
+            continue
+        point_tuple = (float(point[0]), float(point[1]))
+        anchored = bool(vertex.get("replaces_vertex_ids")) or any(
+            _point_distance(point_tuple, anchor) <= EXTENSION_VERTEX_NODE_SNAP_DISTANCE_PX
+            for anchor in anchors
+        )
+        projection_gap = float(vertex.get("projection_gap_px")) if vertex.get("projection_gap_px") is not None else float("inf")
+        # Keep a close, geometrically strong extension intersection even when
+        # the raw vertex detector missed the same point. A distant point is
+        # still an annotation/contour false positive and must be removed.
+        if anchored or projection_gap <= EXTENSION_VERTEX_MAX_NEAR_MISS_PROJECTION_PX:
+            kept.append(vertex)
+    mapping["final_vertices"] = kept
+
+
+def _resolve_final_interval_conflicts(mapping: dict[str, Any]) -> None:
+    """Drop duplicate candidates that the local filter already marked covered.
+
+    When several dimensions land on the same final interval and at least one is
+    included, an extra candidate that was locally excluded as
+    ``covered_by_larger_dimension_on_same_section`` is a duplicate of the
+    included one.  Keeping it would double the interval in the payload, so it
+    is detached from the interval and marked unresolved.
+    """
+    dimensions = mapping.get("dimensions") or []
+    by_interval: dict[str, list[dict[str, Any]]] = {}
+    for dimension in dimensions:
+        if dimension.get("final_interval_status") != "resolved" or not dimension.get("final_interval_id"):
+            continue
+        by_interval.setdefault(str(dimension["final_interval_id"]), []).append(dimension)
+    for interval_dimensions in by_interval.values():
+        included = [item for item in interval_dimensions if item.get("local_filter_decision") == "include"]
+        if not included:
+            continue
+        for dimension in interval_dimensions:
+            if dimension in included:
+                continue
+            if dimension.get("local_filter_reason") != "covered_by_larger_dimension_on_same_section":
+                continue
+            dimension["final_interval_status"] = "unresolved"
+            dimension["final_interval_reason"] = "covered_by_included_dimension_on_final_interval"
+            dimension["final_interval_id"] = None
+            dimension["final_from_vertex"] = None
+            dimension["final_to_vertex"] = None
+
+
 def split_edges_by_final_vertices(mapping: dict[str, Any]) -> list[dict[str, Any]]:
     """Build final VE/HG intervals from raw pipe geometry.
 
@@ -3335,11 +3414,13 @@ def split_edges_by_final_vertices(mapping: dict[str, Any]) -> list[dict[str, Any
     source_edges = list(mapping.get("edges") or [])
     mapping["parent_edges"] = source_edges
     mapping["source_edges"] = source_edges
+    _drop_unanchored_extension_vertices(mapping)
     _build_final_contour(mapping)
     segments = list(mapping.get("final_contour") or [])
     mapping["edge_segments"] = segments
     mapping["edges"] = segments
     _assign_dimensions_to_final_intervals(mapping)
+    _resolve_final_interval_conflicts(mapping)
     _build_final_edge_candidate_groups(mapping)
     return segments
 

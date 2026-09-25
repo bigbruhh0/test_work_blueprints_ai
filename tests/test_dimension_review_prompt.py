@@ -8,7 +8,7 @@ import fitz
 
 from src.dimension_mapping import _dimension_hints_from_text, _first_arrow_third, _handwheel_arrow_segments, _handwheel_details, _handwheel_text_rects, _is_rectangle_side, _same_directed_contour, apply_local_dimension_filter, compute_endpoint_adjustments, compute_extension_vertices, save_clean_local_markup_pdf, save_local_dimension_filter_pdf, save_preprocess_annotation_pdf
 from src.dimension_mapping import _direct_dimension_stroke_from_label, _fallback_leader_stroke_from_label, _find_extension_strokes, _merge_dimension_stroke, _resolve_leader_target
-from src.dimension_mapping import _annotation_arrow_segments, _final_contour_ray_for_dimension, _glyph_pipe_vertex_rows, _handwheel_glyph_parallelograms, _handwheel_glyph_rows, _reserved_annotation_strokes, annotate_valve_edges, compute_final_vertices, split_edges_by_final_vertices
+from src.dimension_mapping import _annotation_arrow_segments, _drop_unanchored_extension_vertices, _final_contour_ray_for_dimension, _glyph_pipe_vertex_rows, _handwheel_glyph_parallelograms, _handwheel_glyph_rows, _reserved_annotation_strokes, _resolve_final_interval_conflicts, annotate_valve_edges, compute_final_vertices, split_edges_by_final_vertices
 from src.dimension_review import build_review_payload
 
 
@@ -1041,6 +1041,61 @@ class DimensionRuleTests(unittest.TestCase):
         self.assertEqual(first["final_to_vertex"], "VE-02")
         self.assertEqual(first["final_interval_status"], "resolved")
         self.assertEqual(first["final_contact_point"], [50.0, 100.0])
+
+    def test_split_drops_extension_vertex_without_source_anchor(self) -> None:
+        mapping = {
+            "vertices": [
+                {"id": "V05", "role": "corner", "x": 209.58, "y": 354.75},
+            ],
+            "final_vertices": [
+                {
+                    "id": "VE-05",
+                    "point": [209.58, 354.75],
+                    "vertex_source": "extension",
+                    "replaces_vertex_ids": ["V05"],
+                },
+                {
+                    "id": "VE-07",
+                    "point": [300.0, 298.77],
+                    "vertex_source": "extension",
+                },
+            ],
+        }
+
+        _drop_unanchored_extension_vertices(mapping)
+
+        self.assertEqual([vertex["id"] for vertex in mapping["final_vertices"]], ["VE-05"])
+
+    def test_final_interval_conflict_drops_covered_duplicate(self) -> None:
+        mapping = {
+            "dimensions": [
+                {
+                    "id": "D007",
+                    "local_filter_decision": "include",
+                    "final_interval_status": "resolved",
+                    "final_interval_id": "F-VE-05-VE-06",
+                    "final_from_vertex": "VE-05",
+                    "final_to_vertex": "VE-06",
+                },
+                {
+                    "id": "D006",
+                    "local_filter_decision": "exclude",
+                    "local_filter_reason": "covered_by_larger_dimension_on_same_section",
+                    "final_interval_status": "resolved",
+                    "final_interval_id": "F-VE-05-VE-06",
+                    "final_from_vertex": "VE-05",
+                    "final_to_vertex": "VE-06",
+                },
+            ],
+        }
+
+        _resolve_final_interval_conflicts(mapping)
+
+        by_id = {dimension["id"]: dimension for dimension in mapping["dimensions"]}
+        self.assertEqual(by_id["D007"]["final_interval_status"], "resolved")
+        self.assertEqual(by_id["D006"]["final_interval_status"], "unresolved")
+        self.assertEqual(by_id["D006"]["final_interval_reason"], "covered_by_included_dimension_on_final_interval")
+        self.assertIsNone(by_id["D006"]["final_interval_id"])
 
     def test_final_ray_is_parallel_and_one_and_half_extension_lengths(self) -> None:
         ray = _final_contour_ray_for_dimension(
