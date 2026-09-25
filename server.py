@@ -963,6 +963,29 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                 payload_path = line_dir / f"{Path(run.source_name).stem}_{line.line_id}_pipeline_length_payload.json"
                 text_path = line_dir / f"{Path(run.source_name).stem}_{line.line_id}_pipeline_length.txt"
                 response_path = line_dir / f"{Path(run.source_name).stem}_{line.line_id}_pipeline_length_response.json"
+                axis_log_path = line_dir / f"{Path(run.source_name).stem}_{line.line_id}_axis_sign.jsonl"
+                axis_log_rows = []
+                for page in payload.get("pages") or []:
+                    reconstruction = page.get("coordinate_reconstruction") or {}
+                    diagnostics = reconstruction.get("_axis_sign_diagnostics") or []
+                    for item in diagnostics:
+                        axis_log_rows.append(json.dumps({"run_id": run.run_id, "page": page.get("page"), **item}, ensure_ascii=False))
+                    axis_log_rows.append(json.dumps({
+                        "run_id": run.run_id,
+                        "page": page.get("page"),
+                        "rule": "summary",
+                        "edges_total": len(diagnostics),
+                        "axis_filled": sum(1 for item in diagnostics if item.get("axis") is not None),
+                        "axis_null": sum(1 for item in diagnostics if item.get("axis") is None),
+                        "inconsistent": sum(1 for item in diagnostics if item.get("inconsistent")),
+                        "ambiguous": sum(1 for item in diagnostics if item.get("ambiguous")),
+                    }, ensure_ascii=False))
+                    axis_log_rows.append(json.dumps({
+                        "run_id": run.run_id,
+                        "page": page.get("page"),
+                        "axis_map": reconstruction.get("_axis_map") or {},
+                    }, ensure_ascii=False))
+                axis_log_path.write_text("\n".join(axis_log_rows) + ("\n" if axis_log_rows else ""), encoding="utf-8")
                 payload_path.write_text(json.dumps(provider_payload, ensure_ascii=False, indent=2), encoding="utf-8")
                 text_path.write_text(build_pipeline_length_text(provider_payload), encoding="utf-8")
                 line.events.append({"time": now(), "stage": "pipeline_length", "message": f"отправка payload провайдеру по листам ({provider})"})
@@ -1040,6 +1063,7 @@ def _run_pipeline(run_id: str, context: dict[str, Any]) -> None:
                     "pipeline_length_payload_json": payload_path.name,
                     "pipeline_length_text": text_path.name,
                     "pipeline_length_response_json": response_path.name,
+                    "pipeline_length_axis_sign_jsonl": axis_log_path.name,
                 }
                 for page_run in line.page_results.values():
                     page_run.stage = "pipeline_length"

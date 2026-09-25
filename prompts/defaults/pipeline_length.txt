@@ -6,6 +6,14 @@
 - dimensions: каждый размер ровно один раз;
 - coordinates: компактные подписи X/Y/Z для сверки.
 
+В coordinate_reconstruction.included_edges уже переданы value_mm, path_points, axis и sign.
+axis/sign определены локальным кодом и являются основным направлением ребра:
+- axis: X, Y, Z или null;
+- sign "+": coordinate(to) = coordinate(from) + value_mm;
+- sign "-": coordinate(to) = coordinate(from) - value_mm;
+- axis/sign=null означает, что направление не доказано. Не угадывай его по пикселям.
+path_points используй только для визуальной проверки направления, не как мировые координаты.
+
 Правила:
 1. Для каждого dimensions[*] верни ровно одну candidate_assessment.
 2. Обычно соглашайся с local_decision. Меняй решение только при явной ошибке.
@@ -14,12 +22,13 @@
 5. Проверяй привязку через final_edge_id и final_edges.from_vertex/to_vertex. Не дублируй решение из другого размера.
 6. is_handwheel_segment=true означает участок штурвала, а не трубопровод. Для такого размера обычно предложи exclude. Самостоятельно штурвалы не ищи.
 7. В coordinate_reconstruction сохраняй известные координаты known_vertices без изменений.
-8. Для partial_vertices и unknown_vertices восстанавливай X/Y/Z по included_edges, value_mm и направлению трубы на приложенном изображении.
+8. Для partial_vertices и unknown_vertices восстанавливай X/Y/Z по included_edges, value_mm, axis и sign. Проходи по цепочкам included_edges от ближайших known_vertices. Не перебирай оси, если axis/sign уже заданы.
 9. Для каждого included_edge расстояние между from_vertex и to_vertex должно быть близко к value_mm с допуском 15% или 8 мм. Две разные вершины, соединённые положительным размером, не могут иметь одинаковые координаты.
 10. Не используй пиксельные координаты как мировые X/Y/Z. sheet_point нужен только для ориентации на изображении.
 11. Верни vertex_coordinates для каждой вершины из known_vertices, partial_vertices и unknown_vertices. Известные координаты не меняй.
-12. Если цепочка включённых рёбер не позволяет определить координату, верни null с короткой причиной и низким confidence.
+12. Если axis/sign=null, цепочка не связана с known_vertices или есть inconsistent/ambiguous, верни null с короткой причиной и низким confidence. Не копируй координаты соседней вершины.
 13. branch_routes строятся только по edge_routes и final_edges. Новые рёбра не создавай.
+14. Верни vertex_coordinates для всех вершин, но локально известные координаты и координаты с method="local_coordinate_solver" не изменяй. Для них можно вернуть assessment, но не новое значение.
 
 Формат ответа:
 {

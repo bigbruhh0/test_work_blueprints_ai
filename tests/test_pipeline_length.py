@@ -6,10 +6,74 @@ from jsonschema import Draft202012Validator
 from src.dimension_mapping import map_dimensions, save_pipeline_length_diagnostic_pdf
 from src.pipeline_length import (
     build_pipeline_length_payload,
+    build_pipeline_length_provider_payload,
     build_pipeline_length_result,
     calculate_local_length_summary,
     merge_pipeline_length_provider_traces,
+    _included_edge_axis_metadata,
 )
+
+
+def test_provider_payload_includes_axis_sign_and_path_points_for_included_edges():
+    mapping = {
+        "final_vertices": [
+            {"id": "VE-01", "point": [10.0, 10.0], "local_coordinates": {"x": 100, "y": 200, "z": 300}},
+            {"id": "VE-02", "point": [10.0, 110.0], "local_coordinates": {"x": 100, "y": 200, "z": 1300}},
+        ],
+        "coordinate_leads": [
+            {"id": "C001", "label": "X", "value": "100", "matched_vertex_id": "VE-01"},
+            {"id": "C002", "label": "Y", "value": "200", "matched_vertex_id": "VE-01"},
+            {"id": "C003", "label": "Z+", "value": "300", "matched_vertex_id": "VE-01"},
+            {"id": "C004", "label": "X", "value": "100", "matched_vertex_id": "VE-02"},
+            {"id": "C005", "label": "Y", "value": "200", "matched_vertex_id": "VE-02"},
+            {"id": "C006", "label": "Z+", "value": "1300", "matched_vertex_id": "VE-02"},
+        ],
+        "final_contour": [{
+            "id": "F-VE-01-VE-02", "from_vertex": "VE-01", "to_vertex": "VE-02",
+            "start": [10.0, 10.0], "end": [10.0, 110.0], "path_points": [[10.0, 10.0], [10.0, 110.0]],
+        }],
+        "final_edge_candidate_groups": [{
+            "edge_id": "F-VE-01-VE-02",
+            "candidates": [{"candidate_id": "D001", "value_mm": 1000}],
+        }],
+        "dimensions": [{"id": "D001", "value": 1000, "local_filter_decision": "include", "final_interval_status": "resolved", "final_interval_id": "F-VE-01-VE-02"}],
+    }
+    payload = build_pipeline_length_provider_payload(build_pipeline_length_payload("L-1", "drawing.pdf", [(217, mapping)]))
+    edge = payload["pages"][0]["coordinate_reconstruction"]["included_edges"][0]
+    assert edge["axis"] == "Z"
+    assert edge["sign"] == "-"
+    assert edge["path_points"] == [[10.0, 10.0], [10.0, 110.0]]
+    assert "_axis_map" not in payload["pages"][0]["coordinate_reconstruction"]
+
+
+def test_axis_detection_keeps_axis_for_negative_direction():
+    vertices = [
+        {"id": "VE-01", "point": [0.0, 0.0], "local_coordinates": {"x": 0, "y": 0, "z": 0}},
+        {"id": "VE-02", "point": [0.0, 100.0], "local_coordinates": {"x": 0, "y": 0, "z": 1000}},
+        {"id": "VE-03", "point": [0.0, -100.0], "local_coordinates": {"x": None, "y": None, "z": None}},
+    ]
+    edges = [
+        {"id": "F-VE-01-VE-02", "from_vertex": "VE-01", "to_vertex": "VE-02", "path_points": [[0.0, 0.0], [0.0, 100.0]], "candidates": [{"value_mm": 1000, "local_decision": "include"}]},
+        {"id": "F-VE-01-VE-03", "from_vertex": "VE-01", "to_vertex": "VE-03", "path_points": [[0.0, 0.0], [0.0, -100.0]], "candidates": [{"value_mm": 1000, "local_decision": "include"}]},
+    ]
+    included, _diagnostics, _axis_map = _included_edge_axis_metadata(vertices, edges)
+    assert [(row["axis"], row["sign"]) for row in included] == [("Z", "-"), ("Z", "+")]
+
+
+def test_axis_detection_works_without_known_coordinate_pairs():
+    vertices = [
+        {"id": "VE-01", "point": [100.0, 100.0], "local_coordinates": {"x": 10, "y": 20, "z": 30}},
+        {"id": "VE-02", "point": [160.0, 40.0], "local_coordinates": {"x": None, "y": None, "z": None}},
+        {"id": "VE-03", "point": [220.0, 100.0], "local_coordinates": {"x": None, "y": None, "z": None}},
+    ]
+    edges = [
+        {"id": "F-VE-01-VE-02", "from_vertex": "VE-01", "to_vertex": "VE-02", "path_points": [[100.0, 100.0], [160.0, 40.0]], "candidates": [{"value_mm": 100, "local_decision": "include"}]},
+        {"id": "F-VE-02-VE-03", "from_vertex": "VE-02", "to_vertex": "VE-03", "path_points": [[160.0, 40.0], [220.0, 100.0]], "candidates": [{"value_mm": 100, "local_decision": "include"}]},
+    ]
+    included, diagnostics, axis_map = _included_edge_axis_metadata(vertices, edges)
+    assert [(row["axis"], row["sign"]) for row in included] == [("X", "+"), ("Y", "-")]
+    assert axis_map["X"]["sheet_dx"] == 1.0
+    assert all(item["axis"] is not None for item in diagnostics)
 
 
 def test_excel_export_rows_include_human_review_tables_and_source_links():

@@ -1285,7 +1285,8 @@ function combinedGraphForLine(line) {
           coordinate_source: hasLocalXYZ ? (localCoordinates.method || 'local') : (useProviderXYZ ? 'provider' : 'sheet_position'),
           coordinate_confidence: hasLocalXYZ ? (localCoordinates.confidence || 0) : (useProviderXYZ ? providerCoordinate.confidence : 0),
           coordinate_unknown: !hasKnownXYZ,
-          coordinate_uncertain: useProviderXYZ && Number(providerCoordinate.confidence) < 0.5,
+          coordinate_uncertain: (hasLocalXYZ && Number(localCoordinates.confidence || 0) < 0.5)
+            || (useProviderXYZ && Number(providerCoordinate.confidence) < 0.5),
           coordinate_reason: hasLocalXYZ ? (localCoordinates.reason || 'локальные координаты') : (useProviderXYZ ? providerCoordinate.reason : 'координаты X/Y/Z не подтверждены'),
         });
         nodes.set(id, node);

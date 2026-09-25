@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 import re
 import subprocess
@@ -281,6 +282,242 @@ def _local_vertex_coordinates(
     }
 
 
+AXIS_NAMES = ("X", "Y", "Z")
+AXIS_MATCH_TOLERANCE_MM = 10.0
+AXIS_MATCH_TOLERANCE_RATIO = 0.05
+AXIS_PATH_ENDPOINT_TOLERANCE_PX = 5.0
+AXIS_SIMILARITY_THRESHOLD = 0.7
+AXIS_SIMILARITY_AMBIGUITY_GAP = 0.1
+
+# Projection of the world axes on the sheet for the CO_0031 isometric series.
+# The vectors describe the positive direction; the sign is determined from the
+# dot product for each individual edge.
+FIXED_SHEET_AXIS_MAP: dict[str, dict[str, float]] = {
+    "X": {"sheet_dx": 1.0, "sheet_dy": -1.0},   # right and up
+    "Y": {"sheet_dx": -1.0, "sheet_dy": -1.0},  # left and up
+    "Z": {"sheet_dx": 0.0, "sheet_dy": -1.0},   # up
+}
+
+
+def _axis_vertex_rows(final_vertices: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    rows = {}
+    for vertex in final_vertices:
+        vertex_id = vertex.get("id")
+        if not vertex_id:
+            continue
+        local = vertex.get("local_coordinates") or {}
+        point = vertex.get("point") or []
+        rows[str(vertex_id)] = {
+            "id": str(vertex_id),
+            "x": local.get("x"),
+            "y": local.get("y"),
+            "z": local.get("z"),
+            "sheet_point": point[:2] if isinstance(point, list) else None,
+        }
+    return rows
+
+
+def _axis_value_matches(delta: Any, value_mm: Any) -> bool:
+    try:
+        delta_value = abs(float(delta))
+        expected = abs(float(value_mm))
+    except (TypeError, ValueError):
+        return False
+    tolerance = max(AXIS_MATCH_TOLERANCE_MM, expected * AXIS_MATCH_TOLERANCE_RATIO)
+    return abs(delta_value - expected) <= tolerance
+
+
+def _edge_path_points(edge: dict[str, Any]) -> list[list[float]]:
+    points = edge.get("path_points") or []
+    return [
+        [float(point[0]), float(point[1])]
+        for point in points
+        if isinstance(point, (list, tuple)) and len(point) >= 2
+    ]
+
+
+def _axis_map_from_known_edges(
+    included: list[dict[str, Any]],
+    vertices: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, float] | None]:
+    vectors: dict[str, list[tuple[float, float]]] = {axis: [] for axis in AXIS_NAMES}
+    for edge in included:
+        source = vertices.get(str(edge.get("from_vertex")))
+        target = vertices.get(str(edge.get("to_vertex")))
+        if not source or not target or not all(source.get(axis.lower()) is not None and target.get(axis.lower()) is not None for axis in AXIS_NAMES):
+            continue
+        value = edge.get("value_mm")
+        diffs = {axis: float(target[axis.lower()]) - float(source[axis.lower()]) for axis in AXIS_NAMES}
+        matches = [axis for axis in AXIS_NAMES if _axis_value_matches(diffs[axis], value)]
+        if len(matches) != 1:
+            continue
+        axis = matches[0]
+        points = _edge_path_points(edge)
+        if len(points) < 2:
+            continue
+        source_point = source.get("sheet_point")
+        target_point = target.get("sheet_point")
+        if isinstance(source_point, list) and isinstance(target_point, list) and len(source_point) >= 2 and len(target_point) >= 2:
+            forward_gap = math.hypot(points[0][0] - source_point[0], points[0][1] - source_point[1]) + math.hypot(points[-1][0] - target_point[0], points[-1][1] - target_point[1])
+            reverse_gap = math.hypot(points[-1][0] - source_point[0], points[-1][1] - source_point[1]) + math.hypot(points[0][0] - target_point[0], points[0][1] - target_point[1])
+            if min(forward_gap, reverse_gap) > AXIS_PATH_ENDPOINT_TOLERANCE_PX * 2:
+                continue
+            if reverse_gap < forward_gap:
+                points = list(reversed(points))
+        dx = points[-1][0] - points[0][0]
+        dy = points[-1][1] - points[0][1]
+        if diffs[axis] < 0:
+            dx, dy = -dx, -dy
+        vectors[axis].append((dx, dy))
+    output: dict[str, dict[str, float] | None] = {}
+    for axis in AXIS_NAMES:
+        values = vectors[axis]
+        if not values:
+            output[axis] = None
+            continue
+        output[axis] = {
+            "sheet_dx": sum(item[0] for item in values) / len(values),
+            "sheet_dy": sum(item[1] for item in values) / len(values),
+        }
+    return output
+
+
+def _axis_path_direction(
+    edge: dict[str, Any],
+    source: dict[str, Any],
+    target: dict[str, Any],
+    axis_map: dict[str, dict[str, float] | None] | None = None,
+) -> tuple[str | None, str | None, float | None, str, bool, bool]:
+    points = _edge_path_points(edge)
+    source_point = source.get("sheet_point")
+    target_point = target.get("sheet_point")
+    if len(points) < 2:
+        return None, None, None, "no_path_points", False, False
+    if not (isinstance(source_point, list) and len(source_point) >= 2 and isinstance(target_point, list) and len(target_point) >= 2):
+        return None, None, None, "missing_sheet_point", False, False
+    forward_gap = math.hypot(points[0][0] - source_point[0], points[0][1] - source_point[1]) + math.hypot(points[-1][0] - target_point[0], points[-1][1] - target_point[1])
+    reverse_gap = math.hypot(points[-1][0] - source_point[0], points[-1][1] - source_point[1]) + math.hypot(points[0][0] - target_point[0], points[0][1] - target_point[1])
+    if forward_gap <= AXIS_PATH_ENDPOINT_TOLERANCE_PX * 2 and max(
+        math.hypot(points[0][0] - source_point[0], points[0][1] - source_point[1]),
+        math.hypot(points[-1][0] - target_point[0], points[-1][1] - target_point[1]),
+    ) <= AXIS_PATH_ENDPOINT_TOLERANCE_PX:
+        oriented = points
+    elif reverse_gap <= AXIS_PATH_ENDPOINT_TOLERANCE_PX * 2 and max(
+        math.hypot(points[-1][0] - source_point[0], points[-1][1] - source_point[1]),
+        math.hypot(points[0][0] - target_point[0], points[0][1] - target_point[1]),
+    ) <= AXIS_PATH_ENDPOINT_TOLERANCE_PX:
+        oriented = list(reversed(points))
+    else:
+        return None, None, None, "path_endpoints_do_not_match_vertices", False, False
+    dx = oriented[-1][0] - oriented[0][0]
+    dy = oriented[-1][1] - oriented[0][1]
+    edge_length = math.hypot(dx, dy)
+    if edge_length <= 1e-9:
+        return None, None, None, "zero_path_length", False, False
+    scores = []
+    axis_map = axis_map or FIXED_SHEET_AXIS_MAP
+    for axis in AXIS_NAMES:
+        vector = axis_map.get(axis)
+        if not vector:
+            continue
+        axis_length = math.hypot(vector["sheet_dx"], vector["sheet_dy"])
+        if axis_length <= 1e-9:
+            continue
+        dot = dx * vector["sheet_dx"] + dy * vector["sheet_dy"]
+        signed_similarity = dot / (edge_length * axis_length)
+        # Axis matching is direction-agnostic; direction is returned
+        # separately as sign. Otherwise every edge going against the learned
+        # positive axis would be incorrectly rejected.
+        scores.append((abs(signed_similarity), axis, dot))
+    scores.sort(reverse=True)
+    if not scores or scores[0][0] < AXIS_SIMILARITY_THRESHOLD:
+        return None, None, scores[0][0] if scores else None, "axis_similarity_below_threshold", False, False
+    if len(scores) > 1 and scores[0][0] - scores[1][0] < AXIS_SIMILARITY_AMBIGUITY_GAP:
+        return None, None, scores[0][0], "axis_similarity_ambiguous", False, True
+    _similarity, axis, dot = scores[0]
+    return axis, "+" if dot >= 0 else "-", _similarity, "path_points", False, False
+
+
+def _included_edge_axis_metadata(
+    final_vertices: list[dict[str, Any]],
+    final_edges: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, dict[str, float] | None]]:
+    vertices = _axis_vertex_rows(final_vertices)
+    included: list[dict[str, Any]] = []
+    for edge in final_edges:
+        for candidate in edge.get("candidates") or []:
+            if candidate.get("local_decision") != "include":
+                continue
+            included.append({
+                "edge_id": edge.get("id"),
+                "from_vertex": edge.get("from_vertex"),
+                "to_vertex": edge.get("to_vertex"),
+                "value_mm": candidate.get("value_mm") or candidate.get("value") or candidate.get("length_mm"),
+                "path_points": edge.get("path_points") or [],
+            })
+    # Do not derive the sheet orientation from known coordinate pairs: a page
+    # can have no connected pair of fully known vertices. The drawing series
+    # has a stable isometric projection, so axis classification must work even
+    # when every endpoint on a branch is unknown.
+    axis_map = FIXED_SHEET_AXIS_MAP
+    diagnostics: list[dict[str, Any]] = []
+    enriched: list[dict[str, Any]] = []
+    for edge in included:
+        source = vertices.get(str(edge.get("from_vertex")))
+        target = vertices.get(str(edge.get("to_vertex")))
+        axis = sign = None
+        rule = 4
+        reason = "missing_vertex_rows"
+        inconsistent = False
+        ambiguous = False
+        similarity = None
+        if source and target:
+            axis, sign, similarity, reason, _path_inconsistent, ambiguous = _axis_path_direction(edge, source, target, axis_map)
+            rule = 3
+            if axis:
+                # Coordinates validate the image-derived direction; they do
+                # not define it. A positive-length edge must not change a
+                # second known world axis.
+                expected = edge.get("value_mm")
+                shared_diffs = {}
+                for axis_name in AXIS_NAMES:
+                    source_value = source.get(axis_name.lower())
+                    target_value = target.get(axis_name.lower())
+                    if source_value is not None and target_value is not None:
+                        shared_diffs[axis_name] = float(target_value) - float(source_value)
+                if axis.lower() in {name.lower() for name in shared_diffs} and not _axis_value_matches(shared_diffs[axis], expected):
+                    inconsistent = True
+                    reason = "path_axis_coordinate_delta_does_not_match_value"
+                elif any(
+                    name != axis and abs(delta) > AXIS_MATCH_TOLERANCE_MM
+                    for name, delta in shared_diffs.items()
+                ):
+                    inconsistent = True
+                    reason = "path_axis_has_second_coordinate_delta"
+                if inconsistent:
+                    axis = sign = None
+            elif reason == "missing_sheet_point":
+                rule = 4
+        elif source or target:
+            axis, sign, similarity, reason, inconsistent, ambiguous = _axis_path_direction(edge, source or {}, target or {}, axis_map)
+            rule = 3 if axis else 4
+        row = dict(edge)
+        row.update({"axis": axis, "sign": sign})
+        enriched.append(row)
+        diagnostics.append({
+            "edge_id": edge.get("edge_id"),
+            "rule": rule,
+            "axis": axis,
+            "sign": sign,
+            "similarity": similarity,
+            "inconsistent": inconsistent,
+            "ambiguous": ambiguous,
+            "reason": reason,
+            "value_mm": edge.get("value_mm"),
+        })
+    return enriched, diagnostics, axis_map
+
+
 def _final_vertex_rows(mapping: dict[str, Any], page_number: int) -> list[dict[str, Any]]:
     coordinate_lookup = _vertex_coordinate_lookup(mapping, page_number)
     rows = []
@@ -384,22 +621,7 @@ def _coordinate_reconstruction_payload(
         else:
             unknown_vertices.append(row)
 
-    included_edges: list[dict[str, Any]] = []
-    for edge in final_edges:
-        candidates = [
-            candidate
-            for candidate in edge.get("candidates") or []
-            if candidate.get("local_decision") == "include"
-        ]
-        for candidate in candidates:
-            included_edges.append(
-                {
-                    "edge_id": edge.get("id"),
-                    "from_vertex": edge.get("from_vertex"),
-                    "to_vertex": edge.get("to_vertex"),
-                    "value_mm": candidate.get("value_mm") or candidate.get("value") or candidate.get("length_mm"),
-                }
-            )
+    included_edges, axis_diagnostics, axis_map = _included_edge_axis_metadata(final_vertices, final_edges)
     return {
         "task": (
             "Восстанови координаты всех unknown/partial VE/HG по known_vertices, "
@@ -409,6 +631,8 @@ def _coordinate_reconstruction_payload(
         "partial_vertices": partial_vertices,
         "unknown_vertices": unknown_vertices,
         "included_edges": included_edges,
+        "_axis_sign_diagnostics": axis_diagnostics,
+        "_axis_map": axis_map,
         "rules": [
             "Верни vertex_coordinates для каждой final_vertices.",
             "Локально известные X/Y/Z не меняй.",
@@ -1259,18 +1483,21 @@ def _compact_pipeline_length_provider_page(page: dict[str, Any]) -> dict[str, An
         if isinstance(row, dict)
     ]
     reconstruction = dict(page.get("coordinate_reconstruction") or {})
-    reconstruction["included_edges"] = []
-    for edge in page.get("final_edges") or page.get("edges") or []:
-        edge_id = edge.get("edge_key") or edge.get("edge_id") or edge.get("id")
-        for candidate in edge.get("candidates") or []:
-            if candidate.get("local_decision") != "include":
-                continue
-            reconstruction["included_edges"].append({
-                "edge_id": edge_id if ":" in str(edge_id or "") else f"{page.get('page')}:{edge_id}",
-                "from_vertex": edge.get("from_vertex"),
-                "to_vertex": edge.get("to_vertex"),
-                "value_mm": candidate.get("value_mm") or candidate.get("value") or candidate.get("length_mm"),
-            })
+    reconstruction.pop("_axis_map", None)
+    reconstruction.pop("_axis_sign_diagnostics", None)
+    compact_included_edges = []
+    for item in reconstruction.get("included_edges") or []:
+        edge_id = item.get("edge_id")
+        compact_included_edges.append({
+            "edge_id": edge_id if ":" in str(edge_id or "") else f"{page.get('page')}:{edge_id}",
+            "from_vertex": item.get("from_vertex"),
+            "to_vertex": item.get("to_vertex"),
+            "value_mm": item.get("value_mm"),
+            "path_points": item.get("path_points") or [],
+            "axis": item.get("axis"),
+            "sign": item.get("sign"),
+        })
+    reconstruction["included_edges"] = compact_included_edges
     return {
         "page": page.get("page"),
         "final_edges": edge_rows,
